@@ -14,6 +14,15 @@ from config_for_simulation import (
     get_dataset_config,
 )
 
+from azure_blob_storage import (
+    blob_exists,
+    find_blob_by_filename,
+    list_blob_names,
+    read_parquet_blob,
+)
+
+STORAGE_MODE = os.getenv("STORAGE_MODE", "local").strip().lower()
+
 DEBUG_MODE = False
 
 PARQUET_FILE_PATH_CACHE = {}
@@ -60,21 +69,34 @@ def _get_opt_folder(week_folder, date_str=None):
 
 
 def _find_parquet_file(folder, filename):
-    folder = os.path.abspath(str(folder))
-    filename = str(filename).lower()
-    key = (folder, filename)
+    folder = str(folder).replace("\\", "/").strip("/")
+    filename = str(filename)
+
+    key = (folder, filename.lower())
 
     if key in PARQUET_FILE_PATH_CACHE:
         return PARQUET_FILE_PATH_CACHE[key]
+
+    if STORAGE_MODE == "blob":
+        blob_name = find_blob_by_filename(
+            prefix=folder,
+            filename=filename,
+        )
+
+        PARQUET_FILE_PATH_CACHE[key] = blob_name
+        return blob_name
+
+    # Local filesystem fallback
+    folder = os.path.abspath(folder)
 
     if not os.path.isdir(folder):
         PARQUET_FILE_PATH_CACHE[key] = None
         return None
 
     for root, _, files in os.walk(folder):
-        for f in files:
-            if f.lower() == filename:
-                path = os.path.join(root, f)
+        for current_file in files:
+            if current_file.lower() == filename.lower():
+                path = os.path.join(root, current_file)
                 PARQUET_FILE_PATH_CACHE[key] = path
                 return path
 
@@ -125,15 +147,21 @@ def _resolve_option_week_folder(week_folder):
 # =========================================================
 
 def _read_parquet_normalized(path, mode="spot"):
-    path = os.path.abspath(str(path))
+    path = str(path)
     mode = str(mode).lower()
     cache_key = (path, mode)
 
     cached = RAW_PARQUET_CACHE.get(cache_key)
+
     if cached is not None:
         return cached.copy()
 
-    df = pd.read_parquet(path)
+    if STORAGE_MODE == "blob":
+        df = read_parquet_blob(path)
+    else:
+        path = os.path.abspath(path)
+        df = pd.read_parquet(path)
+
     lower_cols = {str(c).lower(): c for c in df.columns}
 
     if "datetime" in lower_cols:
