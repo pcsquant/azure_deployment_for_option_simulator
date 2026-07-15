@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Options Strategy Simulator</title>
+
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
+
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+
+<body>
+  <div class="topbar simple-topbar">
+    <div class="brand">Option Simulator</div>
+    <button class="buy" type="button">Premium Plans</button>
+  </div>
+
+  <div class="controls">
+    <select id="symbol">
+      <option value="NIFTY">Nifty</option>
+      <option value="BANKNIFTY">Bank Nifty</option>
+      <option value="SENSEX">Sensex</option>
+    </select>
+
+    <label for="queryDate">Date</label>
+    <input id="queryDate" type="date" />
+
+    <label for="queryTime">Time</label>
+    <input id="queryTime" type="time" value="09:30" />
+
+    <label for="interval">Interval</label>
+    <select id="interval">
+      <option value="1">1m</option>
+      <option value="2">2m</option>
+      <option value="3" selected>3m</option>
+      <option value="5">5m</option>
+      <option value="10">10m</option>
+      <option value="15">15m</option>
+    </select>
+
+    <button id="prevIntervalBtn" type="button">&lt;&lt;</button>
+    <button id="nextIntervalBtn" type="button">&gt;&gt;</button>
+
+    <label for="spot">Spot</label>
+    <input id="spot" type="number" value="23406" step="0.05" readonly />
+
+    <div class="vix-box">
+      <label for="iv" id="openVixChartPopup" class="vix-clickable" title="Open India VIX Chart">
+        INDIA VIX
+      </label>
+      <input id="iv" type="number" value="15.7" step="0.1" min="1" max="100" readonly />
+    </div>
+
+    <label for="days">DTE</label>
+    <input id="days" type="number" value="1" min="0" step="1" readonly />
+
+    <label for="expirySelect">Expiry</label>
+    <select id="expirySelect" style="width:140px;"></select>
+
+
+    <button id="refreshBtn" type="button">Refresh</button>
+    <button class="auto" type="button" onclick="loadTemplate('short_straddle')">Short Straddle</button>
+    <button class="auto" type="button" onclick="loadTemplate('short_strangle')">Short Strangle</button>
+    <button class="auto" type="button" onclick="loadTemplate('iron_condor')">Iron Condor</button>
+  </div>
+
+  <div class="layout">
+  <section class="chain-panel">
+
+      <div class="chain-header">
+
+        <div class="panel-title">
+          Option Chain
+        </div>
+
+        <div class="strike-selector">
+          <label for="strikeCount">Strikes</label>
+
+          <input
+            id="strikeCount"
+            type="number"
+            value="10"
+            min="1"
+            step="1"
+          >
+        </div>
+
+      </div>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Call LTP</th>
+            <th>CE Δ</th>
+            <th>CE IV</th>
+            <th>Strike</th>
+            <th>PE IV</th>
+            <th>PE Δ</th>
+            <th>Put LTP</th>
+          </tr>
+        </thead>
+
+        <tbody id="chainBody"></tbody>
+      </table>
+
+    </section>
+
+    <section class="sim-panel">
+      <div class="tabs">
+        <button id="payoffTab" class="active" type="button">Payoff Chart</button>
+        <button id="openGreeksBtn" type="button">Greeks</button>
+        <button id="openChartPopup" type="button">📈 Index Chart</button>
+        <button id="openFutureChartPopup" type="button">📊 Future Chart</button>
+        <button id="volSmileTab" type="button">Volatility Smile</button>
+        <button id="ivSurfaceTab" type="button">IV Surface</button>
+      </div>
+
+      <div class="metrics">
+        <div><span>Net Credit</span><b id="netCredit">₹0</b></div>
+        <div><span>P&amp;L</span><b id="pnlNow">₹0</b></div>
+        <div><span>Charges</span><b id="tradeCost">₹0</b></div>
+        <div><span>Net P&amp;L After Charges</span><b id="netProfitAfterCost">₹0</b></div>
+        <div><span>Margin</span><b id="marginRequired">₹0</b></div>
+        <div><span>Max Profit</span><b id="maxProfit">-</b></div>
+        <div><span>Max Loss</span><b id="maxLoss">-</b></div>
+        <div><span>Breakevens</span><b id="breakevens">-</b></div>
+      </div>
+
+      <div id="payoffPanel" class="payoff-chart-wrapper">
+        <canvas id="payoffChart"></canvas>
+      </div>
+
+      <div id="volSmilePanel" class="vol-smile-panel" style="display:none;">
+        <div class="vol-smile-chart-card">
+          <h3>Volatility Smile</h3>
+          <canvas id="volSmileChart"></canvas>
+        </div>
+
+        <div class="vol-smile-table-card">
+          <h3>IV Smile Table</h3>
+          <table>
+            <thead>
+              <tr>
+                <th>Strike</th>
+                <th>Call IV (%)</th>
+                <th>Put IV (%)</th>
+                <th>Smile IV (%)</th>
+              </tr>
+            </thead>
+            <tbody id="volSmileBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div id="ivSurfacePanel" class="iv-surface-panel" style="display:none;">
+        <div class="iv-surface-chart-card">
+          <h3>IV Surface</h3>
+          <div id="ivSurfaceChart"></div>
+        </div>
+      </div>
+
+      <div class="positions-header">
+        <b>Positions</b>
+        <button type="button" onclick="addEmptyLeg()">+ Add Leg</button>
+      </div>
+
+      <div class="position-greeks-live">
+        <span>Entry Delta: <b id="entryDelta">0</b></span>
+        <span>Live Delta: <b id="liveDelta">0</b></span>
+        <span>Entry Gamma: <b id="entryGamma">0</b></span>
+        <span>Live Gamma: <b id="liveGamma">0</b></span>
+        <span>Entry Vega: <b id="entryVega">0</b></span>
+        <span>Live Vega: <b id="liveVega">0</b></span>
+        <span>Entry Theta: <b id="entryTheta">0</b></span>
+        <span>Live Theta: <b id="liveTheta">0</b></span>
+      </div>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Side</th>
+            <th>Type</th>
+            <th>Strike</th>
+            <th>Expiry</th>
+            <th>Entry Time</th>
+            <th>Premium</th>
+            <th>Lots</th>
+            <th>Qty</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="legsBody"></tbody>
+      </table>
+    </section>
+  </div>
+
+  <div id="greeksModal" class="greeks-modal">
+    <div class="greeks-popup">
+      <div class="greeks-popup-header">
+        <h2>Complete Greeks</h2>
+        <button id="closeGreeksBtn" type="button">&times;</button>
+      </div>
+
+      <div class="greeks-popup-info">
+        <span>Delta</span>
+        <span>Gamma</span>
+        <span>Vega</span>
+        <span>Theta</span>
+        <span>IV</span>
+      </div>
+
+      <table class="greeks-table">
+        <thead>
+          <tr>
+            <th>Strike</th>
+            <th>CE LTP</th>
+            <th>CE Δ</th>
+            <th>CE Gamma</th>
+            <th>CE Vega</th>
+            <th>CE Theta</th>
+            <th>CE IV</th>
+            <th>PE IV</th>
+            <th>PE Theta</th>
+            <th>PE Vega</th>
+            <th>PE Gamma</th>
+            <th>PE Δ</th>
+            <th>PE LTP</th>
+          </tr>
+        </thead>
+        <tbody id="greeksBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div id="chartModal" class="chart-modal">
+    <div class="chart-popup">
+      <div class="chart-popup-header">
+        <h2>Index Chart</h2>
+        <input type="date" id="indexChartStartDate">
+        <input type="time" id="indexChartStartTime" value="09:15">
+        <input type="date" id="indexChartEndDate">
+        <input type="time" id="indexChartEndTime" value="15:30">
+        <select id="indexChartInterval">
+          <option value="1" selected>1m</option>
+          <option value="2">2m</option>
+          <option value="3">3m</option>
+          <option value="5">5m</option>
+          <option value="10">10m</option>
+          <option value="15">15m</option>
+          <option value="30">30m</option>
+          <option value="60">1h</option>
+        </select>
+        <button type="button" id="indexChartApplyBtn" class="chart-apply-btn" data-chart="index">Apply</button>
+        <button id="closeChartPopup" type="button">&times;</button>
+      </div>
+      <div id="fullscreenIndexChart"></div>
+    </div>
+  </div>
+
+  <div id="futureChartModal" class="chart-modal">
+    <div class="chart-popup">
+      <div class="chart-popup-header">
+        <h2>Future Chart</h2>
+        <select id="futureMonthSelect">
+          <option value="current">This Month</option>
+          <option value="next">Next Month</option>
+          <option value="next_to_next">Next To Next Month</option>
+        </select>
+        <input type="date" id="futureChartStartDate">
+        <input type="time" id="futureChartStartTime" value="09:15">
+        <input type="date" id="futureChartEndDate">
+        <input type="time" id="futureChartEndTime" value="15:30">
+        <select id="futureChartInterval">
+          <option value="1" selected>1m</option>
+          <option value="2">2m</option>
+          <option value="3">3m</option>
+          <option value="5">5m</option>
+          <option value="10">10m</option>
+          <option value="15">15m</option>
+          <option value="30">30m</option>
+          <option value="60">1h</option>
+        </select>
+        <button type="button" id="futureChartApplyBtn" class="chart-apply-btn" data-chart="future">Apply</button>
+        <button id="closeFutureChartPopup" type="button">&times;</button>
+      </div>
+      <div id="fullscreenFutureChart"></div>
+    </div>
+  </div>
+
+  <div id="vixChartModal" class="chart-modal">
+    <div class="chart-popup">
+      <div class="chart-popup-header">
+        <h2>India VIX Chart</h2>
+        <input type="date" id="vixChartStartDate">
+        <input type="time" id="vixChartStartTime" value="09:15">
+        <input type="date" id="vixChartEndDate">
+        <input type="time" id="vixChartEndTime" value="15:30">
+        <select id="vixChartInterval">
+          <option value="1" selected>1m</option>
+          <option value="2">2m</option>
+          <option value="3">3m</option>
+          <option value="5">5m</option>
+          <option value="10">10m</option>
+          <option value="15">15m</option>
+          <option value="30">30m</option>
+          <option value="60">1h</option>
+        </select>
+        <button type="button" id="vixChartApplyBtn" class="chart-apply-btn" data-chart="vix">Apply</button>
+        <button id="closeVixChartPopup" type="button">&times;</button>
+      </div>
+      <div id="fullscreenVixChart"></div>
+    </div>
+  </div>
+
+  <script src="/static/simulator.js"></script>
+</body>
+</html>

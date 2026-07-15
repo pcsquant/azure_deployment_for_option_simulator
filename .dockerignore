@@ -1,0 +1,25 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+venv/
+.venv/
+env/
+
+.git/
+.gitignore
+
+.env
+*.log
+
+# Do not copy heavy market data into the image.
+data/
+weekely_data/
+weekely_data_parquet/
+parquet data/
+*.csv
+*.csv.gz
+*.parquet
+*.zip
+*.7z
