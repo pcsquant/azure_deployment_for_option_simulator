@@ -331,7 +331,7 @@ _OPTION_CHAIN_CACHE_LOCK = Lock()
 
 SHARED_OPTION_CACHE_DIR = os.getenv(
     "SHARED_OPTION_CACHE_DIR",
-    "/app/shared_cache/option_chain"
+    "/opt/option-simulator/shared_cache/option_chain"
 )
 
 os.makedirs(SHARED_OPTION_CACHE_DIR, exist_ok=True)
