@@ -9,3 +9,5 @@ llvmlite==0.42.0
 py-vollib==1.0.1
 py-vollib-vectorized==0.1.1
 gunicorn==22.0.0
+azure-storage-blob
+azure-identity
