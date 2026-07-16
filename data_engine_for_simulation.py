@@ -128,8 +128,16 @@ def _resolve_option_week_folder(week_folder):
 
     if STORAGE_MODE == "blob":
         return week_folder
-        
-    week_name = os.path.basename(os.path.normpath(str(week_folder)))
+
+    week_folder_key = os.path.abspath(week_folder)
+
+    cached = OPTION_WEEK_FOLDER_CACHE.get(week_folder_key)
+    if cached is not None:
+        return cached
+
+    week_name = os.path.basename(
+        os.path.normpath(week_folder)
+    )
 
     candidates = [
         week_name,
@@ -144,17 +152,19 @@ def _resolve_option_week_folder(week_folder):
             name,
         )
 
-        print("Checking option folder:", option_folder, flush=True)
-
         if os.path.isdir(option_folder):
-            print("Using option folder:", option_folder, flush=True)
-            OPTION_WEEK_FOLDER_CACHE[week_folder_key] = option_folder
+            OPTION_WEEK_FOLDER_CACHE[
+                week_folder_key
+            ] = option_folder
+
             return option_folder
 
-    print("WARNING: option folder not found. Falling back to:", week_folder, flush=True)
+    fallback = week_folder
 
-    fallback = str(week_folder)
-    OPTION_WEEK_FOLDER_CACHE[week_folder_key] = fallback
+    OPTION_WEEK_FOLDER_CACHE[
+        week_folder_key
+    ] = fallback
+
     return fallback
 
 # =========================================================
