@@ -30,6 +30,13 @@ import pytz
 
 logger = logging.getLogger(__name__)
 
+STORAGE_MODE = os.getenv("STORAGE_MODE", "local").strip().lower()
+if STORAGE_MODE not in {"local", "blob"}:
+    raise ValueError(
+        "STORAGE_MODE must be either 'local' or 'blob'. "
+        f"Received: {STORAGE_MODE!r}"
+    )
+
 
 # =========================================================
 # GENERAL SETTINGS
@@ -79,14 +86,9 @@ def validate_configuration(
     """
     Validate the simulator configuration.
 
-    Parameters
-    ----------
-    require_data_paths:
-        When True, raise an error if the configured historical-data
-        directories do not exist.
-
-        Keep this False during deployment or repository import when the
-        data may be downloaded or mounted later.
+    Local data paths are required only when STORAGE_MODE is ``local``.
+    Blob mode reads market data remotely and therefore does not require
+    the VM data directories to exist.
     """
 
     if CHUNK_SIZE <= 0:
@@ -110,7 +112,7 @@ def validate_configuration(
             "SESSION_START must be earlier than SESSION_END."
         )
 
-    if require_data_paths:
+    if require_data_paths and STORAGE_MODE == "local":
         missing_paths = [
             path
             for path in {
@@ -124,29 +126,35 @@ def validate_configuration(
             missing_text = ", ".join(
                 str(path) for path in missing_paths
             )
-
             raise FileNotFoundError(
                 f"Historical-data path does not exist: {missing_text}"
             )
 
 
+
 def create_runtime_directories() -> None:
     """
-    Create the configured data directories when appropriate.
+    Create local historical-data directories when local storage is used.
 
-    This should normally be called by a deployment/setup script rather
-    than automatically during import.
+    In Blob mode, the historical data remains in Azure Blob Storage, so
+    local market-data directories are not created.
     """
+
+    if STORAGE_MODE == "blob":
+        logger.info(
+            "STORAGE_MODE=blob; skipping local data-directory creation."
+        )
+        return
 
     PARQUET_BASE_PATH.mkdir(
         parents=True,
         exist_ok=True,
     )
-
     OPTION_PARQUET_BASE_PATH.mkdir(
         parents=True,
         exist_ok=True,
     )
+
 
 
 # =========================================================
@@ -454,6 +462,27 @@ BSE_COMBINED_EXPIRY = np.sort(
 )
 
 
+def _derive_monthly_expiries(expiries) -> np.ndarray:
+    """Return the final listed expiry in each calendar month."""
+    values = pd.DatetimeIndex(pd.to_datetime(expiries)).sort_values()
+
+    if values.empty:
+        return np.array([], dtype="datetime64[ns]")
+
+    monthly = (
+        pd.Series(values, index=values)
+        .groupby([values.year, values.month])
+        .max()
+        .sort_values()
+    )
+    return monthly.to_numpy(dtype="datetime64[ns]")
+
+
+BSE_MONTHLY_COMBINED_EXPIRY = _derive_monthly_expiries(
+    BSE_COMBINED_EXPIRY
+)
+
+
 # =========================================================
 # DATASET CONFIGURATION
 # =========================================================
@@ -484,7 +513,7 @@ def get_dataset_config(
             "opt_zip_prefix": "NIFTY",
             "zip_member": "NIFTY.parquet",
             "strike_step": 50,
-            "week_start": 0,
+            "week_start": WEEK_START,
             "week_end": WEEK_END,
             "combined_expiry": NIFTY_COMBINED_EXPIRY.copy(),
             "monthly_expiry": NIFTY_MONTHLY_COMBINED_EXPIRY.copy(),
@@ -503,7 +532,7 @@ def get_dataset_config(
             "week_start": WEEK_START,
             "week_end": WEEK_END,
             "combined_expiry": BSE_COMBINED_EXPIRY.copy(),
-            "monthly_expiry": BSE_COMBINED_EXPIRY.copy(),
+            "monthly_expiry": BSE_MONTHLY_COMBINED_EXPIRY.copy(),
         }
 
     if normalized_instrument in {
@@ -542,10 +571,12 @@ def log_configuration() -> None:
 
     logger.info(
         "Option Simulator configuration: "
+        "STORAGE_MODE=%s, "
         "PARQUET_BASE_PATH=%s, "
         "OPTION_PARQUET_BASE_PATH=%s, "
         "CANDLE_INTERVAL_MINUTES=%s, "
         "SESSION=%s-%s",
+        STORAGE_MODE,
         PARQUET_BASE_PATH,
         OPTION_PARQUET_BASE_PATH,
         CANDLE_INTERVAL_MINUTES,
