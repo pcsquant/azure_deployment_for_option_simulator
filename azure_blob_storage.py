@@ -216,6 +216,35 @@ def list_blob_names(prefix: str = "") -> Iterator[str]:
         ) from exc
 
 
+# =========================================================
+# CACHED LISTINGS
+# =========================================================
+
+@lru_cache(maxsize=64)
+def _cached_blob_names(prefix: str) -> tuple[str, ...]:
+    """
+    List every blob under a prefix once and cache the result.
+
+    The historical market data in this container is immutable after
+    upload, so caching listings is safe. Lookups by filename or stem
+    (find_blob_by_filename / find_blob_by_stem) previously re-listed the
+    whole prefix on every call, which meant an option-chain load fired
+    dozens of full OPT_TICK listings (~1,600 blobs each) over paged HTTP.
+    With this cache, the prefix is listed once per process.
+
+    After uploading a NEW week folder, either restart the application or
+    call clear_listing_cache() so the new blobs become visible.
+    """
+
+    return tuple(list_blob_names(prefix))
+
+
+def clear_listing_cache() -> None:
+    """Clear the cached blob listings (call after uploading new data)."""
+
+    _cached_blob_names.cache_clear()
+
+
 def find_blob_by_filename(
     prefix: str,
     filename: str,
@@ -254,7 +283,9 @@ def find_blob_by_filename(
         else normalized_filename.lower()
     )
 
-    for current_blob_name in list_blob_names(prefix):
+    for current_blob_name in _cached_blob_names(
+        normalize_blob_name(prefix)
+    ):
         current_filename = blob_filename(current_blob_name)
 
         current_value = (
@@ -288,7 +319,9 @@ def find_blob_by_stem(
     if not expected_stem:
         return None
 
-    for current_blob_name in list_blob_names(prefix):
+    for current_blob_name in _cached_blob_names(
+        normalize_blob_name(prefix)
+    ):
         current_stem = PurePosixPath(
             normalize_blob_name(current_blob_name)
         ).stem.lower()
