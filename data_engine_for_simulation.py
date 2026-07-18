@@ -1164,6 +1164,40 @@ def get_week_folders(instrument="NIFTY"):
     return sorted(folders, key=lambda item: item[0])
 
 
+# Cache of per-(week folder, instrument) trading-date lists so repeated
+# /api/defaults calls don't re-read blobs on every request.
+_WEEK_DATES_CACHE = {}
+_WEEK_DATES_CACHE_LOCK = Lock()
+
+
+def _dates_from_frame(d: "pd.DataFrame | None") -> set:
+    """
+    Extract YYYYMMDD date strings from a frame that has either a `date`
+    column (int/str like 20260702) or a `datetime` column.
+    """
+    dates: set = set()
+
+    if d is None or d.empty:
+        return dates
+
+    lower = {str(c).lower(): c for c in d.columns}
+
+    if "date" in lower:
+        col = pd.to_numeric(d[lower["date"]], errors="coerce").dropna()
+        if not col.empty:
+            dates.update(
+                col.astype("int64").astype(str).unique().tolist()
+            )
+            return dates
+
+    if "datetime" in lower:
+        dt = pd.to_datetime(d[lower["datetime"]], errors="coerce").dropna()
+        if not dt.empty:
+            dates.update(dt.dt.strftime("%Y%m%d").unique().tolist())
+
+    return dates
+
+
 def get_dates_for_week_folder(
     week_number,
     folder,
@@ -1173,14 +1207,95 @@ def get_dates_for_week_folder(
 
     if STORAGE_MODE == "blob":
         prefix = str(folder).replace("\\", "/").strip("/")
+        cache_key = (prefix, str(instrument).upper())
 
-        for blob_name in list_blob_names(prefix):
-            matches = re.findall(r"\d{8}", blob_name)
+        with _WEEK_DATES_CACHE_LOCK:
+            cached = _WEEK_DATES_CACHE.get(cache_key)
 
-            for date_str in matches:
-                dates.add(date_str)
+        if cached is not None:
+            return list(cached)
 
-        return sorted(dates)
+        cfg = get_dataset_config(instrument)
+
+        # -----------------------------------------------------
+        # 1. Read the trading dates from the index parquet
+        #    (IDX_TICK/<SYMBOL>.parquet). Blob names in this
+        #    layout carry no YYYYMMDD tokens, so the old
+        #    filename-regex approach matched garbage digits from
+        #    contract names (expiry+strike) instead of dates.
+        # -----------------------------------------------------
+
+        idx_prefix = _join_storage_path(prefix, "IDX_TICK")
+
+        idx_blob = None
+        for candidate in (
+            f"{cfg['symbol']}.parquet",
+            str(cfg["symbol"]),
+            cfg.get("zip_member", f"{cfg['symbol']}.parquet").replace(
+                ".csv", ".parquet"
+            ),
+        ):
+            try:
+                idx_blob = find_blob_by_filename(
+                    prefix=idx_prefix,
+                    filename=candidate,
+                )
+            except Exception:
+                idx_blob = None
+
+            if idx_blob:
+                break
+
+        if idx_blob:
+            # Try a cheap projected read of just the date column first.
+            try:
+                d = read_parquet_blob(idx_blob, columns=["date"])
+                dates.update(_dates_from_frame(d))
+            except Exception:
+                pass
+
+            # Fall back to a full read if the file has no plain
+            # `date` column (e.g. datetime-only schema).
+            if not dates:
+                try:
+                    d = read_parquet_blob(idx_blob)
+                    dates.update(_dates_from_frame(d))
+                except Exception as exc:
+                    logger.warning(
+                        "Unable to read index blob %s for dates: %s",
+                        idx_blob,
+                        exc,
+                    )
+
+        # -----------------------------------------------------
+        # 2. Fallback: date-stamped folder names in blob paths
+        #    (e.g. NSE_OPT_TICK_20260702/...). Only accept
+        #    8-digit runs that parse as real calendar dates so
+        #    contract digits like 26063043000 are rejected.
+        # -----------------------------------------------------
+
+        if not dates:
+            try:
+                for blob_name in list_blob_names(prefix):
+                    for token in re.findall(r"(?<!\d)(\d{8})(?!\d)", str(blob_name)):
+                        parsed = pd.to_datetime(
+                            token, format="%Y%m%d", errors="coerce"
+                        )
+                        if pd.notna(parsed) and 2000 <= parsed.year <= 2100:
+                            dates.add(token)
+            except Exception as exc:
+                logger.warning(
+                    "Blob-name date fallback failed for %s: %s",
+                    prefix,
+                    exc,
+                )
+
+        result = sorted(dates)
+
+        with _WEEK_DATES_CACHE_LOCK:
+            _WEEK_DATES_CACHE[cache_key] = list(result)
+
+        return result
 
 
     # 1. Old structure: folders with date in name
