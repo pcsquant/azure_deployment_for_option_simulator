@@ -1,5 +1,5 @@
 """
-StockMock-style Options Simulator Flask app.
+ Options Simulator Flask app.
 
 Place this file at:
     agent_for_production/app.py
@@ -1620,7 +1620,12 @@ def api_option_metric_chart():
 
         strike = int(request.args.get("strike"))
         metric = str(request.args.get("metric")).lower()
-        interval = int(request.args.get("interval", CANDLE_INTERVAL_MINUTES))
+        interval = int(
+            request.args.get(
+                "interval",
+                CANDLE_INTERVAL_MINUTES,
+            )
+        )
         selected_expiry = request.args.get("expiry")
 
         allowed = {
@@ -1633,7 +1638,10 @@ def api_option_metric_chart():
         }
 
         if metric not in allowed:
-            raise ValueError("Unsupported metric")
+            raise ValueError(f"Unsupported metric: {metric}")
+
+        if interval <= 0:
+            raise ValueError("Interval must be greater than zero")
 
         if query_date:
             resolved_week, folder, date_str = _resolve_week_folder_for_date(
@@ -1656,6 +1664,21 @@ def api_option_metric_chart():
             or "15:30"
         )
 
+        start_dt = datetime.strptime(
+            f"{query_date} {start_time}",
+            "%Y-%m-%d %H:%M",
+        )
+
+        end_dt = datetime.strptime(
+            f"{end_date} {end_time}",
+            "%Y-%m-%d %H:%M",
+        )
+
+        if end_dt < start_dt:
+            raise ValueError(
+                "End date/time must be after start date/time"
+            )
+
         expiry_str = selected_expiry or get_upcoming_expiry_np(
             datetime.strptime(date_str, "%Y%m%d").date(),
             instrument=dataset,
@@ -1669,37 +1692,47 @@ def api_option_metric_chart():
             instrument=dataset,
         )
 
+        if not isinstance(opt, dict):
+            raise ValueError(
+                f"Option data not found for strike {strike}"
+            )
+
+        ce_raw = opt.get("CE", pd.DataFrame())
+        pe_raw = opt.get("PE", pd.DataFrame())
+
+        # Indian market session is approximately 375 minutes.
+        # Build enough candles to include the complete trading session,
+        # regardless of the selected interval.
+        full_day_candles = math.ceil(375 / interval) + 5
+
+        session_end_ts = IST.localize(
+            datetime.strptime(
+                date_str + " 15:30:00",
+                "%Y%m%d %H:%M:%S",
+            )
+        )
+
         ce = _build_option_candle_window(
-            opt["CE"],
-            IST.localize(
-                datetime.strptime(
-                    date_str + " 15:30:00",
-                    "%Y%m%d %H:%M:%S",
-                )
-            ),
-            interval,
-            before=200,
+            raw_df=ce_raw,
+            target_ts=session_end_ts,
+            candle_interval_minutes=interval,
+            before=full_day_candles,
             after=0,
         )
 
         pe = _build_option_candle_window(
-            opt["PE"],
-            IST.localize(
-                datetime.strptime(
-                    date_str + " 15:30:00",
-                    "%Y%m%d %H:%M:%S",
-                )
-            ),
-            interval,
-            before=200,
+            raw_df=pe_raw,
+            target_ts=session_end_ts,
+            candle_interval_minutes=interval,
+            before=full_day_candles,
             after=0,
         )
 
         spot_candles = _get_spot_candles_for_day(
-            folder,
-            date_str,
-            dataset,
-            interval,
+            folder=folder,
+            date_str=date_str,
+            dataset=dataset,
+            candle_interval_minutes=interval,
         )
 
         if spot_candles is None or spot_candles.empty:
@@ -1711,74 +1744,161 @@ def api_option_metric_chart():
                 "end_date": end_date,
                 "end_time": end_time,
                 "date_str": date_str,
+                "resolved_week_number": resolved_week,
                 "strike": strike,
+                "expiry": expiry_str,
                 "metric": metric,
                 "rows": [],
+                "message": "No spot candles found",
             })
+
+        spot_candles = spot_candles.copy()
 
         if getattr(spot_candles.index, "tz", None) is None:
             spot_index_ist = spot_candles.index.tz_localize(IST)
         else:
             spot_index_ist = spot_candles.index.tz_convert(IST)
 
-        ce_close = pd.Series(index=spot_index_ist, dtype="float64")
-        pe_close = pd.Series(index=spot_index_ist, dtype="float64")
+        spot_candles.index = spot_index_ist
+
+        ce_close = pd.Series(
+            index=spot_index_ist,
+            dtype="float64",
+        )
+
+        pe_close = pd.Series(
+            index=spot_index_ist,
+            dtype="float64",
+        )
 
         if ce is not None and not ce.empty:
             ce_tmp = ce.copy()
-            ce_tmp["timestamp"] = pd.to_datetime(ce_tmp["timestamp"], errors="coerce")
-            ce_tmp = ce_tmp.dropna(subset=["timestamp"])
 
-            ce_idx = ce_tmp.set_index("timestamp")
-            if getattr(ce_idx.index, "tz", None) is None:
-                ce_idx.index = ce_idx.index.tz_localize(IST)
-            else:
-                ce_idx.index = ce_idx.index.tz_convert(IST)
+            if "timestamp" not in ce_tmp.columns:
+                ce_tmp["timestamp"] = ce_tmp.index
 
-            ce_close = ce_idx["close"].reindex(spot_index_ist, method="ffill")
+            ce_tmp["timestamp"] = pd.to_datetime(
+                ce_tmp["timestamp"],
+                errors="coerce",
+            )
+
+            ce_tmp["close"] = pd.to_numeric(
+                ce_tmp["close"],
+                errors="coerce",
+            )
+
+            ce_tmp = ce_tmp.dropna(
+                subset=["timestamp", "close"]
+            )
+
+            if not ce_tmp.empty:
+                ce_idx = ce_tmp.set_index("timestamp")
+                ce_idx = ce_idx[~ce_idx.index.duplicated(
+                    keep="last"
+                )]
+                ce_idx = ce_idx.sort_index()
+
+                if getattr(ce_idx.index, "tz", None) is None:
+                    ce_idx.index = ce_idx.index.tz_localize(IST)
+                else:
+                    ce_idx.index = ce_idx.index.tz_convert(IST)
+
+                ce_close = ce_idx["close"].reindex(
+                    spot_index_ist,
+                    method="ffill",
+                )
 
         if pe is not None and not pe.empty:
             pe_tmp = pe.copy()
-            pe_tmp["timestamp"] = pd.to_datetime(pe_tmp["timestamp"], errors="coerce")
-            pe_tmp = pe_tmp.dropna(subset=["timestamp"])
 
-            pe_idx = pe_tmp.set_index("timestamp")
-            if getattr(pe_idx.index, "tz", None) is None:
-                pe_idx.index = pe_idx.index.tz_localize(IST)
-            else:
-                pe_idx.index = pe_idx.index.tz_convert(IST)
+            if "timestamp" not in pe_tmp.columns:
+                pe_tmp["timestamp"] = pe_tmp.index
 
-            pe_close = pe_idx["close"].reindex(spot_index_ist, method="ffill")
+            pe_tmp["timestamp"] = pd.to_datetime(
+                pe_tmp["timestamp"],
+                errors="coerce",
+            )
+
+            pe_tmp["close"] = pd.to_numeric(
+                pe_tmp["close"],
+                errors="coerce",
+            )
+
+            pe_tmp = pe_tmp.dropna(
+                subset=["timestamp", "close"]
+            )
+
+            if not pe_tmp.empty:
+                pe_idx = pe_tmp.set_index("timestamp")
+                pe_idx = pe_idx[~pe_idx.index.duplicated(
+                    keep="last"
+                )]
+                pe_idx = pe_idx.sort_index()
+
+                if getattr(pe_idx.index, "tz", None) is None:
+                    pe_idx.index = pe_idx.index.tz_localize(IST)
+                else:
+                    pe_idx.index = pe_idx.index.tz_convert(IST)
+
+                pe_close = pe_idx["close"].reindex(
+                    spot_index_ist,
+                    method="ffill",
+                )
 
         rows_df = pd.DataFrame({
             "timestamp": spot_index_ist.tz_localize(None),
-            "trade_date": datetime.strptime(date_str, "%Y%m%d").date(),
+            "trade_date": datetime.strptime(
+                date_str,
+                "%Y%m%d",
+            ).date(),
             "instrument": dataset,
             "expiry": expiry_str,
             "nearest_strike": strike,
             "strike": strike,
-            "close": spot_candles["close"].values,
-            "ce": ce_close.values,
-            "pe": pe_close.values,
+            "close": pd.to_numeric(
+                spot_candles["close"],
+                errors="coerce",
+            ).to_numpy(),
+            "ce": ce_close.to_numpy(),
+            "pe": pe_close.to_numpy(),
         })
 
-        start_dt = datetime.strptime(
-            f"{query_date} {start_time}",
-            "%Y-%m-%d %H:%M",
-        )
-
-        end_dt = datetime.strptime(
-            f"{end_date} {end_time}",
-            "%Y-%m-%d %H:%M",
+        rows_df = rows_df.dropna(
+            subset=["timestamp", "close"]
         )
 
         rows_df = rows_df[
             (rows_df["timestamp"] >= start_dt)
             & (rows_df["timestamp"] <= end_dt)
-        ]
+        ].copy()
 
-        if metric in {"ce_iv", "pe_iv", "ce_delta", "pe_delta"}:
-            rows_df = append_black_scholes_iv(rows_df)
+        if rows_df.empty:
+            return jsonify({
+                "ok": True,
+                "dataset": dataset,
+                "query_date": query_date,
+                "start_time": start_time,
+                "end_date": end_date,
+                "end_time": end_time,
+                "date_str": date_str,
+                "resolved_week_number": resolved_week,
+                "strike": strike,
+                "expiry": expiry_str,
+                "metric": metric,
+                "rows": [],
+                "message": "No rows found in the requested time range",
+            })
+
+        if metric in {
+            "ce_iv",
+            "pe_iv",
+            "ce_delta",
+            "pe_delta",
+        }:
+            rows_df = append_black_scholes_iv(
+                rows_df,
+                compute_greeks=True,
+            )
 
         col_map = {
             "ce_ltp": "ce",
@@ -1790,17 +1910,32 @@ def api_option_metric_chart():
         }
 
         col = col_map[metric]
+
+        if col not in rows_df.columns:
+            raise ValueError(
+                f"Metric column {col} was not generated"
+            )
+
+        rows_df[col] = pd.to_numeric(
+            rows_df[col],
+            errors="coerce",
+        )
+
+        valid_rows = rows_df.dropna(
+            subset=[col]
+        ).copy()
+
         rows = []
 
-        for _, r in rows_df.dropna(subset=[col]).iterrows():
-            ts = pd.Timestamp(r["timestamp"])
+        for _, row in valid_rows.iterrows():
+            ts = pd.Timestamp(row["timestamp"])
 
             if ts.tzinfo is not None:
                 ts = ts.tz_convert(IST).tz_localize(None)
 
             rows.append({
                 "time": int(ts.timestamp()),
-                "value": round(float(r[col]), 4),
+                "value": round(float(row[col]), 4),
             })
 
         return jsonify({
@@ -1811,12 +1946,22 @@ def api_option_metric_chart():
             "end_date": end_date,
             "end_time": end_time,
             "date_str": date_str,
+            "resolved_week_number": resolved_week,
             "strike": strike,
+            "expiry": expiry_str,
+            "interval": interval,
             "metric": metric,
+            "source_row_count": int(len(rows_df)),
+            "valid_metric_row_count": int(len(valid_rows)),
+            "ce_valid_count": int(rows_df["ce"].notna().sum()),
+            "pe_valid_count": int(rows_df["pe"].notna().sum()),
             "rows": rows,
         })
 
     except Exception as exc:
+        app.logger.exception(
+            "Option metric chart failed"
+        )
         return _json_error(str(exc), 400)
 
 @app.route("/api/option-ltp-candle-chart")
