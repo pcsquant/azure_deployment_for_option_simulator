@@ -2,6 +2,7 @@ import hashlib
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from threading import Lock
 
@@ -46,6 +47,22 @@ MAX_RAW_PARQUET_CACHE_SIZE = int(os.getenv("MAX_RAW_PARQUET_CACHE_SIZE", "1000")
 
 OPTION_PARQUET_CACHE = {}
 OPTION_CONTRACT_CACHE = {}
+
+# Option-contract manifest cache. Building the manifest requires either a
+# recursive local filesystem walk or an Azure Blob listing, so it must never
+# happen once per contract lookup. A finite TTL allows newly uploaded files to
+# become visible without restarting the service. Set the TTL to 0 to keep a
+# manifest until it is explicitly invalidated.
+_OPTION_CONTRACT_INDEX_CACHE = {}
+_OPTION_CONTRACT_INDEX_CACHE_LOCK = Lock()
+OPTION_CONTRACT_INDEX_TTL_SECONDS = max(
+    0.0,
+    float(os.getenv("OPTION_CONTRACT_INDEX_TTL_SECONDS", "300")),
+)
+_OPTION_CONTRACT_FILENAME_PATTERN = re.compile(
+    r"^(.+?)(\d{6})(\d+(?:\.\d+)?)(CE|PE)$",
+    re.IGNORECASE,
+)
 
 
 # =========================================================
@@ -108,6 +125,132 @@ def _get_opt_folder(week_folder, date_str=None):
 
     folder = os.path.join(week_folder, "OPT_TICK")
     return folder if os.path.isdir(folder) else week_folder
+
+
+def _normalize_storage_folder(folder):
+    """Return a stable cache key for a local folder or Blob prefix."""
+    value = str(folder).replace("\\", "/").strip("/")
+
+    if STORAGE_MODE == "blob":
+        return value
+
+    return os.path.normcase(os.path.abspath(value))
+
+
+def invalidate_option_contract_index(opt_folder=None):
+    """
+    Invalidate cached option-contract manifests.
+
+    Pass a specific OPT_TICK folder/prefix to invalidate only that manifest,
+    or omit it to clear all manifests. This is useful immediately after a data
+    upload or deployment that changes the option files.
+    """
+    with _OPTION_CONTRACT_INDEX_CACHE_LOCK:
+        if opt_folder is None:
+            _OPTION_CONTRACT_INDEX_CACHE.clear()
+            return
+
+        cache_key = (STORAGE_MODE, _normalize_storage_folder(opt_folder))
+        _OPTION_CONTRACT_INDEX_CACHE.pop(cache_key, None)
+
+
+def _get_option_contract_index(opt_folder):
+    """
+    Return a cached option-contract manifest for ``opt_folder``.
+
+    The manifest maps ``(symbol, expiry, strike, side)`` to the full local path
+    or Azure Blob name. The expensive filesystem walk / Blob listing is done
+    only on a cache miss or after the configured TTL expires.
+    """
+    normalized_folder = _normalize_storage_folder(opt_folder)
+    cache_key = (STORAGE_MODE, normalized_folder)
+    now = time.monotonic()
+
+    with _OPTION_CONTRACT_INDEX_CACHE_LOCK:
+        cached = _OPTION_CONTRACT_INDEX_CACHE.get(cache_key)
+        if cached is not None:
+            age_seconds = now - cached["created_at"]
+            if (
+                OPTION_CONTRACT_INDEX_TTL_SECONDS == 0
+                or age_seconds < OPTION_CONTRACT_INDEX_TTL_SECONDS
+            ):
+                return cached["index"]
+
+        index = {}
+
+        if STORAGE_MODE == "blob":
+            try:
+                file_paths = list_blob_names(normalized_folder)
+            except Exception as exc:
+                logger.exception(
+                    "Unable to list option-contract blobs under %s: %s",
+                    normalized_folder,
+                    exc,
+                )
+                file_paths = []
+        else:
+            if not os.path.isdir(normalized_folder):
+                _OPTION_CONTRACT_INDEX_CACHE[cache_key] = {
+                    "created_at": now,
+                    "index": index,
+                }
+                return index
+
+            file_paths = (
+                os.path.join(root, filename)
+                for root, _, files in os.walk(normalized_folder)
+                for filename in files
+            )
+
+        for file_path in file_paths:
+            file_path = str(file_path)
+            filename = file_path.replace("\\", "/").rsplit("/", 1)[-1]
+
+            if not filename.lower().endswith(".parquet"):
+                continue
+
+            base_name = os.path.splitext(filename)[0].upper()
+            match = _OPTION_CONTRACT_FILENAME_PATTERN.fullmatch(base_name)
+
+            if match is None:
+                continue
+
+            symbol = match.group(1).upper()
+            expiry = match.group(2)
+
+            try:
+                strike = int(float(match.group(3)))
+            except (TypeError, ValueError, OverflowError):
+                continue
+
+            side = match.group(4).upper()
+            contract_key = (symbol, expiry, strike, side)
+
+            # Keep the first deterministic match. Duplicate contract files are
+            # logged because silently replacing one can make results unstable.
+            if contract_key in index:
+                logger.warning(
+                    "Duplicate option contract %s under %s; keeping %s and "
+                    "ignoring %s",
+                    contract_key,
+                    normalized_folder,
+                    index[contract_key],
+                    file_path,
+                )
+                continue
+
+            index[contract_key] = file_path
+
+        _OPTION_CONTRACT_INDEX_CACHE[cache_key] = {
+            "created_at": now,
+            "index": index,
+        }
+        logger.info(
+            "Built option-contract manifest for %s with %d contracts",
+            normalized_folder,
+            len(index),
+        )
+        return index
 
 
 def _find_parquet_file(folder, filename):
@@ -823,40 +966,23 @@ def load_required_option_data_for_date(
     opt_folder = _get_opt_folder(folder, date_str)
 
     result = {}
+    contract_index = _get_option_contract_index(opt_folder)
+
+    try:
+        normalized_strike = int(float(strike))
+    except (TypeError, ValueError, OverflowError):
+        logger.warning("Invalid option strike requested: %r", strike)
+        return empty
+
+    normalized_expiry = str(expiry_str).strip()
 
     for side in ["CE", "PE"]:
-        contract_stem = (
-            f"{symbol}{expiry_str}{int(strike)}{side}"
+        # -----------------------------------------------------
+        # 1. Resolve the option contract from the cached manifest
+        # -----------------------------------------------------
+        matched_path = contract_index.get(
+            (symbol, normalized_expiry, normalized_strike, side)
         )
-
-        # -----------------------------------------------------
-        # 1. Find the option contract file
-        # -----------------------------------------------------
-
-        if STORAGE_MODE == "blob":
-            matched_path = find_blob_by_filename(
-                prefix=opt_folder,
-                filename=f"{contract_stem}.parquet",
-            )
-        else:
-            matched_path = None
-
-            if os.path.isdir(opt_folder):
-                for root, _, files in os.walk(opt_folder):
-                    for current_file in files:
-                        base = os.path.splitext(
-                            current_file
-                        )[0].upper()
-
-                        if base == contract_stem.upper():
-                            matched_path = os.path.join(
-                                root,
-                                current_file,
-                            )
-                            break
-
-                    if matched_path:
-                        break
 
         if not matched_path:
             result[side] = empty[side]
@@ -1045,49 +1171,22 @@ def find_option_contract_files(
     expiry_str,
     instrument="NIFTY",
 ):
-    """Find option-contract Parquet files in local or Blob storage."""
+    """Return contracts for an expiry using the cached option manifest."""
+    cfg = get_dataset_config(instrument)
+    symbol = str(cfg["symbol"]).upper()
+    expiry = str(expiry_str).strip()
     opt_folder = _get_opt_folder(folder, date_str)
-    found = []
+    contract_index = _get_option_contract_index(opt_folder)
 
-    pattern = re.compile(
-        rf"^(.+?){re.escape(str(expiry_str))}"
-        rf"(\d+(?:\.\d+)?)(CE|PE)$",
-        re.IGNORECASE,
-    )
+    found = [
+        (strike, side, path)
+        for (current_symbol, current_expiry, strike, side), path
+        in contract_index.items()
+        if current_symbol == symbol and current_expiry == expiry
+    ]
 
-    if STORAGE_MODE == "blob":
-        file_paths = list_blob_names(opt_folder)
-    else:
-        if not os.path.isdir(opt_folder):
-            return []
-
-        file_paths = (
-            os.path.join(root, filename)
-            for root, _, files in os.walk(opt_folder)
-            for filename in files
-        )
-
-    for file_path in file_paths:
-        filename = (
-            str(file_path)
-            .replace("\\", "/")
-            .rsplit("/", 1)[-1]
-        )
-
-        if not filename.lower().endswith(".parquet"):
-            continue
-
-        base = os.path.splitext(filename)[0].upper()
-        match = pattern.match(base)
-
-        if not match:
-            continue
-
-        strike = int(float(match.group(2)))
-        side = match.group(3).upper()
-        found.append((strike, side, str(file_path)))
-
-    return found
+    # Stable ordering helps callers, tests, and reproducible API responses.
+    return sorted(found, key=lambda item: (item[0], item[1], item[2]))
 
 
 def create_candles(tick_df, interval_minutes):
