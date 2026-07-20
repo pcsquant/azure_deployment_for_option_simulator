@@ -15,6 +15,39 @@ let volSmileChart = null;
 let ivSurfaceChart = null;
 let pinnedIvPoint = null;
 
+
+let activeIndicatorChart = null;
+
+const advancedCharts = {
+  index: {
+    chart: null,
+    candleSeries: null,
+    rows: [],
+    indicators: []
+  },
+
+  future: {
+    chart: null,
+    candleSeries: null,
+    rows: [],
+    indicators: []
+  },
+
+  vix: {
+    chart: null,
+    candleSeries: null,
+    rows: [],
+    indicators: []
+  },
+
+  option: {
+    chart: null,
+    candleSeries: null,
+    rows: [],
+    indicators: []
+  }
+};
+
 const DEFAULT_DATASET = "NIFTY";
 const DEFAULT_TIME = "09:15";
 const DEFAULT_INTERVAL = 1;
@@ -342,6 +375,9 @@ async function loadChain(forceReload = false) {
     alert(err.message || "Failed to load option chain");
   }
 }
+
+
+
 let optionMetricChart = null;
 let optionMetricSeries = null;
 
@@ -356,20 +392,21 @@ async function openOptionMetricChart(event, strike, metric) {
     return;
   }
 
-  modal.style.display = "block";
+    modal.style.display = "block";
 
-  const startDate = getEl("indexChartStartDate");
-  const startTime = getEl("indexChartStartTime");
-  const endDate = getEl("indexChartEndDate");
-  const endTime = getEl("indexChartEndTime");
-  const intervalSelect = getEl("indexChartInterval");
+    const startDate = getEl("indexChartStartDate");
+    const startTime = getEl("indexChartStartTime");
+    const endDate = getEl("indexChartEndDate");
+    const endTime = getEl("indexChartEndTime");
+    const intervalSelect = getEl("indexChartInterval");
 
-  const applyBtn = getEl("indexChartApplyBtn");
-  if (applyBtn) {
-    applyBtn.dataset.chart = "option";
-    applyBtn.dataset.strike = String(strike);
-    applyBtn.dataset.metric = metric;
-  }
+    const applyBtn = getEl("indexChartApplyBtn");
+
+    if (applyBtn) {
+      applyBtn.dataset.chart = "option";
+      applyBtn.dataset.strike = String(strike);
+      applyBtn.dataset.metric = metric;
+    }
 
   if (startDate && !startDate.value) startDate.value = getQueryDate();
   if (startTime && !startTime.value) startTime.value = "09:15";
@@ -495,6 +532,16 @@ async function openOptionMetricChart(event, strike, metric) {
     });
 
     fullscreenSeries.setData(data.rows || []);
+
+    advancedCharts.option.chart = fullscreenChart;
+    advancedCharts.option.candleSeries = fullscreenSeries;
+    advancedCharts.option.rows = data.rows || [];
+
+    if (!Array.isArray(advancedCharts.option.indicators)) {
+      advancedCharts.option.indicators = [];
+    }
+    advancedCharts.option.indicators.forEach(indicator => { indicator.series = []; });
+    redrawChartIndicators("option");
 
     attachOhlcBox(
       fullscreenChart,
@@ -1540,6 +1587,13 @@ async function openChartPopup() {
 
     modal.style.display = "block";
 
+    const applyBtn = getEl("indexChartApplyBtn");
+    if (applyBtn) {
+      applyBtn.dataset.chart = "index";
+      delete applyBtn.dataset.strike;
+      delete applyBtn.dataset.metric;
+    }
+
     const startDate = getEl("indexChartStartDate");
     const startTime = getEl("indexChartStartTime");
     const endDate = getEl("indexChartEndDate");
@@ -1632,6 +1686,12 @@ async function openChartPopup() {
     });
 
     fullscreenSeries.setData(data.rows || []);
+
+    advancedCharts.index.chart = fullscreenChart;
+    advancedCharts.index.candleSeries = fullscreenSeries;
+    advancedCharts.index.rows = data.rows || [];
+    advancedCharts.index.indicators.forEach(indicator => { indicator.series = []; });
+    redrawChartIndicators("index");
 
     attachOhlcBox(
       fullscreenChart,
@@ -1765,6 +1825,15 @@ async function openFutureChartPopup() {
 
     futureSeries.setData(data.rows || []);
 
+    advancedCharts.future.chart = futureChart;
+    advancedCharts.future.candleSeries = futureSeries;
+    advancedCharts.future.rows = data.rows || [];
+
+    if (!Array.isArray(advancedCharts.future.indicators)) {
+      advancedCharts.future.indicators = [];
+    }
+    redrawChartIndicators("future");
+
     attachOhlcBox(
       futureChart,
       futureSeries,
@@ -1881,6 +1950,15 @@ async function openIndiaVixChartPopup() {
 
     vixSeries.setData(data.rows || []);
 
+    advancedCharts.vix.chart = vixChart;
+    advancedCharts.vix.candleSeries = vixSeries;
+    advancedCharts.vix.rows = data.rows || [];
+
+    if (!Array.isArray(advancedCharts.vix.indicators)) {
+      advancedCharts.vix.indicators = [];
+    }
+    redrawChartIndicators("vix");
+
     attachOhlcBox(
       vixChart,
       vixSeries,
@@ -1953,6 +2031,1350 @@ function closeGreeksPopup() {
   if (modal) modal.style.display = "none";
 }
 
+/* =========================================================
+   INDICATOR MODAL
+========================================================= */
+
+function openIndicatorModal(chartName) {
+  const modal = getEl("indicatorModal");
+
+  if (!modal) {
+    console.error("Indicator modal not found: #indicatorModal");
+    return;
+  }
+
+  activeIndicatorChart = chartName;
+
+  modal.classList.add("open");
+  modal.setAttribute("aria-hidden", "false");
+
+  refreshIndicatorModalState();
+
+  const searchInput = getEl("indicatorSearchInput");
+
+  if (searchInput) {
+    searchInput.value = "";
+    filterIndicatorList();
+    searchInput.focus();
+  }
+}
+
+function closeIndicatorModal() {
+  const modal = getEl("indicatorModal");
+
+  if (!modal) return;
+
+  modal.classList.remove("open");
+  modal.setAttribute("aria-hidden", "true");
+}
+
+function refreshIndicatorModalState() {
+  const chartState = advancedCharts[activeIndicatorChart];
+
+  document.querySelectorAll(".indicator-list-item").forEach(button => {
+    const indicatorType = button.dataset.indicator;
+    const status = button.querySelector(".indicator-status");
+
+    let isAdded = false;
+
+    if (chartState && chartState.indicators) {
+      if (Array.isArray(chartState.indicators)) {
+        isAdded = chartState.indicators.some(
+          indicator => indicator.type === indicatorType
+        );
+      } else {
+        isAdded = Boolean(chartState.indicators[indicatorType]);
+      }
+    }
+
+    button.classList.toggle("selected", isAdded);
+
+    if (status) {
+      status.textContent = isAdded ? "Added" : "Add";
+    }
+  });
+}
+
+function filterIndicatorList() {
+  const searchInput = getEl("indicatorSearchInput");
+  const searchText = String(searchInput?.value || "")
+    .trim()
+    .toLowerCase();
+
+  const activeCategory =
+    document.querySelector(".indicator-category.active")?.dataset.category ||
+    "all";
+
+  document.querySelectorAll(".indicator-list-item").forEach(button => {
+    const buttonCategory = button.dataset.category || "";
+    const buttonText = button.textContent.toLowerCase();
+
+    const matchesSearch =
+      !searchText || buttonText.includes(searchText);
+
+    const matchesCategory =
+      activeCategory === "all" || buttonCategory === activeCategory;
+
+    button.hidden = !(matchesSearch && matchesCategory);
+  });
+}
+
+function initialiseIndicatorModal() {
+  const modal = getEl("indicatorModal");
+  const closeButton = getEl("closeIndicatorModal");
+  const searchInput = getEl("indicatorSearchInput");
+
+  if (!modal) {
+    console.error("Cannot initialise indicators: #indicatorModal not found");
+    return;
+  }
+
+  /*
+   * Connect the indicator button from every chart toolbar.
+   */
+  document
+    .querySelectorAll('.chart-toolbar button[data-tool="indicators"]')
+    .forEach(button => {
+      if (button.dataset.indicatorClickAttached === "true") {
+        return;
+      }
+
+      button.addEventListener("click", event => {
+        event.preventDefault();
+        event.stopPropagation();
+
+        const toolbar = button.closest(".chart-toolbar");
+        const chartName = toolbar?.dataset.chart;
+
+        if (!chartName) {
+          console.error(
+            "The chart toolbar does not contain a data-chart value"
+          );
+          return;
+        }
+
+        openIndicatorModal(chartName);
+      });
+
+      button.dataset.indicatorClickAttached = "true";
+    });
+
+  /*
+   * Close button.
+   */
+  if (closeButton && closeButton.dataset.clickAttached !== "true") {
+    closeButton.addEventListener("click", closeIndicatorModal);
+    closeButton.dataset.clickAttached = "true";
+  }
+
+  /*
+   * Close when clicking the background.
+   */
+  if (modal.dataset.backgroundClickAttached !== "true") {
+    modal.addEventListener("click", event => {
+      if (event.target === modal) {
+        closeIndicatorModal();
+      }
+    });
+
+    modal.dataset.backgroundClickAttached = "true";
+  }
+
+  /*
+   * Indicator search.
+   */
+  if (searchInput && searchInput.dataset.inputAttached !== "true") {
+    searchInput.addEventListener("input", filterIndicatorList);
+    searchInput.dataset.inputAttached = "true";
+  }
+
+  /*
+   * Category buttons: All, Trend, Momentum, etc.
+   */
+  document.querySelectorAll(".indicator-category").forEach(button => {
+    if (button.dataset.clickAttached === "true") return;
+
+    button.addEventListener("click", () => {
+      document.querySelectorAll(".indicator-category").forEach(category => {
+        category.classList.remove("active");
+      });
+
+      button.classList.add("active");
+      filterIndicatorList();
+    });
+
+    button.dataset.clickAttached = "true";
+  });
+
+  /*
+   * Indicator list buttons.
+   * For now, this opens the settings modal.
+   */
+  document.querySelectorAll(".indicator-list-item").forEach(button => {
+    if (button.dataset.clickAttached === "true") return;
+
+    button.addEventListener("click", () => {
+      const indicatorType = button.dataset.indicator;
+
+      if (!indicatorType) {
+        console.error("Indicator type is missing");
+        return;
+      }
+
+      const chartState = advancedCharts[activeIndicatorChart];
+      const existing = Array.isArray(chartState?.indicators)
+        ? chartState.indicators.find(indicator => indicator.type === indicatorType)
+        : null;
+      openIndicatorSettings(indicatorType, existing?.id || null);
+    });
+
+    button.dataset.clickAttached = "true";
+  });
+
+  /*
+   * Escape key closes the modal.
+   */
+  if (document.body.dataset.indicatorEscapeAttached !== "true") {
+    document.addEventListener("keydown", event => {
+      if (event.key === "Escape") {
+        closeIndicatorModal();
+        closeIndicatorSettings();
+      }
+    });
+
+    document.body.dataset.indicatorEscapeAttached = "true";
+  }
+}
+
+/* =========================================================
+   INDICATOR SETTINGS MODAL
+========================================================= */
+
+let currentIndicatorType = null;
+let currentIndicatorId = null;
+
+const INDICATOR_DEFAULTS = {
+  ema: {
+    length: 20,
+    source: "close",
+    color: "#2563eb",
+    secondaryColor: "#dc2626",
+    lineWidth: 2,
+    visible: true
+  },
+
+  sma: {
+    length: 20,
+    source: "close",
+    color: "#7c3aed",
+    secondaryColor: "#dc2626",
+    lineWidth: 2,
+    visible: true
+  },
+
+  vwap: {
+    source: "hlc3",
+    color: "#f59e0b",
+    secondaryColor: "#dc2626",
+    lineWidth: 2,
+    visible: true
+  },
+
+  supertrend: {
+    atrLength: 10,
+    multiplier: 3,
+    color: "#16a34a",
+    secondaryColor: "#dc2626",
+    lineWidth: 2,
+    visible: true
+  },
+
+  bollinger: {
+    length: 20,
+    source: "close",
+    multiplier: 2,
+    color: "#2563eb",
+    secondaryColor: "#94a3b8",
+    lineWidth: 2,
+    visible: true
+  },
+
+  rsi: {
+    length: 14,
+    source: "close",
+    color: "#7c3aed",
+    secondaryColor: "#dc2626",
+    lineWidth: 2,
+    visible: true
+  },
+
+  macd: {
+    fastLength: 12,
+    slowLength: 26,
+    signalLength: 9,
+    source: "close",
+    color: "#2563eb",
+    secondaryColor: "#dc2626",
+    lineWidth: 2,
+    visible: true
+  },
+
+  atr: {
+    length: 14,
+    color: "#f97316",
+    secondaryColor: "#dc2626",
+    lineWidth: 2,
+    visible: true
+  },
+
+  volume: {
+    color: "#16a34a",
+    secondaryColor: "#dc2626",
+    lineWidth: 1,
+    visible: true
+  }
+};
+
+function createIndicatorId(type) {
+  return `${type}-${Date.now()}-${Math.random()
+    .toString(36)
+    .slice(2, 8)}`;
+}
+
+function getIndicatorDefaultSettings(type) {
+  return {
+    ...(INDICATOR_DEFAULTS[type] || {})
+  };
+}
+
+function setIndicatorFieldVisibility(type) {
+  const supportedFields = {
+    ema: ["length", "source"],
+    sma: ["length", "source"],
+    vwap: ["source"],
+    supertrend: ["atrLength", "multiplier"],
+    bollinger: ["length", "source", "multiplier"],
+    rsi: ["length", "source"],
+    macd: [
+      "source",
+      "fastLength",
+      "slowLength",
+      "signalLength"
+    ],
+    atr: ["length"],
+    volume: []
+  };
+
+  const visibleFields = supportedFields[type] || [];
+
+  document
+    .querySelectorAll("[data-setting-field]")
+    .forEach(row => {
+      const fieldName = row.dataset.settingField;
+      row.hidden = !visibleFields.includes(fieldName);
+    });
+}
+
+function fillIndicatorSettingsForm(settings) {
+  const setValue = (id, value) => {
+    const element = getEl(id);
+
+    if (element && value !== undefined && value !== null) {
+      element.value = value;
+    }
+  };
+
+  setValue("indicatorLength", settings.length ?? 20);
+  setValue("indicatorSource", settings.source ?? "close");
+  setValue("indicatorMultiplier", settings.multiplier ?? 2);
+  setValue("indicatorAtrLength", settings.atrLength ?? 10);
+  setValue("indicatorFastLength", settings.fastLength ?? 12);
+  setValue("indicatorSlowLength", settings.slowLength ?? 26);
+  setValue("indicatorSignalLength", settings.signalLength ?? 9);
+  setValue("indicatorColor", settings.color ?? "#2563eb");
+  setValue(
+    "indicatorSecondaryColor",
+    settings.secondaryColor ?? "#dc2626"
+  );
+  setValue("indicatorLineWidth", settings.lineWidth ?? 2);
+
+  const visibleInput = getEl("indicatorVisible");
+
+  if (visibleInput) {
+    visibleInput.checked = settings.visible !== false;
+  }
+}
+
+function readIndicatorSettingsForm() {
+  return {
+    length: Math.max(
+      1,
+      Number(getEl("indicatorLength")?.value || 20)
+    ),
+
+    source: getEl("indicatorSource")?.value || "close",
+
+    multiplier: Math.max(
+      0.1,
+      Number(getEl("indicatorMultiplier")?.value || 2)
+    ),
+
+    atrLength: Math.max(
+      1,
+      Number(getEl("indicatorAtrLength")?.value || 10)
+    ),
+
+    fastLength: Math.max(
+      1,
+      Number(getEl("indicatorFastLength")?.value || 12)
+    ),
+
+    slowLength: Math.max(
+      1,
+      Number(getEl("indicatorSlowLength")?.value || 26)
+    ),
+
+    signalLength: Math.max(
+      1,
+      Number(getEl("indicatorSignalLength")?.value || 9)
+    ),
+
+    color: getEl("indicatorColor")?.value || "#2563eb",
+
+    secondaryColor:
+      getEl("indicatorSecondaryColor")?.value || "#dc2626",
+
+    lineWidth: Math.max(
+      1,
+      Number(getEl("indicatorLineWidth")?.value || 2)
+    ),
+
+    visible: Boolean(getEl("indicatorVisible")?.checked)
+  };
+}
+
+function openIndicatorSettings(indicatorType, indicatorId = null) {
+  const modal = getEl("indicatorSettingsModal");
+
+  if (!modal) {
+    console.error(
+      "Indicator settings modal not found: #indicatorSettingsModal"
+    );
+    return;
+  }
+
+  currentIndicatorType = indicatorType;
+  currentIndicatorId = indicatorId;
+
+  let settings = getIndicatorDefaultSettings(indicatorType);
+
+  const chartState = advancedCharts[activeIndicatorChart];
+
+  if (
+    chartState &&
+    Array.isArray(chartState.indicators) &&
+    indicatorId
+  ) {
+    const existingIndicator = chartState.indicators.find(
+      indicator => indicator.id === indicatorId
+    );
+
+    if (existingIndicator) {
+      settings = {
+        ...settings,
+        ...existingIndicator.settings
+      };
+    }
+  }
+
+  const title = getEl("indicatorSettingsTitle");
+
+  if (title) {
+    title.textContent =
+      `Indicator settings — ${indicatorType.toUpperCase()}`;
+  }
+
+  setIndicatorFieldVisibility(indicatorType);
+  fillIndicatorSettingsForm(settings);
+
+  modal.classList.add("open");
+  modal.setAttribute("aria-hidden", "false");
+
+  showIndicatorSettingsTab("inputs");
+}
+
+function closeIndicatorSettings() {
+  const modal = getEl("indicatorSettingsModal");
+
+  if (!modal) return;
+
+  modal.classList.remove("open");
+  modal.setAttribute("aria-hidden", "true");
+
+  currentIndicatorType = null;
+  currentIndicatorId = null;
+}
+
+function showIndicatorSettingsTab(tabName) {
+  const inputsPanel = getEl("indicatorInputsPanel");
+  const stylePanel = getEl("indicatorStylePanel");
+
+  document
+    .querySelectorAll(".indicator-settings-tab")
+    .forEach(button => {
+      button.classList.toggle(
+        "active",
+        button.dataset.settingsTab === tabName
+      );
+    });
+
+  if (inputsPanel) {
+    inputsPanel.hidden = tabName !== "inputs";
+  }
+
+  if (stylePanel) {
+    stylePanel.hidden = tabName !== "style";
+  }
+}
+
+function saveIndicatorSettings() {
+  if (!activeIndicatorChart || !currentIndicatorType) {
+    console.error("No active chart or indicator selected");
+    return;
+  }
+
+  const chartState = advancedCharts[activeIndicatorChart];
+
+  if (!chartState) {
+    console.error(`Unknown chart: ${activeIndicatorChart}`);
+    return;
+  }
+
+  /*
+   * Convert old object state into an array.
+   */
+  if (!Array.isArray(chartState.indicators)) {
+    chartState.indicators = [];
+  }
+
+  const settings = readIndicatorSettingsForm();
+
+  if (currentIndicatorId) {
+    const existingIndex = chartState.indicators.findIndex(
+      indicator => indicator.id === currentIndicatorId
+    );
+
+    if (existingIndex >= 0) {
+      chartState.indicators[existingIndex] = {
+        ...chartState.indicators[existingIndex],
+        type: currentIndicatorType,
+        settings
+      };
+    }
+  } else {
+    chartState.indicators.push({
+      id: createIndicatorId(currentIndicatorType),
+      type: currentIndicatorType,
+      settings,
+      series: []
+    });
+  }
+
+  closeIndicatorSettings();
+  closeIndicatorModal();
+  refreshIndicatorModalState();
+
+  console.log(
+    `Saved ${currentIndicatorType} for ${activeIndicatorChart}`,
+    settings
+  );
+
+  /*
+   * The actual indicator drawing function will be called here.
+   */
+  redrawChartIndicators(activeIndicatorChart);
+}
+
+function removeCurrentIndicator() {
+  if (
+    !activeIndicatorChart ||
+    !currentIndicatorId
+  ) {
+    closeIndicatorSettings();
+    return;
+  }
+
+  const chartState = advancedCharts[activeIndicatorChart];
+
+  if (!chartState || !Array.isArray(chartState.indicators)) {
+    closeIndicatorSettings();
+    return;
+  }
+
+  chartState.indicators = chartState.indicators.filter(
+    indicator => indicator.id !== currentIndicatorId
+  );
+
+  closeIndicatorSettings();
+  refreshIndicatorModalState();
+  redrawChartIndicators(activeIndicatorChart);
+}
+
+function initialiseIndicatorSettingsModal() {
+  const modal = getEl("indicatorSettingsModal");
+  const closeButton = getEl("closeIndicatorSettings");
+  const cancelButton = getEl("cancelIndicatorSettings");
+  const saveButton = getEl("saveIndicatorSettings");
+  const removeButton = getEl("removeIndicatorSettings");
+
+  if (!modal) {
+    console.error(
+      "Cannot initialise indicator settings: modal not found"
+    );
+    return;
+  }
+
+  closeButton?.addEventListener(
+    "click",
+    closeIndicatorSettings
+  );
+
+  cancelButton?.addEventListener(
+    "click",
+    closeIndicatorSettings
+  );
+
+  saveButton?.addEventListener(
+    "click",
+    saveIndicatorSettings
+  );
+
+  removeButton?.addEventListener(
+    "click",
+    removeCurrentIndicator
+  );
+
+  document
+    .querySelectorAll(".indicator-settings-tab")
+    .forEach(button => {
+      button.addEventListener("click", () => {
+        showIndicatorSettingsTab(
+          button.dataset.settingsTab || "inputs"
+        );
+      });
+    });
+
+  modal.addEventListener("click", event => {
+    if (event.target === modal) {
+      closeIndicatorSettings();
+    }
+  });
+}
+
+function getIndicatorSourceValue(row, source = "close") {
+  const open = Number(row?.open);
+  const high = Number(row?.high);
+  const low = Number(row?.low);
+  const close = Number(row?.close);
+
+  if (![open, high, low, close].every(Number.isFinite)) return null;
+
+  switch (source) {
+    case "open": return open;
+    case "high": return high;
+    case "low": return low;
+    case "hl2": return (high + low) / 2;
+    case "hlc3": return (high + low + close) / 3;
+    case "ohlc4": return (open + high + low + close) / 4;
+    default: return close;
+  }
+}
+
+function calculateSMA(rows, period, source = "close") {
+  const result = [];
+  const window = [];
+  let sum = 0;
+
+  rows.forEach(row => {
+    const value = getIndicatorSourceValue(row, source);
+    if (!Number.isFinite(value)) return;
+
+    window.push(value);
+    sum += value;
+
+    if (window.length > period) sum -= window.shift();
+    if (window.length === period) result.push({ time: row.time, value: sum / period });
+  });
+
+  return result;
+}
+
+function calculateEMA(rows, period, source = "close") {
+  const values = rows
+    .map(row => ({ row, value: getIndicatorSourceValue(row, source) }))
+    .filter(item => Number.isFinite(item.value));
+
+  if (values.length < period) return [];
+
+  const result = [];
+  const multiplier = 2 / (period + 1);
+  let ema = values.slice(0, period).reduce((sum, item) => sum + item.value, 0) / period;
+  result.push({ time: values[period - 1].row.time, value: ema });
+
+  for (let i = period; i < values.length; i += 1) {
+    ema = ((values[i].value - ema) * multiplier) + ema;
+    result.push({ time: values[i].row.time, value: ema });
+  }
+
+  return result;
+}
+
+function calculateVWAP(rows, source = "hlc3") {
+  const result = [];
+  let cumulativePV = 0;
+  let cumulativeVolume = 0;
+
+  rows.forEach(row => {
+    const price = getIndicatorSourceValue(row, source);
+    const volume = Number(row?.volume ?? row?.qty ?? 0);
+    if (!Number.isFinite(price) || !Number.isFinite(volume) || volume <= 0) return;
+
+    cumulativePV += price * volume;
+    cumulativeVolume += volume;
+    result.push({ time: row.time, value: cumulativePV / cumulativeVolume });
+  });
+
+  return result;
+}
+
+function calculateBollingerBands(rows, period, multiplier, source = "close") {
+  const middle = [];
+  const upper = [];
+  const lower = [];
+  const window = [];
+
+  rows.forEach(row => {
+    const value = getIndicatorSourceValue(row, source);
+    if (!Number.isFinite(value)) return;
+
+    window.push(value);
+    if (window.length > period) window.shift();
+    if (window.length !== period) return;
+
+    const mean = window.reduce((sum, item) => sum + item, 0) / period;
+    const variance = window.reduce((sum, item) => sum + ((item - mean) ** 2), 0) / period;
+    const deviation = Math.sqrt(variance) * multiplier;
+
+    middle.push({ time: row.time, value: mean });
+    upper.push({ time: row.time, value: mean + deviation });
+    lower.push({ time: row.time, value: mean - deviation });
+  });
+
+  return { middle, upper, lower };
+}
+
+function calculateATR(rows, period) {
+  const trueRanges = [];
+  const result = [];
+  let previousClose = null;
+  let atr = null;
+
+  rows.forEach(row => {
+    const high = Number(row?.high);
+    const low = Number(row?.low);
+    const close = Number(row?.close);
+    if (![high, low, close].every(Number.isFinite)) return;
+
+    const tr = previousClose === null
+      ? high - low
+      : Math.max(high - low, Math.abs(high - previousClose), Math.abs(low - previousClose));
+    trueRanges.push({ time: row.time, value: tr });
+    previousClose = close;
+  });
+
+  if (trueRanges.length < period) return [];
+  atr = trueRanges.slice(0, period).reduce((sum, item) => sum + item.value, 0) / period;
+  result.push({ time: trueRanges[period - 1].time, value: atr });
+
+  for (let i = period; i < trueRanges.length; i += 1) {
+    atr = ((atr * (period - 1)) + trueRanges[i].value) / period;
+    result.push({ time: trueRanges[i].time, value: atr });
+  }
+
+  return result;
+}
+
+function calculateRSI(rows, period, source = "close") {
+  const values = rows
+    .map(row => ({ time: row.time, value: getIndicatorSourceValue(row, source) }))
+    .filter(item => Number.isFinite(item.value));
+  if (values.length <= period) return [];
+
+  let gains = 0;
+  let losses = 0;
+  for (let i = 1; i <= period; i += 1) {
+    const change = values[i].value - values[i - 1].value;
+    gains += Math.max(change, 0);
+    losses += Math.max(-change, 0);
+  }
+
+  let avgGain = gains / period;
+  let avgLoss = losses / period;
+  const result = [];
+  const toRsi = () => avgLoss === 0 ? 100 : 100 - (100 / (1 + (avgGain / avgLoss)));
+  result.push({ time: values[period].time, value: toRsi() });
+
+  for (let i = period + 1; i < values.length; i += 1) {
+    const change = values[i].value - values[i - 1].value;
+    avgGain = ((avgGain * (period - 1)) + Math.max(change, 0)) / period;
+    avgLoss = ((avgLoss * (period - 1)) + Math.max(-change, 0)) / period;
+    result.push({ time: values[i].time, value: toRsi() });
+  }
+
+  return result;
+}
+
+function calculateMACD(rows, fastLength, slowLength, signalLength, source = "close") {
+  const fast = calculateEMA(rows, fastLength, source);
+  const slow = calculateEMA(rows, slowLength, source);
+  const slowMap = new Map(slow.map(item => [item.time, item.value]));
+  const macd = fast
+    .filter(item => slowMap.has(item.time))
+    .map(item => ({ time: item.time, value: item.value - slowMap.get(item.time) }));
+
+  const signalRows = macd.map(item => ({
+    time: item.time,
+    open: item.value,
+    high: item.value,
+    low: item.value,
+    close: item.value
+  }));
+  const signal = calculateEMA(signalRows, signalLength, "close");
+  const signalMap = new Map(signal.map(item => [item.time, item.value]));
+  const histogram = macd
+    .filter(item => signalMap.has(item.time))
+    .map(item => ({
+      time: item.time,
+      value: item.value - signalMap.get(item.time),
+      color: item.value - signalMap.get(item.time) >= 0 ? "rgba(22,163,74,0.65)" : "rgba(220,38,38,0.65)"
+    }));
+
+  return { macd, signal, histogram };
+}
+
+function calculateSupertrend(rows, atrLength, multiplier) {
+  const atr = calculateATR(rows, atrLength);
+  const atrMap = new Map(atr.map(item => [item.time, item.value]));
+  const result = [];
+  let finalUpper = null;
+  let finalLower = null;
+  let supertrend = null;
+  let previousClose = null;
+
+  rows.forEach(row => {
+    const high = Number(row?.high);
+    const low = Number(row?.low);
+    const close = Number(row?.close);
+    const atrValue = atrMap.get(row.time);
+    if (![high, low, close, atrValue].every(Number.isFinite)) {
+      previousClose = Number.isFinite(close) ? close : previousClose;
+      return;
+    }
+
+    const hl2 = (high + low) / 2;
+    const basicUpper = hl2 + (multiplier * atrValue);
+    const basicLower = hl2 - (multiplier * atrValue);
+
+    finalUpper = finalUpper === null || basicUpper < finalUpper || previousClose > finalUpper
+      ? basicUpper
+      : finalUpper;
+    finalLower = finalLower === null || basicLower > finalLower || previousClose < finalLower
+      ? basicLower
+      : finalLower;
+
+    if (supertrend === null) supertrend = finalUpper;
+    else if (supertrend === finalUpper) supertrend = close <= finalUpper ? finalUpper : finalLower;
+    else supertrend = close >= finalLower ? finalLower : finalUpper;
+
+    result.push({
+      time: row.time,
+      value: supertrend,
+      color: close >= supertrend ? "#16a34a" : "#dc2626"
+    });
+    previousClose = close;
+  });
+
+  return result;
+}
+
+function safeRemoveSeries(chart, series) {
+  if (!chart || !series) return;
+  try { chart.removeSeries(series); } catch (error) { console.warn("Indicator series removal warning:", error); }
+}
+
+function clearIndicatorSeries(chartState, indicator) {
+  if (!Array.isArray(indicator.series)) indicator.series = [];
+  indicator.series.forEach(series => safeRemoveSeries(chartState.chart, series));
+  indicator.series = [];
+}
+
+function createLineIndicatorSeries(chartState, data, settings, options = {}) {
+  const series = chartState.chart.addLineSeries({
+    color: options.color || settings.color,
+    lineWidth: Number(settings.lineWidth || 2),
+    visible: settings.visible !== false,
+    priceScaleId: options.priceScaleId || "right",
+    lastValueVisible: options.lastValueVisible ?? true,
+    priceLineVisible: options.priceLineVisible ?? false
+  });
+  series.setData(data);
+  return series;
+}
+
+function redrawChartIndicators(chartName) {
+  const chartState = advancedCharts[chartName];
+  if (!chartState?.chart || !Array.isArray(chartState.rows)) return;
+  if (!Array.isArray(chartState.indicators)) chartState.indicators = [];
+
+  chartState.indicators.forEach(indicator => {
+    clearIndicatorSeries(chartState, indicator);
+    const settings = indicator.settings || {};
+    const rows = chartState.rows;
+
+    try {
+      if (indicator.type === "ema") {
+        indicator.series.push(createLineIndicatorSeries(chartState, calculateEMA(rows, settings.length, settings.source), settings));
+      } else if (indicator.type === "sma") {
+        indicator.series.push(createLineIndicatorSeries(chartState, calculateSMA(rows, settings.length, settings.source), settings));
+      } else if (indicator.type === "vwap") {
+        indicator.series.push(createLineIndicatorSeries(chartState, calculateVWAP(rows, settings.source), settings));
+      } else if (indicator.type === "bollinger") {
+        const bands = calculateBollingerBands(rows, settings.length, settings.multiplier, settings.source);
+        indicator.series.push(createLineIndicatorSeries(chartState, bands.middle, settings));
+        indicator.series.push(createLineIndicatorSeries(chartState, bands.upper, settings, { color: settings.secondaryColor }));
+        indicator.series.push(createLineIndicatorSeries(chartState, bands.lower, settings, { color: settings.secondaryColor }));
+      } else if (indicator.type === "supertrend") {
+        const data = calculateSupertrend(rows, settings.atrLength, settings.multiplier);
+        const series = chartState.chart.addLineSeries({
+          color: settings.color,
+          lineWidth: Number(settings.lineWidth || 2),
+          visible: settings.visible !== false,
+          priceLineVisible: false,
+          lastValueVisible: true
+        });
+        series.setData(data);
+        indicator.series.push(series);
+      } else if (indicator.type === "rsi") {
+        chartState.chart.priceScale("rsi").applyOptions({ scaleMargins: { top: 0.72, bottom: 0.02 } });
+        indicator.series.push(createLineIndicatorSeries(chartState, calculateRSI(rows, settings.length, settings.source), settings, { priceScaleId: "rsi" }));
+      } else if (indicator.type === "atr") {
+        chartState.chart.priceScale("atr").applyOptions({ scaleMargins: { top: 0.72, bottom: 0.02 } });
+        indicator.series.push(createLineIndicatorSeries(chartState, calculateATR(rows, settings.length), settings, { priceScaleId: "atr" }));
+      } else if (indicator.type === "macd") {
+        chartState.chart.priceScale("macd").applyOptions({ scaleMargins: { top: 0.72, bottom: 0.02 } });
+        const macd = calculateMACD(rows, settings.fastLength, settings.slowLength, settings.signalLength, settings.source);
+        indicator.series.push(createLineIndicatorSeries(chartState, macd.macd, settings, { priceScaleId: "macd" }));
+        indicator.series.push(createLineIndicatorSeries(chartState, macd.signal, settings, { priceScaleId: "macd", color: settings.secondaryColor }));
+        const histogram = chartState.chart.addHistogramSeries({
+          priceScaleId: "macd",
+          priceFormat: { type: "price" },
+          visible: settings.visible !== false,
+          priceLineVisible: false,
+          lastValueVisible: false
+        });
+        histogram.setData(macd.histogram);
+        indicator.series.push(histogram);
+      } else if (indicator.type === "volume") {
+        const volumeData = rows
+          .map(row => ({
+            time: row.time,
+            value: Number(row?.volume ?? row?.qty ?? 0),
+            color: Number(row?.close) >= Number(row?.open)
+              ? "rgba(22,163,74,0.55)"
+              : "rgba(220,38,38,0.55)"
+          }))
+          .filter(item => Number.isFinite(item.value) && item.value > 0);
+
+        const histogram = chartState.chart.addHistogramSeries({
+          priceScaleId: "volume",
+          priceFormat: { type: "volume" },
+          visible: settings.visible !== false,
+          priceLineVisible: false,
+          lastValueVisible: false
+        });
+        chartState.chart.priceScale("volume").applyOptions({ scaleMargins: { top: 0.78, bottom: 0 } });
+        histogram.setData(volumeData);
+        indicator.series.push(histogram);
+      }
+    } catch (error) {
+      console.error(`Failed to draw ${indicator.type} on ${chartName}:`, error);
+    }
+  });
+}
+
+/* =========================================================
+   CHART DRAWING TOOLS
+========================================================= */
+
+const chartDrawings = {
+  index: [],
+  future: [],
+  vix: []
+};
+
+const drawingState = {
+  chartName: null,
+  tool: null,
+  canvas: null,
+  context: null,
+  startPoint: null,
+  previewPoint: null,
+  drawing: false
+};
+
+function getDrawingCanvas(chartName) {
+  const ids = {
+    index: "indexDrawingCanvas",
+    future: "futureDrawingCanvas",
+    vix: "vixDrawingCanvas"
+  };
+
+  return getEl(ids[chartName]);
+}
+
+function resizeDrawingCanvas(chartName) {
+  const canvas = getDrawingCanvas(chartName);
+
+  if (!canvas) return;
+
+  const rect = canvas.parentElement.getBoundingClientRect();
+  const ratio = window.devicePixelRatio || 1;
+
+  canvas.width = Math.max(1, Math.round(rect.width * ratio));
+  canvas.height = Math.max(1, Math.round(rect.height * ratio));
+
+  canvas.style.width = `${rect.width}px`;
+  canvas.style.height = `${rect.height}px`;
+
+  const context = canvas.getContext("2d");
+
+  context.setTransform(ratio, 0, 0, ratio, 0, 0);
+
+  redrawSavedDrawings(chartName);
+}
+
+function getCanvasPoint(canvas, event) {
+  const rect = canvas.getBoundingClientRect();
+
+  return {
+    x: event.clientX - rect.left,
+    y: event.clientY - rect.top
+  };
+}
+
+function drawTrendLine(context, start, end) {
+  context.beginPath();
+  context.moveTo(start.x, start.y);
+  context.lineTo(end.x, end.y);
+  context.stroke();
+}
+
+function drawHorizontalLine(context, point, width) {
+  context.beginPath();
+  context.moveTo(0, point.y);
+  context.lineTo(width, point.y);
+  context.stroke();
+}
+
+function drawRectangle(context, start, end) {
+  const x = Math.min(start.x, end.x);
+  const y = Math.min(start.y, end.y);
+  const width = Math.abs(end.x - start.x);
+  const height = Math.abs(end.y - start.y);
+
+  context.strokeRect(x, y, width, height);
+}
+
+function drawTextAnnotation(context, point, text) {
+  context.save();
+  context.font = "bold 14px Arial";
+  context.fillStyle = "#111827";
+  context.fillText(text, point.x, point.y);
+  context.restore();
+}
+
+function applyDrawingStyle(context) {
+  context.strokeStyle = "#2563eb";
+  context.fillStyle = "#2563eb";
+  context.lineWidth = 2;
+  context.lineCap = "round";
+  context.lineJoin = "round";
+}
+
+function renderDrawing(context, canvas, drawing) {
+  applyDrawingStyle(context);
+
+  if (drawing.tool === "trend") {
+    drawTrendLine(context, drawing.start, drawing.end);
+  }
+
+  if (drawing.tool === "horizontal") {
+    drawHorizontalLine(
+      context,
+      drawing.start,
+      canvas.getBoundingClientRect().width
+    );
+  }
+
+  if (drawing.tool === "rectangle") {
+    drawRectangle(context, drawing.start, drawing.end);
+  }
+
+  if (drawing.tool === "text") {
+    drawTextAnnotation(
+      context,
+      drawing.start,
+      drawing.text || "Text"
+    );
+  }
+}
+
+function redrawSavedDrawings(chartName, previewDrawing = null) {
+  const canvas = getDrawingCanvas(chartName);
+
+  if (!canvas) return;
+
+  const context = canvas.getContext("2d");
+  const rect = canvas.getBoundingClientRect();
+
+  context.clearRect(0, 0, rect.width, rect.height);
+
+  const drawings = chartDrawings[chartName] || [];
+
+  drawings.forEach(drawing => {
+    renderDrawing(context, canvas, drawing);
+  });
+
+  if (previewDrawing) {
+    renderDrawing(context, canvas, previewDrawing);
+  }
+}
+
+function deactivateDrawingTool() {
+  if (drawingState.canvas) {
+    drawingState.canvas.classList.remove("active");
+  }
+
+  document
+    .querySelectorAll(
+      '.chart-toolbar button[data-tool="trend"], ' +
+      '.chart-toolbar button[data-tool="horizontal"], ' +
+      '.chart-toolbar button[data-tool="rectangle"], ' +
+      '.chart-toolbar button[data-tool="text"]'
+    )
+    .forEach(button => {
+      button.classList.remove("active");
+    });
+
+  drawingState.chartName = null;
+  drawingState.tool = null;
+  drawingState.canvas = null;
+  drawingState.context = null;
+  drawingState.startPoint = null;
+  drawingState.previewPoint = null;
+  drawingState.drawing = false;
+}
+
+function activateDrawingTool(chartName, tool, button) {
+  deactivateDrawingTool();
+
+  const canvas = getDrawingCanvas(chartName);
+
+  if (!canvas) {
+    console.error(`Drawing canvas missing for ${chartName}`);
+    return;
+  }
+
+  resizeDrawingCanvas(chartName);
+
+  drawingState.chartName = chartName;
+  drawingState.tool = tool;
+  drawingState.canvas = canvas;
+  drawingState.context = canvas.getContext("2d");
+
+  canvas.classList.add("active");
+  button.classList.add("active");
+}
+
+function clearChartDrawings(chartName) {
+  if (!chartDrawings[chartName]) return;
+
+  chartDrawings[chartName] = [];
+  redrawSavedDrawings(chartName);
+}
+
+function handleDrawingMouseDown(event) {
+  if (!drawingState.canvas || !drawingState.tool) return;
+
+  const point = getCanvasPoint(drawingState.canvas, event);
+
+  if (drawingState.tool === "horizontal") {
+    chartDrawings[drawingState.chartName].push({
+      tool: "horizontal",
+      start: point
+    });
+
+    redrawSavedDrawings(drawingState.chartName);
+    return;
+  }
+
+  if (drawingState.tool === "text") {
+    const text = window.prompt("Enter annotation text:");
+
+    if (text && text.trim()) {
+      chartDrawings[drawingState.chartName].push({
+        tool: "text",
+        start: point,
+        text: text.trim()
+      });
+
+      redrawSavedDrawings(drawingState.chartName);
+    }
+
+    return;
+  }
+
+  drawingState.startPoint = point;
+  drawingState.previewPoint = point;
+  drawingState.drawing = true;
+}
+
+function handleDrawingMouseMove(event) {
+  if (
+    !drawingState.drawing ||
+    !drawingState.canvas ||
+    !drawingState.startPoint
+  ) {
+    return;
+  }
+
+  drawingState.previewPoint = getCanvasPoint(
+    drawingState.canvas,
+    event
+  );
+
+  redrawSavedDrawings(drawingState.chartName, {
+    tool: drawingState.tool,
+    start: drawingState.startPoint,
+    end: drawingState.previewPoint
+  });
+}
+
+function handleDrawingMouseUp(event) {
+  if (
+    !drawingState.drawing ||
+    !drawingState.canvas ||
+    !drawingState.startPoint
+  ) {
+    return;
+  }
+
+  const endPoint = getCanvasPoint(drawingState.canvas, event);
+
+  chartDrawings[drawingState.chartName].push({
+    tool: drawingState.tool,
+    start: drawingState.startPoint,
+    end: endPoint
+  });
+
+  drawingState.startPoint = null;
+  drawingState.previewPoint = null;
+  drawingState.drawing = false;
+
+  redrawSavedDrawings(drawingState.chartName);
+}
+
+function initialiseDrawingCanvas(chartName) {
+  const canvas = getDrawingCanvas(chartName);
+
+  if (!canvas || canvas.dataset.drawingInitialised === "true") {
+    return;
+  }
+
+  canvas.addEventListener("mousedown", handleDrawingMouseDown);
+  canvas.addEventListener("mousemove", handleDrawingMouseMove);
+  canvas.addEventListener("mouseup", handleDrawingMouseUp);
+  canvas.addEventListener("mouseleave", event => {
+    if (drawingState.drawing) {
+      handleDrawingMouseUp(event);
+    }
+  });
+
+  canvas.dataset.drawingInitialised = "true";
+
+  resizeDrawingCanvas(chartName);
+}
+
+function initialiseChartDrawingTools() {
+  ["index", "future", "vix"].forEach(initialiseDrawingCanvas);
+
+  document
+    .querySelectorAll(".chart-toolbar button[data-tool]")
+    .forEach(button => {
+      if (button.dataset.drawingClickAttached === "true") {
+        return;
+      }
+
+      const tool = button.dataset.tool;
+
+      if (tool === "indicators") {
+        return;
+      }
+
+      button.addEventListener("click", event => {
+        event.preventDefault();
+
+        const toolbar = button.closest(".chart-toolbar");
+        const chartName = toolbar?.dataset.chart;
+        const chartState = advancedCharts[chartName];
+
+        if (!chartName) return;
+
+        if (tool === "fit") {
+          chartState?.chart?.timeScale().fitContent();
+          resizeDrawingCanvas(chartName);
+          return;
+        }
+
+        if (tool === "clear") {
+          clearChartDrawings(chartName);
+          deactivateDrawingTool();
+          return;
+        }
+
+        if (tool === "crosshair") {
+          deactivateDrawingTool();
+          return;
+        }
+
+        if (
+          tool === "trend" ||
+          tool === "horizontal" ||
+          tool === "rectangle" ||
+          tool === "text"
+        ) {
+          activateDrawingTool(chartName, tool, button);
+        }
+      });
+
+      button.dataset.drawingClickAttached = "true";
+    });
+
+  window.addEventListener("resize", () => {
+    ["index", "future", "vix"].forEach(resizeDrawingCanvas);
+  });
+}
+
 async function initSimulator() {
   try {
     ensureExpiryWarning();
@@ -1975,6 +3397,11 @@ window.addEventListener("DOMContentLoaded", () => {
   ensureExpiryWarning();
   ensureMetricsCards();
   ensurePositionsHeaders();
+
+  initialiseIndicatorModal();
+  initialiseIndicatorSettingsModal();
+  initialiseChartDrawingTools();
+
 
   const refreshBtn = getEl("refreshBtn");
   if (refreshBtn) refreshBtn.onclick = () => loadChain(true);
