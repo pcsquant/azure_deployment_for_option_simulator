@@ -373,14 +373,709 @@ tr.atm td:nth-child(4) {
 }
 
 /* =========================
-   CHARTS
+   ADVANCED CHARTS
 ========================= */
 
-#fullscreenIndexChart,
-#fullscreenFutureChart {
+.advanced-chart-body {
+  display: flex;
   width: 100%;
   height: calc(94vh - 64px);
+  min-height: 450px;
+  background: #ffffff;
+  overflow: hidden;
 }
+
+.vix-chart-body {
+  height: 420px;
+  min-height: 420px;
+}
+
+/* =========================
+   LEFT TOOLBAR
+========================= */
+
+.chart-toolbar {
+  width: 56px;
+  min-width: 56px;
+  height: 100%;
+  padding: 10px 7px;
+
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+
+  background: #f8fafc;
+  border-right: 1px solid #d8dee4;
+  overflow-y: auto;
+}
+
+.chart-toolbar button {
+  width: 40px;
+  height: 40px;
+  min-height: 40px;
+  padding: 0;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  border: 1px solid transparent;
+  border-radius: 6px;
+
+  background: transparent;
+  color: #334155;
+
+  font-size: 18px;
+  font-weight: 700;
+  line-height: 1;
+
+  cursor: pointer;
+  transition:
+    background-color 0.15s ease,
+    border-color 0.15s ease,
+    color 0.15s ease;
+}
+
+.chart-toolbar button:hover {
+  background: #e2e8f0;
+  border-color: #cbd5e1;
+  color: #0f172a;
+}
+
+.chart-toolbar button.active {
+  background: #2563eb;
+  border-color: #2563eb;
+  color: #ffffff;
+}
+
+.chart-toolbar button:focus-visible {
+  outline: 2px solid #38bdf8;
+  outline-offset: 2px;
+}
+
+/* =========================
+   MAIN CHART AREA
+========================= */
+
+.chart-main-area {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  overflow: hidden;
+  background: #ffffff;
+}
+
+/* =======================================================
+   DRAWING LAYER
+======================================================= */
+
+.drawing-chart-area {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.chart-drawing-canvas {
+  position: absolute;
+  inset: 0;
+  z-index: 50;
+
+  width: 100%;
+  height: 100%;
+
+  pointer-events: none;
+  cursor: crosshair;
+}
+
+.chart-drawing-canvas.active {
+  pointer-events: auto;
+}
+
+.chart-toolbar button.active {
+  border-color: #2563eb;
+  background: #2563eb;
+  color: #ffffff;
+}
+
+/* =======================================================
+   LIGHTWEIGHT CHART
+======================================================= */
+
+.advanced-chart {
+  width: 100%;
+  height: 100%;
+}
+
+/* Keep IDs for compatibility */
+#fullscreenIndexChart,
+#fullscreenFutureChart,
+#fullscreenVixChart {
+  width: 100%;
+  height: 100%;
+}
+
+/* Keep IDs for compatibility with existing JavaScript */
+#fullscreenIndexChart,
+#fullscreenFutureChart,
+#fullscreenVixChart {
+  width: 100%;
+  height: 100%;
+}
+
+/* =========================
+   INDICATOR MODAL
+========================= */
+
+.indicator-modal {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: 100000;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(15, 23, 42, 0.42);
+}
+
+.indicator-modal.open {
+  display: flex;
+}
+
+.indicator-popup {
+  width: min(900px, 96vw);
+  height: min(680px, 90vh);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: #ffffff;
+  border: 1px solid #d8dee4;
+  border-radius: 14px;
+  box-shadow: 0 22px 70px rgba(15, 23, 42, 0.25);
+}
+
+.indicator-popup-header {
+  min-height: 68px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 22px;
+  border-bottom: 1px solid #eceff3;
+}
+
+.indicator-popup-header h2 {
+  margin: 0;
+  color: #202124;
+  font-size: 21px;
+  font-weight: 700;
+}
+
+#closeIndicatorModal {
+  width: 38px;
+  height: 38px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #4b5563;
+  font-size: 30px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+#closeIndicatorModal:hover {
+  background: #f1f5f9;
+}
+
+.indicator-search-wrapper {
+  position: relative;
+  margin: 14px 20px;
+}
+
+.indicator-search-wrapper input {
+  width: 100%;
+  height: 42px;
+  padding: 8px 14px 8px 42px;
+  border: 1px solid #d7dce1;
+  border-radius: 9px;
+  background: #ffffff;
+  color: #1f2937;
+  font-size: 15px;
+}
+
+.indicator-search-wrapper input:focus {
+  border-color: #2563eb;
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
+}
+
+.indicator-search-icon {
+  position: absolute;
+  top: 50%;
+  left: 14px;
+  z-index: 2;
+  color: #6b7280;
+  font-size: 22px;
+  transform: translateY(-50%);
+  pointer-events: none;
+}
+
+.indicator-popup-content {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  overflow: hidden;
+  border-top: 1px solid #eceff3;
+}
+
+.indicator-sidebar {
+  height: 100%;
+  padding: 18px 12px;
+  overflow-y: auto;
+  border-right: 1px solid #eceff3;
+  background: #fafafa;
+}
+
+.indicator-sidebar-heading {
+  margin: 0 12px 10px;
+  color: #7a7f87;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.indicator-category {
+  width: 100%;
+  min-height: 42px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 4px;
+  padding: 9px 12px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: #27292d;
+  text-align: left;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.indicator-category:hover {
+  background: #f3f4f6;
+}
+
+.indicator-category.active {
+  background: #e8e8e9;
+  color: #111827;
+  font-weight: 700;
+}
+
+.indicator-list-area {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  padding: 16px 18px;
+  background: #ffffff;
+}
+
+.indicator-list-tabs {
+  display: flex;
+  gap: 7px;
+  margin-bottom: 18px;
+}
+
+.indicator-tab {
+  padding: 7px 15px;
+  border: 0;
+  border-radius: 18px;
+  background: #f0f1f2;
+  color: #24262a;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.indicator-tab:hover {
+  background: #e5e7eb;
+}
+
+.indicator-tab.active {
+  background: #303236;
+  color: #ffffff;
+}
+
+.indicator-list-heading {
+  padding: 0 10px 8px;
+  color: #7a7f87;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.indicator-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.indicator-list-item {
+  width: 100%;
+  min-height: 52px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 11px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #22252a;
+  text-align: left;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.indicator-list-item:hover {
+  background: #f2f4f6;
+}
+
+.indicator-list-item.selected {
+  background: #e9f2ff;
+  color: #0b5ed7;
+  font-weight: 700;
+}
+
+.indicator-item-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+}
+
+.indicator-item-copy b {
+  color: #22252a;
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.indicator-item-copy small {
+  color: #64748b;
+  font-size: 11px;
+  font-weight: 400;
+}
+
+.indicator-list-item.selected .indicator-item-copy b {
+  color: #0b5ed7;
+}
+
+.indicator-status {
+  flex-shrink: 0;
+  color: #6b7280;
+  font-size: 12px;
+}
+
+.indicator-list-item.selected .indicator-status {
+  color: #0b5ed7;
+}
+
+.indicator-list-item[hidden] {
+  display: none;
+}
+
+/* Scrollbars */
+
+.indicator-list::-webkit-scrollbar,
+.indicator-sidebar::-webkit-scrollbar,
+.indicator-settings-popup::-webkit-scrollbar {
+  width: 8px;
+}
+
+.indicator-list::-webkit-scrollbar-thumb,
+.indicator-sidebar::-webkit-scrollbar-thumb,
+.indicator-settings-popup::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 10px;
+}
+
+.indicator-list::-webkit-scrollbar-track,
+.indicator-sidebar::-webkit-scrollbar-track,
+.indicator-settings-popup::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* =========================
+   INDICATOR SETTINGS MODAL
+========================= */
+
+.indicator-settings-modal {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: 100100;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(15, 23, 42, 0.45);
+}
+
+.indicator-settings-modal.open {
+  display: flex;
+}
+
+.indicator-settings-popup {
+  width: min(480px, 95vw);
+  max-height: 88vh;
+  overflow-y: auto;
+  background: #ffffff;
+  border: 1px solid #d8dee4;
+  border-radius: 12px;
+  box-shadow: 0 22px 70px rgba(15, 23, 42, 0.28);
+}
+
+.indicator-settings-header {
+  min-height: 62px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 20px;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.indicator-settings-header h3 {
+  margin: 0;
+  color: #1f2937;
+  font-size: 18px;
+  font-weight: 700;
+}
+
+#closeIndicatorSettings {
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #4b5563;
+  font-size: 28px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+#closeIndicatorSettings:hover {
+  background: #f1f5f9;
+}
+
+.indicator-settings-tabs {
+  display: flex;
+  gap: 8px;
+  padding: 12px 20px 0;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.indicator-settings-tab {
+  padding: 9px 12px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  background: transparent;
+  color: #64748b;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.indicator-settings-tab:hover {
+  color: #1f2937;
+}
+
+.indicator-settings-tab.active {
+  border-bottom-color: #2563eb;
+  color: #2563eb;
+}
+
+.indicator-settings-panel {
+  padding: 20px;
+}
+
+.indicator-settings-panel[hidden] {
+  display: none;
+}
+
+.indicator-setting-row {
+  display: grid;
+  grid-template-columns: 150px minmax(0, 1fr);
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 16px;
+}
+
+.indicator-setting-row:last-child {
+  margin-bottom: 0;
+}
+
+.indicator-setting-row[hidden] {
+  display: none;
+}
+
+.indicator-setting-row label {
+  color: #334155;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.indicator-setting-row input,
+.indicator-setting-row select {
+  width: 100%;
+  min-width: 0;
+  height: 38px;
+}
+
+.indicator-setting-row input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  justify-self: start;
+}
+
+.indicator-setting-row input[type="color"] {
+  width: 56px;
+  height: 36px;
+  padding: 3px;
+  cursor: pointer;
+}
+
+.indicator-settings-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 16px 20px;
+  border-top: 1px solid #e5e7eb;
+  background: #f8fafc;
+}
+
+.indicator-settings-spacer {
+  flex: 1;
+}
+
+.indicator-settings-actions button {
+  min-width: 84px;
+  height: 38px;
+  cursor: pointer;
+}
+
+.indicator-settings-actions .primary {
+  border-color: #2563eb;
+  background: #2563eb;
+  color: #ffffff;
+}
+
+.indicator-settings-actions .primary:hover {
+  background: #1d4ed8;
+}
+
+.indicator-settings-actions .danger {
+  border-color: #fecaca;
+  background: #fff1f2;
+  color: #dc2626;
+}
+
+.indicator-settings-actions .danger:hover {
+  border-color: #dc2626;
+  background: #dc2626;
+  color: #ffffff;
+}
+
+/* =========================
+   RESPONSIVE INDICATOR MODAL
+========================= */
+
+@media (max-width: 700px) {
+  .indicator-modal {
+    padding: 10px;
+  }
+
+  .indicator-popup {
+    width: 100%;
+    height: 92vh;
+  }
+
+  .indicator-popup-content {
+    grid-template-columns: 145px minmax(0, 1fr);
+  }
+
+  .indicator-sidebar {
+    padding: 14px 8px;
+  }
+
+  .indicator-category {
+    gap: 8px;
+    padding: 8px;
+    font-size: 12px;
+  }
+
+  .indicator-list-area {
+    padding: 14px 10px;
+  }
+
+  .indicator-list-item {
+    font-size: 12px;
+  }
+
+  .indicator-item-copy b {
+    font-size: 12px;
+  }
+
+  .indicator-item-copy small {
+    font-size: 10px;
+  }
+
+  .indicator-popup-header h2 {
+    font-size: 17px;
+  }
+}
+
+/* =========================
+   RESPONSIVE SETTINGS MODAL
+========================= */
+
+@media (max-width: 600px) {
+  .indicator-settings-modal {
+    padding: 10px;
+  }
+
+  .indicator-settings-popup {
+    width: 100%;
+    max-height: 94vh;
+  }
+
+  .indicator-setting-row {
+    grid-template-columns: 1fr;
+    gap: 7px;
+  }
+
+  .indicator-settings-actions {
+    flex-wrap: wrap;
+  }
+
+  .indicator-settings-spacer {
+    display: none;
+  }
+
+  .indicator-settings-actions button {
+    flex: 1;
+  }
+}
+
+
+
+/* =========================
+   VIX CHART POPUP
+========================= */
 
 #vixChartModal .chart-popup {
   width: 80%;
@@ -389,9 +1084,97 @@ tr.atm td:nth-child(4) {
   max-height: 80vh;
 }
 
-#fullscreenVixChart {
-  width: 100%;
-  height: 420px;
+/* =========================
+   CHART LOADING AND ERROR
+========================= */
+
+.chart-loading,
+.chart-error,
+.chart-empty {
+  position: absolute;
+  inset: 0;
+  z-index: 120;
+
+  display: none;
+  align-items: center;
+  justify-content: center;
+
+  padding: 20px;
+  text-align: center;
+
+  background: rgba(255, 255, 255, 0.92);
+  color: #475569;
+
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.chart-loading.show,
+.chart-error.show,
+.chart-empty.show {
+  display: flex;
+}
+
+.chart-error {
+  color: #b91c1c;
+}
+
+/* =========================
+   CHART TOOLTIP
+========================= */
+
+.chart-custom-tooltip {
+  position: absolute;
+  z-index: 130;
+  display: none;
+
+  min-width: 145px;
+  padding: 8px 10px;
+
+  border: 1px solid #cbd5e1;
+  border-radius: 7px;
+
+  background: rgba(255, 255, 255, 0.95);
+  color: #1e293b;
+
+  font-size: 12px;
+  line-height: 1.5;
+
+  pointer-events: none;
+  box-shadow: 0 6px 18px rgba(15, 23, 42, 0.12);
+}
+
+.chart-custom-tooltip.visible {
+  display: block;
+}
+
+/* =========================
+   RESPONSIVE CHARTS
+========================= */
+
+@media (max-width: 900px) {
+  .advanced-chart-body {
+    height: calc(94vh - 64px);
+    min-height: 400px;
+  }
+
+  .chart-toolbar {
+    width: 48px;
+    min-width: 48px;
+    padding: 8px 4px;
+  }
+
+  .chart-toolbar button {
+    width: 36px;
+    height: 36px;
+    min-height: 36px;
+    font-size: 16px;
+  }
+
+  #vixChartModal .chart-popup {
+    width: 96%;
+    max-width: none;
+  }
 }
 
 /* =========================
@@ -534,10 +1317,6 @@ tr.atm td:nth-child(4) {
   display: block;
 }
 
-#ivSurfaceChart {
-  width: 100%;
-  height: 420px;
-}
 
 .chain-header{
     display:flex;
