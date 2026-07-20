@@ -1958,6 +1958,164 @@ function attachOhlcBox(chartInstance, series, container, boxId) {
   });
 }
 
+async function openChartPopup() {
+  try {
+    const modal = getEl("chartModal");
+    const container = getEl("fullscreenIndexChart");
+
+    if (
+      !modal ||
+      !container ||
+      typeof LightweightCharts === "undefined"
+    ) {
+      throw new Error("Index chart modal or chart library is missing");
+    }
+
+    const startDate = getEl("indexChartStartDate");
+    const startTime = getEl("indexChartStartTime");
+    const endDate = getEl("indexChartEndDate");
+    const endTime = getEl("indexChartEndTime");
+    const intervalSelect = getEl("indexChartInterval");
+    const applyBtn = getEl("indexChartApplyBtn");
+
+    modal.style.display = "block";
+
+    const chartTitle = modal.querySelector("h2");
+
+    if (chartTitle) {
+      chartTitle.textContent = `${getDataset()} Index Chart`;
+    }
+
+    if (applyBtn) {
+      applyBtn.dataset.chart = "index";
+      delete applyBtn.dataset.strike;
+      delete applyBtn.dataset.metric;
+    }
+
+    if (startDate && !startDate.value) {
+      startDate.value = getQueryDate();
+    }
+
+    if (startTime && !startTime.value) {
+      startTime.value = "09:15";
+    }
+
+    if (endDate && !endDate.dataset.userChanged) {
+      endDate.value = getQueryDate();
+    }
+
+    if (endTime && !endTime.dataset.userChanged) {
+      endTime.value = getQueryTime();
+    }
+
+    const params = new URLSearchParams({
+      dataset: getDataset(),
+      date: startDate?.value || getQueryDate(),
+      start_time: startTime?.value || "09:15",
+      end_date: endDate?.value || getQueryDate(),
+      end_time: endTime?.value || getQueryTime(),
+      interval: intervalSelect?.value || String(getInterval()),
+      _: String(Date.now())
+    });
+
+    const data = await fetchJson(
+      `/api/index-chart?${params.toString()}`
+    );
+
+    if (!data.ok || !Array.isArray(data.rows) || !data.rows.length) {
+      throw new Error("No index chart data found");
+    }
+
+    if (fullscreenChart) {
+      fullscreenChart.remove();
+      fullscreenChart = null;
+      fullscreenSeries = null;
+    }
+
+    container.innerHTML = "";
+
+    fullscreenChart = LightweightCharts.createChart(container, {
+      width: container.clientWidth,
+      height: container.clientHeight || 700,
+
+      layout: {
+        background: { color: "#ffffff" },
+        textColor: "#222222"
+      },
+
+      grid: {
+        vertLines: { color: "#eef2f7" },
+        horzLines: { color: "#eef2f7" }
+      },
+
+      crosshair: {
+        mode: LightweightCharts.CrosshairMode.Normal
+      },
+
+      timeScale: {
+        timeVisible: true,
+        secondsVisible: false,
+        borderColor: "#dddddd"
+      },
+
+      rightPriceScale: {
+        borderColor: "#dddddd"
+      }
+    });
+
+    fullscreenSeries = fullscreenChart.addCandlestickSeries({
+      upColor: "#16a34a",
+      downColor: "#dc2626",
+      borderUpColor: "#16a34a",
+      borderDownColor: "#dc2626",
+      wickUpColor: "#16a34a",
+      wickDownColor: "#dc2626"
+    });
+
+    fullscreenSeries.setData(data.rows);
+
+    advancedCharts.index.chart = fullscreenChart;
+    advancedCharts.index.candleSeries = fullscreenSeries;
+    advancedCharts.index.rows = data.rows;
+
+    if (!Array.isArray(advancedCharts.index.indicators)) {
+      advancedCharts.index.indicators = [];
+    }
+
+    advancedCharts.index.indicators.forEach(indicator => {
+      indicator.series = [];
+    });
+
+    redrawChartIndicators("index");
+
+    attachOhlcBox(
+      fullscreenChart,
+      fullscreenSeries,
+      container,
+      "indexOhlcBox"
+    );
+
+    fullscreenChart.timeScale().fitContent();
+
+    const resizeHandler = () => {
+      if (!fullscreenChart || !container) return;
+
+      fullscreenChart.applyOptions({
+        width: container.clientWidth,
+        height: container.clientHeight || 700
+      });
+    };
+
+    window.addEventListener("resize", resizeHandler, {
+      once: true
+    });
+
+  } catch (err) {
+    console.error("openChartPopup error:", err);
+    alert(err.message || "Failed to load index chart");
+  }
+}
+
 function closeChartPopup() {
   const modal = getEl("chartModal");
 
