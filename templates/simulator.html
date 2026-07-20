@@ -236,85 +236,1015 @@
     </div>
   </div>
 
-  <div id="chartModal" class="chart-modal">
-    <div class="chart-popup">
-      <div class="chart-popup-header">
-        <h2>Index Chart</h2>
-        <input type="date" id="indexChartStartDate">
-        <input type="time" id="indexChartStartTime" value="09:15">
-        <input type="date" id="indexChartEndDate">
-        <input type="time" id="indexChartEndTime" value="15:30">
-        <select id="indexChartInterval">
-          <option value="1" selected>1m</option>
-          <option value="2">2m</option>
-          <option value="3">3m</option>
-          <option value="5">5m</option>
-          <option value="10">10m</option>
-          <option value="15">15m</option>
-          <option value="30">30m</option>
-          <option value="60">1h</option>
-        </select>
-        <button type="button" id="indexChartApplyBtn" class="chart-apply-btn" data-chart="index">Apply</button>
-        <button id="closeChartPopup" type="button">&times;</button>
-      </div>
-      <div id="fullscreenIndexChart"></div>
-    </div>
-  </div>
+ <!-- =========================================================
+     INDEX CHART MODAL
+========================================================= -->
+<div id="chartModal" class="chart-modal">
+  <div class="chart-popup">
 
-  <div id="futureChartModal" class="chart-modal">
-    <div class="chart-popup">
-      <div class="chart-popup-header">
-        <h2>Future Chart</h2>
-        <select id="futureMonthSelect">
-          <option value="current">This Month</option>
-          <option value="next">Next Month</option>
-          <option value="next_to_next">Next To Next Month</option>
-        </select>
-        <input type="date" id="futureChartStartDate">
-        <input type="time" id="futureChartStartTime" value="09:15">
-        <input type="date" id="futureChartEndDate">
-        <input type="time" id="futureChartEndTime" value="15:30">
-        <select id="futureChartInterval">
-          <option value="1" selected>1m</option>
-          <option value="2">2m</option>
-          <option value="3">3m</option>
-          <option value="5">5m</option>
-          <option value="10">10m</option>
-          <option value="15">15m</option>
-          <option value="30">30m</option>
-          <option value="60">1h</option>
-        </select>
-        <button type="button" id="futureChartApplyBtn" class="chart-apply-btn" data-chart="future">Apply</button>
-        <button id="closeFutureChartPopup" type="button">&times;</button>
-      </div>
-      <div id="fullscreenFutureChart"></div>
-    </div>
-  </div>
+    <div class="chart-popup-header">
+      <h2>Index Chart</h2>
 
-  <div id="vixChartModal" class="chart-modal">
-    <div class="chart-popup">
-      <div class="chart-popup-header">
-        <h2>India VIX Chart</h2>
-        <input type="date" id="vixChartStartDate">
-        <input type="time" id="vixChartStartTime" value="09:15">
-        <input type="date" id="vixChartEndDate">
-        <input type="time" id="vixChartEndTime" value="15:30">
-        <select id="vixChartInterval">
-          <option value="1" selected>1m</option>
-          <option value="2">2m</option>
-          <option value="3">3m</option>
-          <option value="5">5m</option>
-          <option value="10">10m</option>
-          <option value="15">15m</option>
-          <option value="30">30m</option>
-          <option value="60">1h</option>
-        </select>
-        <button type="button" id="vixChartApplyBtn" class="chart-apply-btn" data-chart="vix">Apply</button>
-        <button id="closeVixChartPopup" type="button">&times;</button>
+      <input
+        type="date"
+        id="indexChartStartDate"
+        aria-label="Index chart start date"
+      >
+
+      <input
+        type="time"
+        id="indexChartStartTime"
+        value="09:15"
+        aria-label="Index chart start time"
+      >
+
+      <input
+        type="date"
+        id="indexChartEndDate"
+        aria-label="Index chart end date"
+      >
+
+      <input
+        type="time"
+        id="indexChartEndTime"
+        value="15:30"
+        aria-label="Index chart end time"
+      >
+
+      <select
+        id="indexChartInterval"
+        aria-label="Index chart interval"
+      >
+        <option value="1" selected>1m</option>
+        <option value="2">2m</option>
+        <option value="3">3m</option>
+        <option value="5">5m</option>
+        <option value="10">10m</option>
+        <option value="15">15m</option>
+        <option value="30">30m</option>
+        <option value="60">1h</option>
+      </select>
+
+      <button
+        type="button"
+        id="indexChartApplyBtn"
+        class="chart-apply-btn"
+        data-chart="index"
+      >
+        Apply
+      </button>
+
+      <button
+        id="closeChartPopup"
+        type="button"
+        title="Close"
+        aria-label="Close index chart"
+      >
+        &times;
+      </button>
+    </div>
+
+    <div class="advanced-chart-body">
+
+      <div
+        class="chart-toolbar"
+        data-chart="index"
+        aria-label="Index chart tools"
+      >
+        <button
+          type="button"
+          data-tool="crosshair"
+          class="active"
+          title="Crosshair"
+          aria-label="Crosshair"
+        >
+          ＋
+        </button>
+
+        <button
+          type="button"
+          data-tool="indicators"
+          title="Indicators"
+          aria-label="Open index indicators"
+        >
+          📊
+        </button>
+
+        <button
+          type="button"
+          data-tool="trend"
+          title="Trend line"
+          aria-label="Trend line"
+        >
+          ╱
+        </button>
+
+        <button
+          type="button"
+          data-tool="horizontal"
+          title="Horizontal line"
+          aria-label="Horizontal line"
+        >
+          —
+        </button>
+
+        <button
+          type="button"
+          data-tool="rectangle"
+          title="Rectangle"
+          aria-label="Rectangle"
+        >
+          ▭
+        </button>
+
+        <button
+          type="button"
+          data-tool="text"
+          title="Text annotation"
+          aria-label="Text annotation"
+        >
+          T
+        </button>
+
+        <button
+          type="button"
+          data-tool="fit"
+          title="Fit chart"
+          aria-label="Fit index chart"
+        >
+          ⛶
+        </button>
+
+        <button
+          type="button"
+          data-tool="clear"
+          title="Clear drawings"
+          aria-label="Clear index chart drawings"
+        >
+          🗑
+        </button>
       </div>
-      <div id="fullscreenVixChart"></div>
+
+      <div class="chart-main-area drawing-chart-area">
+        <div
+          id="fullscreenIndexChart"
+          class="advanced-chart"
+        ></div>
+
+        <canvas
+          id="indexDrawingCanvas"
+          class="chart-drawing-canvas"
+          data-chart="index"
+        ></canvas>
+      </div>
+
     </div>
   </div>
+</div>
+
+
+<!-- =========================================================
+     FUTURE CHART MODAL
+========================================================= -->
+<div id="futureChartModal" class="chart-modal">
+  <div class="chart-popup">
+
+    <div class="chart-popup-header">
+      <h2>Future Chart</h2>
+
+      <select
+        id="futureMonthSelect"
+        aria-label="Future contract month"
+      >
+        <option value="current">This Month</option>
+        <option value="next">Next Month</option>
+        <option value="next_to_next">Next To Next Month</option>
+      </select>
+
+      <input
+        type="date"
+        id="futureChartStartDate"
+        aria-label="Future chart start date"
+      >
+
+      <input
+        type="time"
+        id="futureChartStartTime"
+        value="09:15"
+        aria-label="Future chart start time"
+      >
+
+      <input
+        type="date"
+        id="futureChartEndDate"
+        aria-label="Future chart end date"
+      >
+
+      <input
+        type="time"
+        id="futureChartEndTime"
+        value="15:30"
+        aria-label="Future chart end time"
+      >
+
+      <select
+        id="futureChartInterval"
+        aria-label="Future chart interval"
+      >
+        <option value="1" selected>1m</option>
+        <option value="2">2m</option>
+        <option value="3">3m</option>
+        <option value="5">5m</option>
+        <option value="10">10m</option>
+        <option value="15">15m</option>
+        <option value="30">30m</option>
+        <option value="60">1h</option>
+      </select>
+
+      <button
+        type="button"
+        id="futureChartApplyBtn"
+        class="chart-apply-btn"
+        data-chart="future"
+      >
+        Apply
+      </button>
+
+      <button
+        id="closeFutureChartPopup"
+        type="button"
+        title="Close"
+        aria-label="Close future chart"
+      >
+        &times;
+      </button>
+    </div>
+
+    <div class="advanced-chart-body">
+
+      <div
+        class="chart-toolbar"
+        data-chart="future"
+        aria-label="Future chart tools"
+      >
+        <button
+          type="button"
+          data-tool="crosshair"
+          class="active"
+          title="Crosshair"
+          aria-label="Crosshair"
+        >
+          ＋
+        </button>
+
+        <button
+          type="button"
+          data-tool="indicators"
+          title="Indicators"
+          aria-label="Open future indicators"
+        >
+          📊
+        </button>
+
+        <button
+          type="button"
+          data-tool="trend"
+          title="Trend line"
+          aria-label="Trend line"
+        >
+          ╱
+        </button>
+
+        <button
+          type="button"
+          data-tool="horizontal"
+          title="Horizontal line"
+          aria-label="Horizontal line"
+        >
+          —
+        </button>
+
+        <button
+          type="button"
+          data-tool="rectangle"
+          title="Rectangle"
+          aria-label="Rectangle"
+        >
+          ▭
+        </button>
+
+        <button
+          type="button"
+          data-tool="text"
+          title="Text annotation"
+          aria-label="Text annotation"
+        >
+          T
+        </button>
+
+        <button
+          type="button"
+          data-tool="fit"
+          title="Fit chart"
+          aria-label="Fit future chart"
+        >
+          ⛶
+        </button>
+
+        <button
+          type="button"
+          data-tool="clear"
+          title="Clear drawings"
+          aria-label="Clear future chart drawings"
+        >
+          🗑
+        </button>
+      </div>
+
+      <div class="chart-main-area drawing-chart-area">
+        <div
+          id="fullscreenFutureChart"
+          class="advanced-chart"
+        ></div>
+
+        <canvas
+          id="futureDrawingCanvas"
+          class="chart-drawing-canvas"
+          data-chart="future"
+        ></canvas>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+
+<!-- =========================================================
+     INDIA VIX CHART MODAL
+========================================================= -->
+<div id="vixChartModal" class="chart-modal">
+  <div class="chart-popup">
+
+    <div class="chart-popup-header">
+      <h2>India VIX Chart</h2>
+
+      <input
+        type="date"
+        id="vixChartStartDate"
+        aria-label="India VIX chart start date"
+      >
+
+      <input
+        type="time"
+        id="vixChartStartTime"
+        value="09:15"
+        aria-label="India VIX chart start time"
+      >
+
+      <input
+        type="date"
+        id="vixChartEndDate"
+        aria-label="India VIX chart end date"
+      >
+
+      <input
+        type="time"
+        id="vixChartEndTime"
+        value="15:30"
+        aria-label="India VIX chart end time"
+      >
+
+      <select
+        id="vixChartInterval"
+        aria-label="India VIX chart interval"
+      >
+        <option value="1" selected>1m</option>
+        <option value="2">2m</option>
+        <option value="3">3m</option>
+        <option value="5">5m</option>
+        <option value="10">10m</option>
+        <option value="15">15m</option>
+        <option value="30">30m</option>
+        <option value="60">1h</option>
+      </select>
+
+      <button
+        type="button"
+        id="vixChartApplyBtn"
+        class="chart-apply-btn"
+        data-chart="vix"
+      >
+        Apply
+      </button>
+
+      <button
+        id="closeVixChartPopup"
+        type="button"
+        title="Close"
+        aria-label="Close India VIX chart"
+      >
+        &times;
+      </button>
+    </div>
+
+    <div class="advanced-chart-body vix-chart-body">
+
+      <div
+        class="chart-toolbar"
+        data-chart="vix"
+        aria-label="India VIX chart tools"
+      >
+        <button
+          type="button"
+          data-tool="crosshair"
+          class="active"
+          title="Crosshair"
+          aria-label="Crosshair"
+        >
+          ＋
+        </button>
+
+        <button
+          type="button"
+          data-tool="indicators"
+          title="Indicators"
+          aria-label="Open India VIX indicators"
+        >
+          📊
+        </button>
+
+        <button
+          type="button"
+          data-tool="trend"
+          title="Trend line"
+          aria-label="Trend line"
+        >
+          ╱
+        </button>
+
+        <button
+          type="button"
+          data-tool="horizontal"
+          title="Horizontal line"
+          aria-label="Horizontal line"
+        >
+          —
+        </button>
+
+        <button
+          type="button"
+          data-tool="rectangle"
+          title="Rectangle"
+          aria-label="Rectangle"
+        >
+          ▭
+        </button>
+
+        <button
+          type="button"
+          data-tool="text"
+          title="Text annotation"
+          aria-label="Text annotation"
+        >
+          T
+        </button>
+
+        <button
+          type="button"
+          data-tool="fit"
+          title="Fit chart"
+          aria-label="Fit India VIX chart"
+        >
+          ⛶
+        </button>
+
+        <button
+          type="button"
+          data-tool="clear"
+          title="Clear drawings"
+          aria-label="Clear India VIX chart drawings"
+        >
+          🗑
+        </button>
+      </div>
+
+      <div class="chart-main-area drawing-chart-area">
+        <div
+          id="fullscreenVixChart"
+          class="advanced-chart"
+        ></div>
+
+        <canvas
+          id="vixDrawingCanvas"
+          class="chart-drawing-canvas"
+          data-chart="vix"
+        ></canvas>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+
+<!-- =========================================================
+     SHARED INDICATOR SELECTION MODAL
+     Add this only once
+========================================================= -->
+<div
+  id="indicatorModal"
+  class="indicator-modal"
+  aria-hidden="true"
+>
+  <div
+    class="indicator-popup"
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="indicatorModalTitle"
+  >
+
+    <div class="indicator-popup-header">
+      <h2 id="indicatorModalTitle">
+        Indicators, metrics, and strategies
+      </h2>
+
+      <button
+        id="closeIndicatorModal"
+        type="button"
+        aria-label="Close indicator window"
+        title="Close"
+      >
+        &times;
+      </button>
+    </div>
+
+    <div class="indicator-search-wrapper">
+      <span
+        class="indicator-search-icon"
+        aria-hidden="true"
+      >
+        ⌕
+      </span>
+
+      <input
+        id="indicatorSearchInput"
+        type="search"
+        placeholder="Search indicators"
+        autocomplete="off"
+        aria-label="Search indicators"
+      >
+    </div>
+
+    <div class="indicator-popup-content">
+
+      <!-- Left-side indicator categories -->
+      <aside class="indicator-sidebar">
+
+        <div class="indicator-sidebar-heading">
+          Built-in
+        </div>
+
+        <button
+          type="button"
+          class="indicator-category active"
+          data-category="all"
+        >
+          <span aria-hidden="true">▦</span>
+          <span>All indicators</span>
+        </button>
+
+        <button
+          type="button"
+          class="indicator-category"
+          data-category="trend"
+        >
+          <span aria-hidden="true">📈</span>
+          <span>Trend</span>
+        </button>
+
+        <button
+          type="button"
+          class="indicator-category"
+          data-category="momentum"
+        >
+          <span aria-hidden="true">⚡</span>
+          <span>Momentum</span>
+        </button>
+
+        <button
+          type="button"
+          class="indicator-category"
+          data-category="volatility"
+        >
+          <span aria-hidden="true">〽</span>
+          <span>Volatility</span>
+        </button>
+
+        <button
+          type="button"
+          class="indicator-category"
+          data-category="volume"
+        >
+          <span aria-hidden="true">▥</span>
+          <span>Volume</span>
+        </button>
+
+      </aside>
+
+      <!-- Right-side indicator list -->
+      <main class="indicator-list-area">
+
+        <div class="indicator-list-tabs">
+          <button
+            type="button"
+            class="indicator-tab active"
+            data-tab="indicators"
+          >
+            Indicators
+          </button>
+
+          <button
+            type="button"
+            class="indicator-tab"
+            data-tab="strategies"
+          >
+            Strategies
+          </button>
+
+          <button
+            type="button"
+            class="indicator-tab"
+            data-tab="patterns"
+          >
+            Patterns
+          </button>
+        </div>
+
+        <div class="indicator-list-heading">
+          Indicator name
+        </div>
+
+        <div
+          id="indicatorList"
+          class="indicator-list"
+        >
+
+          <button
+            type="button"
+            class="indicator-list-item"
+            data-indicator="ema"
+            data-category="trend"
+          >
+            <span class="indicator-item-copy">
+              <b>Moving Average Exponential</b>
+              <small>EMA — adjustable length and source</small>
+            </span>
+            <span class="indicator-status">Add</span>
+          </button>
+
+          <button
+            type="button"
+            class="indicator-list-item"
+            data-indicator="sma"
+            data-category="trend"
+          >
+            <span class="indicator-item-copy">
+              <b>Moving Average Simple</b>
+              <small>SMA — adjustable length and source</small>
+            </span>
+            <span class="indicator-status">Add</span>
+          </button>
+
+          <button
+            type="button"
+            class="indicator-list-item"
+            data-indicator="vwap"
+            data-category="volume"
+          >
+            <span class="indicator-item-copy">
+              <b>Volume Weighted Average Price</b>
+              <small>VWAP — requires volume data</small>
+            </span>
+            <span class="indicator-status">Add</span>
+          </button>
+
+          <button
+            type="button"
+            class="indicator-list-item"
+            data-indicator="supertrend"
+            data-category="trend"
+          >
+            <span class="indicator-item-copy">
+              <b>Supertrend</b>
+              <small>Adjustable ATR length and multiplier</small>
+            </span>
+            <span class="indicator-status">Add</span>
+          </button>
+
+          <button
+            type="button"
+            class="indicator-list-item"
+            data-indicator="bollinger"
+            data-category="volatility"
+          >
+            <span class="indicator-item-copy">
+              <b>Bollinger Bands</b>
+              <small>Adjustable length, source and deviation</small>
+            </span>
+            <span class="indicator-status">Add</span>
+          </button>
+
+          <button
+            type="button"
+            class="indicator-list-item"
+            data-indicator="rsi"
+            data-category="momentum"
+          >
+            <span class="indicator-item-copy">
+              <b>Relative Strength Index</b>
+              <small>RSI — separate pane</small>
+            </span>
+            <span class="indicator-status">Add</span>
+          </button>
+
+          <button
+            type="button"
+            class="indicator-list-item"
+            data-indicator="macd"
+            data-category="momentum"
+          >
+            <span class="indicator-item-copy">
+              <b>Moving Average Convergence Divergence</b>
+              <small>MACD — separate pane</small>
+            </span>
+            <span class="indicator-status">Add</span>
+          </button>
+
+          <button
+            type="button"
+            class="indicator-list-item"
+            data-indicator="atr"
+            data-category="volatility"
+          >
+            <span class="indicator-item-copy">
+              <b>Average True Range</b>
+              <small>ATR — separate pane</small>
+            </span>
+            <span class="indicator-status">Add</span>
+          </button>
+
+          <button
+            type="button"
+            class="indicator-list-item"
+            data-indicator="volume"
+            data-category="volume"
+          >
+            <span class="indicator-item-copy">
+              <b>Volume</b>
+              <small>Volume histogram</small>
+            </span>
+            <span class="indicator-status">Add</span>
+          </button>
+
+        </div>
+      </main>
+    </div>
+  </div>
+</div>
+
+<!-- =========================================================
+     INDICATOR SETTINGS MODAL
+     Add this only once, after the indicator selection modal
+========================================================= -->
+<div
+  id="indicatorSettingsModal"
+  class="indicator-settings-modal"
+  aria-hidden="true"
+>
+  <div
+    class="indicator-settings-popup"
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="indicatorSettingsTitle"
+  >
+    <div class="indicator-settings-header">
+      <h3 id="indicatorSettingsTitle">Indicator settings</h3>
+
+      <button
+        type="button"
+        id="closeIndicatorSettings"
+        aria-label="Close indicator settings"
+        title="Close"
+      >
+        &times;
+      </button>
+    </div>
+
+    <div class="indicator-settings-tabs">
+      <button
+        type="button"
+        class="indicator-settings-tab active"
+        data-settings-tab="inputs"
+      >
+        Inputs
+      </button>
+
+      <button
+        type="button"
+        class="indicator-settings-tab"
+        data-settings-tab="style"
+      >
+        Style
+      </button>
+    </div>
+
+    <div
+      id="indicatorInputsPanel"
+      class="indicator-settings-panel"
+    >
+      <div
+        class="indicator-setting-row"
+        data-setting-field="length"
+      >
+        <label for="indicatorLength">Length</label>
+
+        <input
+          id="indicatorLength"
+          type="number"
+          min="1"
+          step="1"
+          value="20"
+        >
+      </div>
+
+      <div
+        class="indicator-setting-row"
+        data-setting-field="source"
+      >
+        <label for="indicatorSource">Source</label>
+
+        <select id="indicatorSource">
+          <option value="close">Close</option>
+          <option value="open">Open</option>
+          <option value="high">High</option>
+          <option value="low">Low</option>
+          <option value="hl2">HL2</option>
+          <option value="hlc3">HLC3</option>
+          <option value="ohlc4">OHLC4</option>
+        </select>
+      </div>
+
+      <div
+        class="indicator-setting-row"
+        data-setting-field="multiplier"
+      >
+        <label for="indicatorMultiplier">Multiplier</label>
+
+        <input
+          id="indicatorMultiplier"
+          type="number"
+          min="0.1"
+          step="0.1"
+          value="2"
+        >
+      </div>
+
+      <div
+        class="indicator-setting-row"
+        data-setting-field="atrLength"
+      >
+        <label for="indicatorAtrLength">ATR length</label>
+
+        <input
+          id="indicatorAtrLength"
+          type="number"
+          min="1"
+          step="1"
+          value="10"
+        >
+      </div>
+
+      <div
+        class="indicator-setting-row"
+        data-setting-field="fastLength"
+      >
+        <label for="indicatorFastLength">Fast length</label>
+
+        <input
+          id="indicatorFastLength"
+          type="number"
+          min="1"
+          step="1"
+          value="12"
+        >
+      </div>
+
+      <div
+        class="indicator-setting-row"
+        data-setting-field="slowLength"
+      >
+        <label for="indicatorSlowLength">Slow length</label>
+
+        <input
+          id="indicatorSlowLength"
+          type="number"
+          min="1"
+          step="1"
+          value="26"
+        >
+      </div>
+
+      <div
+        class="indicator-setting-row"
+        data-setting-field="signalLength"
+      >
+        <label for="indicatorSignalLength">Signal length</label>
+
+        <input
+          id="indicatorSignalLength"
+          type="number"
+          min="1"
+          step="1"
+          value="9"
+        >
+      </div>
+    </div>
+
+    <div
+      id="indicatorStylePanel"
+      class="indicator-settings-panel"
+      hidden
+    >
+      <div class="indicator-setting-row">
+        <label for="indicatorColor">Colour</label>
+
+        <input
+          id="indicatorColor"
+          type="color"
+          value="#2563eb"
+        >
+      </div>
+
+      <div class="indicator-setting-row">
+        <label for="indicatorSecondaryColor">Secondary colour</label>
+
+        <input
+          id="indicatorSecondaryColor"
+          type="color"
+          value="#dc2626"
+        >
+      </div>
+
+      <div class="indicator-setting-row">
+        <label for="indicatorLineWidth">Line width</label>
+
+        <select id="indicatorLineWidth">
+          <option value="1">1</option>
+          <option value="2" selected>2</option>
+          <option value="3">3</option>
+          <option value="4">4</option>
+        </select>
+      </div>
+
+      <div class="indicator-setting-row">
+        <label for="indicatorVisible">Visible</label>
+
+        <input
+          id="indicatorVisible"
+          type="checkbox"
+          checked
+        >
+      </div>
+    </div>
+
+    <div class="indicator-settings-actions">
+      <button
+        type="button"
+        id="removeIndicatorSettings"
+        class="danger"
+      >
+        Remove
+      </button>
+
+      <span class="indicator-settings-spacer"></span>
+
+      <button
+        type="button"
+        id="cancelIndicatorSettings"
+      >
+        Cancel
+      </button>
+
+      <button
+        type="button"
+        id="saveIndicatorSettings"
+        class="primary"
+      >
+        Apply
+      </button>
+    </div>
+  </div>
+</div>
+
 
   <script src="/static/simulator.js"></script>
 </body>
