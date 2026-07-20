@@ -1,6 +1,7 @@
 let chain = [];
 let legs = [];
 let chart = null;
+
 let appDefaults = null;
 
 let fullscreenChart = null;
@@ -115,6 +116,91 @@ function getStrikeCount() {
   const input = getEl("strikeCount");
   const value = Number(input?.value || DEFAULT_STRIKE_COUNT);
   return value > 0 ? Math.floor(value) : DEFAULT_STRIKE_COUNT;
+}
+
+function parseExpiryValue(expiryValue) {
+  const value = String(expiryValue || "").trim();
+
+  if (!/^\d{6}$/.test(value)) {
+    return null;
+  }
+
+  const year = 2000 + Number(value.slice(0, 2));
+  const month = Number(value.slice(2, 4)) - 1;
+  const day = Number(value.slice(4, 6));
+
+  const expiryDate = new Date(year, month, day);
+
+  return Number.isNaN(expiryDate.getTime())
+    ? null
+    : expiryDate;
+}
+
+
+function isNiftyMonthlyExpiry(expiryValue) {
+  const selectedDate = parseExpiryValue(expiryValue);
+
+  if (!selectedDate) {
+    return false;
+  }
+
+  const expirySelect = getEl("expirySelect");
+
+  if (!expirySelect) {
+    return false;
+  }
+
+  const sameMonthExpiries = Array.from(expirySelect.options)
+    .map(option => ({
+      value: option.value,
+      date: parseExpiryValue(option.value)
+    }))
+    .filter(item =>
+      item.date &&
+      item.date.getFullYear() === selectedDate.getFullYear() &&
+      item.date.getMonth() === selectedDate.getMonth()
+    )
+    .sort((a, b) => a.date - b.date);
+
+  if (!sameMonthExpiries.length) {
+    return false;
+  }
+
+  const monthlyExpiry =
+    sameMonthExpiries[sameMonthExpiries.length - 1].value;
+
+  return String(expiryValue) === String(monthlyExpiry);
+}
+
+
+function getStrikeStep(expiryValue = null) {
+  const dataset = getDataset();
+
+  if (dataset === "BANKNIFTY" || dataset === "SENSEX") {
+    return 100;
+  }
+
+  if (
+    dataset === "NIFTY" &&
+    isNiftyMonthlyExpiry(expiryValue)
+  ) {
+    return 100;
+  }
+
+  return 50;
+}
+
+
+function normalizeStrike(strike, expiryValue = null) {
+  const value = Number(strike);
+
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+
+  const step = getStrikeStep(expiryValue);
+
+  return Math.round(value / step) * step;
 }
 
 function setSpot(value) {
@@ -759,7 +845,8 @@ function renderVolSmile() {
       spanGaps: true,
       plugins: {
         legend: {
-          position: "top"
+          position: "top",
+          align: "start"
         }
       },
       scales: {
@@ -1197,13 +1284,24 @@ function getGreeksForLeg(type, strike) {
 }
 
 function createLeg(side, type, strike, premium, lots = 1) {
-  const g = getGreeksForLeg(type, strike);
+  const expiry =
+    getEl("expirySelect")?.value || "current expiry";
+
+  const normalizedStrike = normalizeStrike(
+    strike,
+    expiry
+  );
+
+  const g = getGreeksForLeg(
+    type,
+    normalizedStrike
+  );
 
   return {
     side,
     type,
-    strike: Number(strike),
-    expiry: getEl("expirySelect")?.value || "current expiry",
+    strike: normalizedStrike,
+    expiry,
     entry_time: getQueryTime(),
     premium: Number(premium || 0),
     lots: Number(lots || 1),
@@ -1223,13 +1321,21 @@ function addLeg(side, type, strike, premium) {
 }
 
 function addEmptyLeg() {
+  const expiry =
+    getEl("expirySelect")?.value || "current expiry";
+
   const atmRow = chain.find(row => row.atm);
-  const atm = atmRow ? Number(atmRow.strike) : Math.round(getSpot() / 50) * 50;
+
+  const atm = atmRow
+    ? normalizeStrike(atmRow.strike, expiry)
+    : normalizeStrike(getSpot(), expiry);
+
   addLeg("BUY", "CE", atm, 100);
 }
 
 function removeLeg(index) {
   legs.splice(index, 1);
+
   renderLegs();
   calculate();
 }
@@ -1239,7 +1345,30 @@ function updateLeg(index, field, value) {
 
   if (field === "qty") {
     legs[index].qty = getFixedQty();
-  } else {
+  }
+
+  else if (field === "strike") {
+    legs[index].strike = normalizeStrike(
+      value,
+      legs[index].expiry
+    );
+
+    // Show the corrected strike immediately
+    renderLegs();
+  }
+
+  else if (field === "expiry") {
+    legs[index].expiry = value;
+
+    legs[index].strike = normalizeStrike(
+      legs[index].strike,
+      value
+    );
+
+    renderLegs();
+  }
+
+  else {
     legs[index][field] = value;
   }
 
@@ -1255,8 +1384,14 @@ function renderLegs() {
   body.innerHTML = "";
 
   legs.forEach((leg, i) => {
-    if (!leg.expiry) leg.expiry = "current expiry";
-    if (!leg.entry_time) leg.entry_time = getQueryTime();
+    if (!leg.expiry) {
+      leg.expiry =
+        getEl("expirySelect")?.value || "current expiry";
+    }
+
+    if (!leg.entry_time) {
+      leg.entry_time = getQueryTime();
+    }
 
     leg.qty = getFixedQty();
 
@@ -1264,64 +1399,155 @@ function renderLegs() {
 
     tr.innerHTML = `
       <td>
-        <select onchange="updateLeg(${i}, 'side', this.value)">
-          <option value="BUY" ${leg.side === "BUY" ? "selected" : ""}>BUY</option>
-          <option value="SELL" ${leg.side === "SELL" ? "selected" : ""}>SELL</option>
+        <select
+          onchange="updateLeg(${i}, 'side', this.value)"
+        >
+          <option
+            value="BUY"
+            ${leg.side === "BUY" ? "selected" : ""}
+          >
+            BUY
+          </option>
+
+          <option
+            value="SELL"
+            ${leg.side === "SELL" ? "selected" : ""}
+          >
+            SELL
+          </option>
         </select>
       </td>
 
       <td>
-        <select onchange="updateLeg(${i}, 'type', this.value)">
-          <option value="CE" ${leg.type === "CE" ? "selected" : ""}>CE</option>
-          <option value="PE" ${leg.type === "PE" ? "selected" : ""}>PE</option>
+        <select
+          onchange="updateLeg(${i}, 'type', this.value)"
+        >
+          <option
+            value="CE"
+            ${leg.type === "CE" ? "selected" : ""}
+          >
+            CE
+          </option>
+
+          <option
+            value="PE"
+            ${leg.type === "PE" ? "selected" : ""}
+          >
+            PE
+          </option>
         </select>
       </td>
 
       <td>
-        <input class="leg-input" type="number" value="${leg.strike}"
-          onchange="updateLeg(${i}, 'strike', Number(this.value))">
+        <input
+          class="leg-input"
+          type="number"
+          value="${leg.strike}"
+          step="${getStrikeStep(leg.expiry)}"
+          onchange="updateLeg(
+            ${i},
+            'strike',
+            Number(this.value)
+          )"
+        >
       </td>
 
       <td>
-  <select class="leg-input" onchange="updateLeg(${i}, 'expiry', this.value)">
-    ${
-      getEl("expirySelect")
-        ? Array.from(getEl("expirySelect").options)
-            .map(
-              opt => `
-                <option value="${opt.value}"
-                  ${leg.expiry === opt.value ? "selected" : ""}>
-                  ${opt.textContent}
-                </option>
-              `
-            )
-            .join("")
-        : `<option value="${leg.expiry}">${leg.expiry}</option>`
-    }
-  </select>
-</td>
-
-      <td>
-        <input class="leg-input leg-entry-time" type="time" value="${leg.entry_time}"
-          onchange="updateLeg(${i}, 'entry_time', this.value)">
+        <select
+          class="leg-input"
+          onchange="updateLeg(
+            ${i},
+            'expiry',
+            this.value
+          )"
+        >
+          ${
+            getEl("expirySelect")
+              ? Array.from(
+                  getEl("expirySelect").options
+                )
+                  .map(
+                    option => `
+                      <option
+                        value="${option.value}"
+                        ${
+                          leg.expiry === option.value
+                            ? "selected"
+                            : ""
+                        }
+                      >
+                        ${option.textContent}
+                      </option>
+                    `
+                  )
+                  .join("")
+              : `
+                  <option value="${leg.expiry}">
+                    ${leg.expiry}
+                  </option>
+                `
+          }
+        </select>
       </td>
 
       <td>
-        <input class="leg-input" type="number" value="${leg.premium}" step="0.05"
-          onchange="updateLeg(${i}, 'premium', Number(this.value))">
+        <input
+          class="leg-input leg-entry-time"
+          type="time"
+          value="${leg.entry_time}"
+          onchange="updateLeg(
+            ${i},
+            'entry_time',
+            this.value
+          )"
+        >
       </td>
 
       <td>
-        <input class="leg-input" type="number" value="${leg.lots}"
-          onchange="updateLeg(${i}, 'lots', Number(this.value))">
+        <input
+          class="leg-input"
+          type="number"
+          value="${leg.premium}"
+          step="0.05"
+          min="0"
+          onchange="updateLeg(
+            ${i},
+            'premium',
+            Number(this.value)
+          )"
+        >
       </td>
 
       <td>
-        <input class="leg-input" type="number" value="${getFixedQty()}" readonly>
+        <input
+          class="leg-input"
+          type="number"
+          value="${leg.lots}"
+          step="1"
+          min="1"
+          onchange="updateLeg(
+            ${i},
+            'lots',
+            Number(this.value)
+          )"
+        >
       </td>
 
       <td>
-        <button class="delete-leg-btn" type="button" onclick="removeLeg(${i})">
+        <input
+          class="leg-input"
+          type="number"
+          value="${getFixedQty()}"
+          readonly
+        >
+      </td>
+
+      <td>
+        <button
+          class="delete-leg-btn"
+          type="button"
+          onclick="removeLeg(${i})"
+        >
           Delete
         </button>
       </td>
@@ -1332,13 +1558,25 @@ function renderLegs() {
 }
 
 function loadTemplate(name) {
+  const expiry =
+    getEl("expirySelect")?.value || "current expiry";
+
   const atmRow = chain.find(row => row.atm);
-  const atm = atmRow ? Number(atmRow.strike) : Math.round(getSpot() / 50) * 50;
+
+  const atm = atmRow
+    ? normalizeStrike(atmRow.strike, expiry)
+    : normalizeStrike(getSpot(), expiry);
 
   const find = (strike, type) => {
-    const row = chain.find(x => Number(x.strike) === Number(strike));
+    const row = chain.find(
+      item => Number(item.strike) === Number(strike)
+    );
+
     if (!row) return 100;
-    return Number((type === "CE" ? row.ce_ltp : row.pe_ltp) || 100);
+
+    return Number(
+      (type === "CE" ? row.ce_ltp : row.pe_ltp) || 100
+    );
   };
 
   if (name === "short_straddle") {
@@ -1346,22 +1584,21 @@ function loadTemplate(name) {
       createLeg("SELL", "CE", atm, find(atm, "CE")),
       createLeg("SELL", "PE", atm, find(atm, "PE"))
     ];
-  }
-
-  if (name === "short_strangle") {
+  } else if (name === "short_strangle") {
     legs = [
       createLeg("SELL", "CE", atm + 200, find(atm + 200, "CE")),
       createLeg("SELL", "PE", atm - 200, find(atm - 200, "PE"))
     ];
-  }
-
-  if (name === "iron_condor") {
+  } else if (name === "iron_condor") {
     legs = [
       createLeg("BUY", "PE", atm - 400, find(atm - 400, "PE")),
       createLeg("SELL", "PE", atm - 200, find(atm - 200, "PE")),
       createLeg("SELL", "CE", atm + 200, find(atm + 200, "CE")),
       createLeg("BUY", "CE", atm + 400, find(atm + 400, "CE"))
     ];
+  } else {
+    console.warn(`Unknown strategy template: ${name}`);
+    return;
   }
 
   renderLegs();
@@ -1491,51 +1728,194 @@ async function calculate() {
 
 function renderChart(labels, payoff, current) {
   const canvas = getEl("payoffChart");
-  if (!canvas || typeof Chart === "undefined") return;
+
+  if (!canvas || typeof Chart === "undefined") {
+    return;
+  }
 
   const ctx = canvas.getContext("2d");
-  if (chart) chart.destroy();
+
+  if (chart) {
+    chart.destroy();
+  }
+
+  const currentSpotPlugin = {
+    id: "currentSpotPlugin",
+
+    afterDatasetsDraw(chartInstance) {
+      const currentSpot = Number(getSpot());
+
+      if (
+        !Number.isFinite(currentSpot) ||
+        !Array.isArray(labels) ||
+        labels.length === 0
+      ) {
+        return;
+      }
+
+      const numericLabels = labels.map(Number);
+      const xScale = chartInstance.scales.x;
+      const yScale = chartInstance.scales.y;
+
+      if (!xScale || !yScale) {
+        return;
+      }
+
+      let xPixel = null;
+      const exactIndex = numericLabels.findIndex(
+        value => value === currentSpot
+      );
+
+      if (exactIndex >= 0) {
+        xPixel = xScale.getPixelForValue(exactIndex);
+      } else {
+        for (let index = 1; index < numericLabels.length; index += 1) {
+          const previousValue = numericLabels[index - 1];
+          const nextValue = numericLabels[index];
+
+          if (
+            currentSpot >= previousValue &&
+            currentSpot <= nextValue &&
+            nextValue !== previousValue
+          ) {
+            const previousPixel = xScale.getPixelForValue(index - 1);
+            const nextPixel = xScale.getPixelForValue(index);
+            const ratio =
+              (currentSpot - previousValue) /
+              (nextValue - previousValue);
+
+            xPixel =
+              previousPixel +
+              ratio * (nextPixel - previousPixel);
+            break;
+          }
+        }
+      }
+
+      if (!Number.isFinite(xPixel)) {
+        return;
+      }
+
+      const chartContext = chartInstance.ctx;
+      const label = `${getDataset()} Spot : ${currentSpot.toFixed(2)}`;
+
+      chartContext.save();
+
+      // Current-spot vertical line.
+      chartContext.beginPath();
+      chartContext.setLineDash([]);
+      chartContext.strokeStyle = "#16a34a";
+      chartContext.lineWidth = 2;
+      chartContext.moveTo(xPixel, yScale.top);
+      chartContext.lineTo(xPixel, yScale.bottom);
+      chartContext.stroke();
+
+      // Label is placed in the reserved space above the plotting area.
+      chartContext.font = "bold 12px Arial";
+      chartContext.textAlign = "center";
+      chartContext.textBaseline = "bottom";
+      chartContext.fillStyle = "#111827";
+      chartContext.fillText(
+        label,
+        xPixel,
+        yScale.top - 8
+      );
+
+      chartContext.restore();
+    }
+  };
 
   chart = new Chart(ctx, {
     type: "line",
+    plugins: [currentSpotPlugin],
+
     data: {
       labels,
       datasets: [
         {
-          label: "Expiry Payoff",
+          // The payoff curve remains, but its legend/title is hidden.
+          label: "",
           data: payoff,
           borderWidth: 2,
+          pointRadius: 0,
+          pointHoverRadius: 4,
+          tension: 0,
+          spanGaps: true,
+          segment: {
+            borderColor: context => {
+              const y0 = Number(context.p0?.parsed?.y);
+              const y1 = Number(context.p1?.parsed?.y);
+              return y0 >= 0 && y1 >= 0 ? "#16a34a" : "#ef4444";
+            }
+          },
           fill: {
             target: "origin",
-            above: "rgba(0, 180, 90, 0.18)",
-            below: "rgba(230, 80, 80, 0.18)"
-          },
-          tension: 0.15
-        },
-        {
-          label: "Current MTM",
-          data: current,
-          borderWidth: 2,
-          borderDash: [6, 4],
-          tension: 0.15
+            above: "rgba(22, 163, 74, 0.18)",
+            below: "rgba(239, 68, 68, 0.14)"
+          }
         }
       ]
     },
+
     options: {
       responsive: true,
       maintainAspectRatio: false,
+      interaction: {
+        mode: "index",
+        intersect: false
+      },
+      layout: {
+        padding: {
+          top: 36,
+          right: 10,
+          bottom: 4,
+          left: 4
+        }
+      },
       plugins: {
-        legend: { position: "top" }
+        legend: {
+          display: false
+        },
+        tooltip: {
+          enabled: true
+        }
       },
       scales: {
-        y: { title: { display: true, text: "P&L" } },
-        x: { title: { display: true, text: "Spot" } }
+        y: {
+          grace: "8%",
+          title: {
+            display: true,
+            text: "P&L"
+          },
+          ticks: {
+            maxTicksLimit: 7
+          },
+          grid: {
+            color: "rgba(148, 163, 184, 0.28)"
+          }
+        },
+        x: {
+          offset: false,
+          title: {
+            display: true,
+            text: "Spot"
+          },
+          ticks: {
+            autoSkip: true,
+            maxTicksLimit: 12,
+            maxRotation: 45,
+            minRotation: 45
+          },
+          grid: {
+            color: "rgba(148, 163, 184, 0.22)"
+          }
+        }
       }
     }
   });
 }
 
-function attachOhlcBox(chart, series, container, boxId) {
+function attachOhlcBox(chartInstance, series, container, boxId) {
   let box = document.getElementById(boxId);
 
   if (!box) {
@@ -1555,7 +1935,7 @@ function attachOhlcBox(chart, series, container, boxId) {
     container.appendChild(box);
   }
 
-  chart.subscribeCrosshairMove(param => {
+  chartInstance.subscribeCrosshairMove(param => {
     if (!param?.time) return;
 
     const candle = param.seriesData.get(series);
@@ -1571,141 +1951,11 @@ function attachOhlcBox(chart, series, container, boxId) {
     }
 
     box.innerHTML =
-      `O ${candle.open.toFixed(2)} ` +
-      `H ${candle.high.toFixed(2)} ` +
-      `L ${candle.low.toFixed(2)} ` +
-      `C ${candle.close.toFixed(2)}`;
+      `O ${Number(candle.open).toFixed(2)} ` +
+      `H ${Number(candle.high).toFixed(2)} ` +
+      `L ${Number(candle.low).toFixed(2)} ` +
+      `C ${Number(candle.close).toFixed(2)}`;
   });
-}
-
-async function openChartPopup() {
-  try {
-    const modal = getEl("chartModal");
-    const container = getEl("fullscreenIndexChart");
-
-    if (!modal || !container || typeof LightweightCharts === "undefined") return;
-
-    modal.style.display = "block";
-
-    const applyBtn = getEl("indexChartApplyBtn");
-    if (applyBtn) {
-      applyBtn.dataset.chart = "index";
-      delete applyBtn.dataset.strike;
-      delete applyBtn.dataset.metric;
-    }
-
-    const startDate = getEl("indexChartStartDate");
-    const startTime = getEl("indexChartStartTime");
-    const endDate = getEl("indexChartEndDate");
-    const endTime = getEl("indexChartEndTime");
-    const intervalSelect = getEl("indexChartInterval");
-
-    if (startDate && !startDate.value) startDate.value = getQueryDate();
-    if (startTime && !startTime.value) startTime.value = "09:15";
-
-    if (endDate && !endDate.dataset.userChanged) endDate.value = getQueryDate();
-    if (endTime && !endTime.dataset.userChanged) endTime.value = getQueryTime();
-
-    if (startTime && !startTime.dataset.changeAttached) {
-      startTime.addEventListener("change", () => {
-        startTime.dataset.userChanged = "true";
-      });
-      startTime.dataset.changeAttached = "true";
-    }
-
-    if (endDate && !endDate.dataset.changeAttached) {
-      endDate.addEventListener("change", () => {
-        endDate.dataset.userChanged = "true";
-      });
-      endDate.dataset.changeAttached = "true";
-    }
-
-    if (endTime && !endTime.dataset.changeAttached) {
-      endTime.addEventListener("change", () => {
-        endTime.dataset.userChanged = "true";
-      });
-      endTime.dataset.changeAttached = "true";
-    }
-
-    const params = new URLSearchParams({
-      dataset: getDataset(),
-      date: startDate?.value || getQueryDate(),
-      start_time: startTime?.value || "09:15",
-      end_date: endDate?.value || getQueryDate(),
-      end_time: endTime?.value || getQueryTime(),
-      interval: intervalSelect?.value || String(getInterval()),
-      _: String(Date.now())
-    });
-
-    const data = await fetchJson(`/api/index-chart?${params.toString()}`);
-
-    if (!data.ok || !data.rows || !data.rows.length) {
-      alert("No index chart data found");
-      return;
-    }
-
-    if (fullscreenChart) {
-      fullscreenChart.remove();
-      fullscreenChart = null;
-      fullscreenSeries = null;
-    }
-
-    container.innerHTML = "";
-
-    fullscreenChart = LightweightCharts.createChart(container, {
-      width: container.clientWidth,
-      height: container.clientHeight,
-      layout: {
-        background: { color: "#ffffff" },
-        textColor: "#222"
-      },
-      grid: {
-        vertLines: { color: "#eef2f7" },
-        horzLines: { color: "#eef2f7" }
-      },
-      crosshair: {
-        mode: LightweightCharts.CrosshairMode.Normal
-      },
-      timeScale: {
-        timeVisible: true,
-        secondsVisible: false,
-        borderColor: "#ddd"
-      },
-      rightPriceScale: {
-        borderColor: "#ddd"
-      }
-    });
-
-    fullscreenSeries = fullscreenChart.addCandlestickSeries({
-      upColor: "#16a34a",
-      downColor: "#dc2626",
-      borderUpColor: "#16a34a",
-      borderDownColor: "#dc2626",
-      wickUpColor: "#16a34a",
-      wickDownColor: "#dc2626"
-    });
-
-    fullscreenSeries.setData(data.rows || []);
-
-    advancedCharts.index.chart = fullscreenChart;
-    advancedCharts.index.candleSeries = fullscreenSeries;
-    advancedCharts.index.rows = data.rows || [];
-    advancedCharts.index.indicators.forEach(indicator => { indicator.series = []; });
-    redrawChartIndicators("index");
-
-    attachOhlcBox(
-      fullscreenChart,
-      fullscreenSeries,
-      container,
-      "indexOhlcBox"
-    );
-
-    fullscreenChart.timeScale().fitContent();
-
-  } catch (err) {
-    console.error("openChartPopup error:", err);
-    alert(err.message || "Failed to load index chart");
-  }
 }
 
 function closeChartPopup() {
