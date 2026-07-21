@@ -597,11 +597,11 @@ def _get_spot_candles_for_day(
     candle_interval_minutes: int,
 ) -> pd.DataFrame:
     """
-    Load spot/index candles for one trading day.
+    Load and cache spot/index candles for a trading day.
 
-    The daily IDX_TICK folder is constructed here because the current
-    load_tick_data() implementation accepts only the data path and,
-    optionally, the instrument name.
+    The resolved week folder must be passed directly to load_tick_data().
+    load_tick_data() internally resolves the IDX_TICK directory and the
+    instrument Parquet file for both local and Azure Blob storage.
     """
 
     folder = str(folder).strip()
@@ -636,40 +636,37 @@ def _get_spot_candles_for_day(
     if cached is not None:
         return cached.copy()
 
-    # The current load_tick_data() signature accepts:
-    #
-    #     load_tick_data(path, instrument=None)
-    #
-    # Therefore, pass the daily index folder as the first argument and
-    # the dataset as the second argument.
-    index_folder = os.path.join(
-        folder,
-        f"NSE_IDX_TICK_{date_str}",
-    )
-
     try:
+        # Important:
+        # Pass the week folder directly.
+        #
+        # For Azure Blob Storage, load_tick_data() internally resolves:
+        #
+        #   <week_folder>/IDX_TICK/NIFTY.parquet
+        #
+        # Do not append NSE_IDX_TICK_YYYYMMDD here.
         tick_df = load_tick_data(
-            index_folder,
+            folder,
             instrument=dataset,
         )
 
     except Exception:
         logger.exception(
             "Failed to load spot tick data: "
-            "dataset=%s date=%s index_folder=%s",
+            "dataset=%s date=%s folder=%s",
             dataset,
             date_str,
-            index_folder,
+            folder,
         )
         return pd.DataFrame()
 
     if tick_df is None or tick_df.empty:
         logger.warning(
             "No spot tick data found: "
-            "dataset=%s date=%s index_folder=%s",
+            "dataset=%s date=%s folder=%s",
             dataset,
             date_str,
-            index_folder,
+            folder,
         )
         return pd.DataFrame()
 
