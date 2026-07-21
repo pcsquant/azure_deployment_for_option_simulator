@@ -15,6 +15,7 @@ let vixSeries = null;
 let volSmileChart = null;
 let ivSurfaceChart = null;
 let pinnedIvPoint = null;
+let ivSurfaceRequestGeneration = 0;
 
 
 let activeIndicatorChart = null;
@@ -881,6 +882,36 @@ async function renderIvSurface() {
     return;
   }
 
+  /*
+   * Every invocation gets its own generation number. If the user changes the
+   * date/time and starts another request, an older response is ignored instead
+   * of replacing the newer chart.
+   */
+  const requestGeneration = ++ivSurfaceRequestGeneration;
+  const isCurrentRequest = () =>
+    requestGeneration === ivSurfaceRequestGeneration;
+
+  const sleep = milliseconds =>
+    new Promise(resolve => setTimeout(resolve, milliseconds));
+
+  const readyStatuses = new Set([
+    "ready",
+    "ready_with_errors"
+  ]);
+
+  const pendingStatuses = new Set([
+    "queued",
+    "processing",
+    "pending",
+    "running"
+  ]);
+
+  const renderStatus = message => {
+    if (isCurrentRequest()) {
+      container.innerHTML = `<p>${message}</p>`;
+    }
+  };
+
   try {
     const params = new URLSearchParams({
       dataset: getDataset(),
@@ -892,27 +923,99 @@ async function renderIvSurface() {
       _: String(Date.now())
     });
 
-    container.innerHTML = "<p>Building IV surface...</p>";
+    renderStatus("Building IV surface...");
 
-    const data = await fetchJson(`/api/iv-surface?${params.toString()}`);
-    let finalData = data;
+    let finalData = await fetchJson(
+      `/api/iv-surface?${params.toString()}`
+    );
 
-    if (data.status === "processing" && data.job_id) {
-      for (let i = 0; i < 60; i++) {
-        await new Promise(resolve => setTimeout(resolve, 1000));
+    if (!isCurrentRequest()) return;
 
-        const statusData = await fetchJson(`/api/iv-surface/status/${data.job_id}`);
+    /*
+     * The ThreadPool backend normally returns:
+     *   status = "queued" on the initial request,
+     *   status = "processing" while calculating,
+     *   status = "ready" or "ready_with_errors" when complete.
+     *
+     * The old code only polled when the initial status was "processing".
+     * Therefore a normal "queued" response was treated as the final response,
+     * causing the false "No IV surface data returned" error.
+     */
+    if (
+      pendingStatuses.has(String(finalData?.status || "").toLowerCase()) &&
+      finalData?.job_id
+    ) {
+      const jobId = encodeURIComponent(String(finalData.job_id));
+      const maximumAttempts = 120;
+      const pollIntervalMs = 1000;
 
-        if (statusData.status === "ready") {
+      let completed = false;
+
+      for (let attempt = 1; attempt <= maximumAttempts; attempt += 1) {
+        if (!isCurrentRequest()) return;
+
+        renderStatus(
+          `Building IV surface... (${attempt}/${maximumAttempts})`
+        );
+
+        await sleep(pollIntervalMs);
+
+        if (!isCurrentRequest()) return;
+
+        const statusData = await fetchJson(
+          `/api/iv-surface/status/${jobId}?_=${Date.now()}`
+        );
+
+        if (!isCurrentRequest()) return;
+
+        const status = String(statusData?.status || "").toLowerCase();
+
+        if (readyStatuses.has(status)) {
           finalData = statusData;
+          completed = true;
           break;
         }
 
-        if (statusData.status === "failed") {
-          throw new Error(statusData.error || "IV surface job failed");
+        if (status === "failed") {
+          throw new Error(
+            statusData?.error ||
+            statusData?.detail ||
+            "IV surface job failed."
+          );
+        }
+
+        /*
+         * A cached result may be returned without a status transition that the
+         * frontend recognizes. Treat a complete payload as ready.
+         */
+        if (
+          statusData?.ok &&
+          Array.isArray(statusData?.rows) &&
+          statusData.rows.length > 0 &&
+          Array.isArray(statusData?.expiries) &&
+          statusData.expiries.length > 0
+        ) {
+          finalData = statusData;
+          completed = true;
+          break;
+        }
+
+        if (!pendingStatuses.has(status) && status !== "done") {
+          throw new Error(
+            statusData?.error ||
+            `Unexpected IV surface job status: ${status || "unknown"}`
+          );
         }
       }
+
+      if (!completed) {
+        throw new Error(
+          "IV surface calculation timed out. Please try again."
+        );
+      }
     }
+
+    if (!isCurrentRequest()) return;
 
     const hasSurfaceData =
       finalData &&
@@ -926,11 +1029,25 @@ async function renderIvSurface() {
 
     if (!hasSurfaceData) {
       console.error("IV Surface response:", finalData);
-      throw new Error(finalData?.error || "No IV surface data returned from backend.");
+      throw new Error(
+        finalData?.error ||
+        finalData?.detail ||
+        "No IV surface data returned from backend."
+      );
     }
 
-    const strikes = finalData.strikes;
-    const expiries = finalData.expiries;
+    const expiries = finalData.expiries
+      .filter(expiry => expiry && (expiry.value || expiry.label))
+      .map(expiry => ({
+        value: String(expiry.value || ""),
+        label: String(expiry.label || expiry.value || "")
+      }));
+
+    const normalizedStrikes = [...new Set(
+      finalData.strikes
+        .map(strike => Number(strike))
+        .filter(Number.isFinite)
+    )].sort((left, right) => left - right);
 
     const rows = finalData.rows.filter(row =>
       row &&
@@ -942,36 +1059,69 @@ async function renderIvSurface() {
       Number.isFinite(Number(row.strike))
     );
 
-    if (!strikes.length || !expiries.length || !rows.length) {
-      container.innerHTML = "<p>No IV surface data found.</p>";
+    if (
+      !normalizedStrikes.length ||
+      !expiries.length ||
+      !rows.length
+    ) {
+      renderStatus("No IV surface data found.");
       return;
     }
 
-    const expiryLabels = expiries.map(exp => String(exp.label || exp.value || ""));
-    const normalizedStrikes = strikes.map(strike => Number(strike));
+    /*
+     * Build an O(1) lookup map instead of repeatedly scanning all rows for
+     * every expiry/strike grid point.
+     */
+    const rowLookup = new Map();
 
-    const z = expiries.map(exp =>
+    rows.forEach(row => {
+      const expiry = String(row.expiry || "");
+      const strike = Number(row.strike);
+      const iv = Number(row.iv);
+
+      if (!expiry || !Number.isFinite(strike) || !Number.isFinite(iv)) {
+        return;
+      }
+
+      rowLookup.set(`${expiry}|${strike}`, {
+        ...row,
+        expiry,
+        strike,
+        iv
+      });
+    });
+
+    const expiryLabels = expiries.map(expiry => expiry.label);
+
+    const z = expiries.map(expiry =>
       normalizedStrikes.map(strike => {
-        const found = rows.find(row =>
-          String(row.expiry) === String(exp.value) &&
-          Number(row.strike) === Number(strike)
-        );
-
-        return found ? Number(found.iv) : null;
+        const row = rowLookup.get(`${expiry.value}|${strike}`);
+        return row ? row.iv : null;
       })
     );
 
-    const hoverText = expiries.map((exp, expiryIndex) =>
+    const validGridPoints = z.reduce(
+      (count, values) =>
+        count + values.filter(value => Number.isFinite(Number(value))).length,
+      0
+    );
+
+    if (!validGridPoints) {
+      renderStatus("No valid IV values were available for plotting.");
+      return;
+    }
+
+    const hoverText = expiries.map((expiry, expiryIndex) =>
       normalizedStrikes.map((strike, strikeIndex) => {
         const iv = z[expiryIndex][strikeIndex];
 
-        if (iv === null || iv === undefined || !Number.isFinite(Number(iv))) {
+        if (!Number.isFinite(Number(iv))) {
           return "";
         }
 
         return (
           `Strike: ${strike}<br>` +
-          `Expiry: ${exp.label || exp.value}<br>` +
+          `Expiry: ${expiry.label}<br>` +
           `IV: ${Number(iv).toFixed(2)}%`
         );
       })
@@ -992,7 +1142,7 @@ async function renderIvSurface() {
         [0.75, "#fde725"],
         [1, "#ffff00"]
       ],
-      opacity: 0.75,
+      opacity: 0.78,
       showscale: true,
       colorbar: {
         title: "IV %",
@@ -1003,7 +1153,7 @@ async function renderIvSurface() {
     };
 
     const lineTraces = expiries
-      .map((exp, expiryIndex) => {
+      .map((expiry, expiryIndex) => {
         const lineX = [];
         const lineY = [];
         const lineZ = [];
@@ -1012,13 +1162,13 @@ async function renderIvSurface() {
         normalizedStrikes.forEach((strike, strikeIndex) => {
           const iv = z[expiryIndex][strikeIndex];
 
-          if (iv !== null && iv !== undefined && Number.isFinite(Number(iv))) {
-            lineX.push(Number(strike));
-            lineY.push(String(exp.label || exp.value || ""));
+          if (Number.isFinite(Number(iv))) {
+            lineX.push(strike);
+            lineY.push(expiry.label);
             lineZ.push(Number(iv) + 0.05);
             lineText.push(
               `Strike: ${strike}<br>` +
-              `Expiry: ${exp.label || exp.value}<br>` +
+              `Expiry: ${expiry.label}<br>` +
               `IV: ${Number(iv).toFixed(2)}%`
             );
           }
@@ -1029,7 +1179,7 @@ async function renderIvSurface() {
         return {
           type: "scatter3d",
           mode: "lines+markers",
-          name: exp.label || exp.value,
+          name: expiry.label,
           x: lineX,
           y: lineY,
           z: lineZ,
@@ -1047,15 +1197,19 @@ async function renderIvSurface() {
       const matched = rows.find(row =>
         Number(row.strike) === Number(pinnedIvPoint.strike) &&
         (
-          String(row.expiry_label || "") === String(pinnedIvPoint.expiryLabel || "") ||
-          String(row.expiry || "") === String(pinnedIvPoint.expiry || "")
+          String(row.expiry_label || "") ===
+            String(pinnedIvPoint.expiryLabel || "") ||
+          String(row.expiry || "") ===
+            String(pinnedIvPoint.expiry || "")
         )
       );
 
       if (matched) {
         const expiryLabel =
           matched.expiry_label ||
-          expiries.find(e => String(e.value) === String(matched.expiry))?.label ||
+          expiries.find(
+            expiry => String(expiry.value) === String(matched.expiry)
+          )?.label ||
           matched.expiry ||
           pinnedIvPoint.expiryLabel;
 
@@ -1073,7 +1227,10 @@ async function renderIvSurface() {
           x: [Number(matched.strike)],
           y: [String(expiryLabel)],
           z: [Number(matched.iv) + 0.35],
-          text: [`Tracking<br>${matched.strike}<br>${Number(matched.iv).toFixed(2)}%`],
+          text: [
+            `Tracking<br>${matched.strike}<br>` +
+            `${Number(matched.iv).toFixed(2)}%`
+          ],
           textposition: "top center",
           marker: {
             size: 9,
@@ -1109,8 +1266,8 @@ async function renderIvSurface() {
       scene: {
         xaxis: { title: "Strike" },
         yaxis: {
-          title: "",
-          showticklabels: false
+          title: "Expiry",
+          type: "category"
         },
         zaxis: { title: "IV (%)" },
         camera: {
@@ -1127,9 +1284,11 @@ async function renderIvSurface() {
       if (container.data) {
         Plotly.purge(container);
       }
-    } catch (purgeErr) {
-      console.warn("Plotly purge warning:", purgeErr);
+    } catch (purgeError) {
+      console.warn("Plotly purge warning:", purgeError);
     }
+
+    if (!isCurrentRequest()) return;
 
     container.innerHTML = "";
     container.style.position = "relative";
@@ -1147,6 +1306,15 @@ async function renderIvSurface() {
         displaylogo: false
       }
     );
+
+    if (!isCurrentRequest()) {
+      try {
+        Plotly.purge(container);
+      } catch (error) {
+        console.warn("Plotly stale-request purge warning:", error);
+      }
+      return;
+    }
 
     let pinnedBox = container.querySelector(".iv-pinned-box");
 
@@ -1181,26 +1349,48 @@ async function renderIvSurface() {
 
     let lastIvClickTime = 0;
 
-    container.on("plotly_click", function(clickData) {
+    container.removeAllListeners?.("plotly_click");
+
+    container.on("plotly_click", clickData => {
       try {
-        if (!clickData || !clickData.points || !clickData.points.length) return;
+        if (
+          !clickData ||
+          !Array.isArray(clickData.points) ||
+          !clickData.points.length
+        ) {
+          return;
+        }
 
         const point = clickData.points[0];
         const clickedStrike = Number(point.x);
         const clickedExpiryLabel = String(point.y || "");
 
-        const clicked = rows.find(row =>
-          Number(row.strike) === clickedStrike &&
-          (
-            String(row.expiry_label || "") === clickedExpiryLabel ||
-            String(row.expiry || "") === clickedExpiryLabel ||
-            expiryLabels.includes(clickedExpiryLabel)
-          )
+        const matchingExpiry = expiries.find(
+          expiry =>
+            expiry.label === clickedExpiryLabel ||
+            expiry.value === clickedExpiryLabel
         );
+
+        const clicked =
+          rowLookup.get(
+            `${matchingExpiry?.value || ""}|${clickedStrike}`
+          ) ||
+          rows.find(row =>
+            Number(row.strike) === clickedStrike &&
+            (
+              String(row.expiry_label || "") === clickedExpiryLabel ||
+              String(row.expiry || "") === clickedExpiryLabel
+            )
+          );
 
         if (!clicked) return;
 
-        const expiryLabel = clicked.expiry_label || clickedExpiryLabel || clicked.expiry;
+        const expiryLabel =
+          clicked.expiry_label ||
+          matchingExpiry?.label ||
+          clickedExpiryLabel ||
+          clicked.expiry;
+
         const ivValue = Number(clicked.iv);
 
         pinnedBox.innerHTML =
@@ -1225,12 +1415,15 @@ async function renderIvSurface() {
         }
 
         lastIvClickTime = now;
-      } catch (clickErr) {
-        console.error("IV surface click handler error:", clickErr);
+      } catch (clickError) {
+        console.error(
+          "IV surface click handler error:",
+          clickError
+        );
       }
     });
 
-    container.oncontextmenu = function(event) {
+    container.oncontextmenu = event => {
       event.preventDefault();
 
       pinnedIvPoint = null;
@@ -1244,10 +1437,14 @@ async function renderIvSurface() {
       return false;
     };
 
-  } catch (err) {
-    console.error("renderIvSurface error:", err);
-    container.innerHTML = "<p>Failed to load IV surface. Check console for details.</p>";
-    alert(err.message || "Failed to load IV surface");
+  } catch (error) {
+    if (!isCurrentRequest()) return;
+
+    console.error("renderIvSurface error:", error);
+    container.innerHTML =
+      "<p>Failed to load IV surface. Check console for details.</p>";
+
+    alert(error.message || "Failed to load IV surface");
   }
 }
 
