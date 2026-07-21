@@ -617,7 +617,7 @@ def _resolve_default_week_date(dataset: str) -> Tuple[int, str, str, str]:
         date_str,
         dt.strftime("%Y-%m-%d"),
     )
-def get_available_expiries_for_date(query_date, dataset="NIFTY", max_months=2):
+def get_available_expiries_for_date(query_date, dataset="NIFTY", max_months=4):
     cfg = get_dataset_config(dataset)
     expiries = pd.to_datetime(cfg["combined_expiry"])
 
