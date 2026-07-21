@@ -1,62 +1,157 @@
 """
-Production async IV surface support for the Options Simulator.
+Production asynchronous IV-surface support for the Options Simulator.
 
-Provides:
-- /api/iv-surface
-- /api/iv-surface/status/<job_id>
-- Redis cache for completed IV surface payloads
-- Redis in-flight job lookup to avoid duplicate jobs
-- Kafka producer integration from Flask route
-- Kafka worker helpers
+Features
+--------
+* Flask endpoints:
+    - GET /api/iv-surface
+    - GET /api/iv-surface/status/<job_id>
+* Redis result cache and distributed in-flight job deduplication.
+* Kafka-backed background processing.
+* Per-expiry parallelism with bounded workers.
+* Input validation, deterministic cache keys, structured job states, timing
+  metadata, safe cleanup, and resilient Redis/Kafka handling.
 
-This file is intentionally dependency-injected from app.py so it does not need
-to import your whole app during route registration.
+The module is dependency-injected from the Flask application, so it does not
+import the simulator application itself.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import os
+import signal
 import time
 import uuid
-import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Callable, Dict, Iterable, Optional, Tuple
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
 from flask import jsonify, request
 
-
 logger = logging.getLogger(__name__)
 
-IV_SURFACE_TOPIC = os.getenv("IV_SURFACE_TOPIC", "iv_surface_requests")
-IV_SURFACE_CACHE_TTL_SECONDS = int(os.getenv("IV_SURFACE_CACHE_TTL_SECONDS", "3600"))
-IV_SURFACE_JOB_TTL_SECONDS = int(os.getenv("IV_SURFACE_JOB_TTL_SECONDS", "600"))
-IV_SURFACE_MAX_EXPIRIES = int(os.getenv("IV_SURFACE_MAX_EXPIRIES", "5"))
-IV_SURFACE_MAX_WORKERS = int(os.getenv("IV_SURFACE_MAX_WORKERS", "4"))
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
 
-# =========================================================
-# REDIS / KEY HELPERS
-# =========================================================
+def _env_int(name: str, default: int, minimum: int = 1, maximum: int | None = None) -> int:
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer, received {raw!r}") from exc
+    if value < minimum:
+        raise RuntimeError(f"{name} must be >= {minimum}, received {value}")
+    if maximum is not None and value > maximum:
+        raise RuntimeError(f"{name} must be <= {maximum}, received {value}")
+    return value
+
+
+IV_SURFACE_TOPIC = os.getenv("IV_SURFACE_TOPIC", "iv_surface_requests").strip()
+IV_SURFACE_DLQ_TOPIC = os.getenv("IV_SURFACE_DLQ_TOPIC", "iv_surface_requests_dlq").strip()
+IV_SURFACE_CACHE_VERSION = os.getenv("IV_SURFACE_CACHE_VERSION", "v2").strip()
+IV_SURFACE_CACHE_TTL_SECONDS = _env_int("IV_SURFACE_CACHE_TTL_SECONDS", 3600, 30)
+IV_SURFACE_JOB_TTL_SECONDS = _env_int("IV_SURFACE_JOB_TTL_SECONDS", 900, 60)
+IV_SURFACE_LOCK_TTL_SECONDS = _env_int("IV_SURFACE_LOCK_TTL_SECONDS", 900, 60)
+IV_SURFACE_MAX_EXPIRIES = _env_int("IV_SURFACE_MAX_EXPIRIES", 5, 1, 24)
+IV_SURFACE_MAX_WORKERS = _env_int("IV_SURFACE_MAX_WORKERS", 4, 1, 32)
+IV_SURFACE_MAX_STRIKES_EACH_SIDE = _env_int("IV_SURFACE_MAX_STRIKES_EACH_SIDE", 100, 1, 500)
+IV_SURFACE_MAX_MONTHS_ALLOWED = _env_int("IV_SURFACE_MAX_MONTHS_ALLOWED", 12, 1, 60)
+KAFKA_SEND_TIMEOUT_SECONDS = _env_int("KAFKA_SEND_TIMEOUT_SECONDS", 15, 1, 120)
+KAFKA_MAX_POLL_RECORDS = _env_int("KAFKA_MAX_POLL_RECORDS", 10, 1, 500)
+KAFKA_SESSION_TIMEOUT_MS = _env_int("KAFKA_SESSION_TIMEOUT_MS", 30000, 6000, 300000)
+KAFKA_MAX_POLL_INTERVAL_MS = _env_int("KAFKA_MAX_POLL_INTERVAL_MS", 900000, 30000, 3600000)
+
+if not IV_SURFACE_TOPIC:
+    raise RuntimeError("IV_SURFACE_TOPIC cannot be empty")
+
+
+# ---------------------------------------------------------------------------
+# Generic helpers
+# ---------------------------------------------------------------------------
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _json_dumps(value: Any) -> str:
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False, default=str)
+
+
+def _decode_redis_value(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return str(value)
+
 
 def redis_get_json(redis_client: Any, key: str) -> Optional[Dict[str, Any]]:
-    value = redis_client.get(key)
+    """Read a JSON object from Redis.
 
-    if not value:
+    Corrupt entries are removed because retaining them would make every request
+    fail until their TTL expires.
+    """
+    try:
+        raw = redis_client.get(key)
+    except Exception as exc:
+        logger.exception("Redis GET failed for key=%s", key)
+        raise RuntimeError("Redis is unavailable") from exc
+
+    text = _decode_redis_value(raw)
+    if not text:
         return None
 
-    if isinstance(value, bytes):
-        value = value.decode("utf-8")
+    try:
+        value = json.loads(text)
+    except (TypeError, json.JSONDecodeError):
+        logger.warning("Removing corrupt Redis JSON entry key=%s", key)
+        try:
+            redis_client.delete(key)
+        except Exception:
+            logger.debug("Unable to delete corrupt Redis key=%s", key, exc_info=True)
+        return None
 
-    return json.loads(value)
+    return value if isinstance(value, dict) else None
 
 
-def redis_set_json(redis_client: Any, key: str, value: Dict[str, Any], ex: int) -> None:
-    redis_client.setex(
-        key,
-        ex,
-        json.dumps(value, separators=(",", ":"), default=str),
-    )
+def redis_set_json(redis_client: Any, key: str, value: Mapping[str, Any], ex: int) -> None:
+    try:
+        redis_client.setex(key, int(ex), _json_dumps(dict(value)))
+    except Exception as exc:
+        logger.exception("Redis SETEX failed for key=%s", key)
+        raise RuntimeError("Redis is unavailable") from exc
+
+
+def redis_set_if_absent(redis_client: Any, key: str, value: str, ex: int) -> bool:
+    """Atomically acquire a Redis key with TTL."""
+    try:
+        result = redis_client.set(key, value, nx=True, ex=int(ex))
+    except Exception as exc:
+        logger.exception("Redis SET NX failed for key=%s", key)
+        raise RuntimeError("Redis is unavailable") from exc
+    return bool(result)
+
+
+def redis_delete(redis_client: Any, *keys: str) -> None:
+    filtered = [key for key in keys if key]
+    if not filtered:
+        return
+    try:
+        redis_client.delete(*filtered)
+    except Exception:
+        logger.warning("Unable to delete Redis keys=%s", filtered, exc_info=True)
+
+
+def _normalise_cache_component(value: Any) -> str:
+    return str(value).strip().lower().replace(" ", "_")
 
 
 def iv_surface_cache_key(
@@ -67,23 +162,82 @@ def iv_surface_cache_key(
     strike_count: int,
     max_months: int,
 ) -> str:
-    return (
-        f"iv_surface:{dataset}:{query_date}:{query_time}:"
-        f"{int(interval)}:{int(strike_count)}:{int(max_months)}"
-    )
+    """Build a short deterministic cache key.
+
+    The readable prefix helps operations; the SHA-256 suffix prevents unsafe or
+    unexpectedly long user-controlled Redis keys.
+    """
+    canonical = {
+        "version": IV_SURFACE_CACHE_VERSION,
+        "dataset": _normalise_cache_component(dataset),
+        "query_date": str(query_date),
+        "query_time": str(query_time),
+        "interval": int(interval),
+        "strike_count": int(strike_count),
+        "max_months": int(max_months),
+    }
+    digest = hashlib.sha256(_json_dumps(canonical).encode("utf-8")).hexdigest()[:24]
+    return f"iv_surface:{IV_SURFACE_CACHE_VERSION}:{canonical['dataset']}:{digest}"
 
 
 def job_lookup_key(cache_key: str) -> str:
-    return f"job_lookup:{cache_key}"
+    return f"iv_surface:lookup:{cache_key}"
 
 
 def job_key(job_id: str) -> str:
-    return f"job:iv_surface:{job_id}"
+    return f"iv_surface:job:{job_id}"
 
 
-# =========================================================
-# IV SURFACE BUILDER
-# =========================================================
+def _validate_job_id(value: str) -> str:
+    try:
+        return str(uuid.UUID(str(value)))
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise ValueError("Invalid IV surface job id") from exc
+
+
+def _coerce_int(name: str, value: Any, minimum: int, maximum: int) -> int:
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if not minimum <= result <= maximum:
+        raise ValueError(f"{name} must be between {minimum} and {maximum}")
+    return result
+
+
+@dataclass(frozen=True)
+class IVSurfaceRequest:
+    dataset: str
+    query_date: str
+    query_time: str
+    interval: int
+    strike_count: int
+    max_months: int
+
+    @property
+    def cache_key(self) -> str:
+        return iv_surface_cache_key(
+            self.dataset,
+            self.query_date,
+            self.query_time,
+            self.interval,
+            self.strike_count,
+            self.max_months,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Surface builder
+# ---------------------------------------------------------------------------
+
+
+def _normalise_expiry(expiry: Mapping[str, Any]) -> Dict[str, Any]:
+    value = str(expiry.get("value", "")).strip()
+    if not value:
+        raise ValueError("Expiry entry is missing 'value'")
+    label = str(expiry.get("label") or value).strip()
+    return {**dict(expiry), "value": value, "label": label}
+
 
 def build_iv_surface_payload(
     *,
@@ -97,15 +251,29 @@ def build_iv_surface_payload(
     get_available_expiries_for_date: Callable[..., Iterable[Dict[str, Any]]],
     safe_float: Callable[[Any], Optional[float]],
 ) -> Dict[str, Any]:
-    all_expiries = list(
-        get_available_expiries_for_date(
-            query_date=query_date,
-            dataset=dataset,
-            max_months=max_months,
-        )
-    )
+    """Build a complete IV-surface payload for a single timestamp."""
+    started = time.monotonic()
 
-    expiries = all_expiries[:IV_SURFACE_MAX_EXPIRIES]
+    raw_expiries = get_available_expiries_for_date(
+        query_date=query_date,
+        dataset=dataset,
+        max_months=max_months,
+    )
+    all_expiries: list[Dict[str, Any]] = []
+    seen_values: set[str] = set()
+
+    for raw in raw_expiries or []:
+        try:
+            exp = _normalise_expiry(raw)
+        except Exception:
+            logger.warning("Skipping malformed expiry entry: %r", raw, exc_info=True)
+            continue
+        if exp["value"] in seen_values:
+            continue
+        seen_values.add(exp["value"])
+        all_expiries.append(exp)
+
+    expiries = all_expiries[: min(max_months, IV_SURFACE_MAX_EXPIRIES)]
 
     if not expiries:
         return {
@@ -119,13 +287,16 @@ def build_iv_surface_payload(
             "strikes": [],
             "chain_source": "none",
             "rows": [],
+            "errors": [],
+            "generated_at": utc_now_iso(),
+            "duration_ms": round((time.monotonic() - started) * 1000, 2),
         }
 
-    def process_expiry(exp: Dict[str, Any]) -> Tuple[list[Dict[str, Any]], set[int], str]:
+    def process_expiry(exp: Dict[str, Any]) -> Tuple[list[Dict[str, Any]], set[int], str, Dict[str, Any]]:
+        expiry_started = time.monotonic()
         expiry_value = exp["value"]
         expiry_label = exp["label"]
 
-        expiry_started = time.monotonic()
         snap = build_option_chain_snapshot(
             query_date=query_date,
             query_time=query_time,
@@ -134,92 +305,88 @@ def build_iv_surface_payload(
             strike_count_each_side=strike_count,
             candle_interval_minutes=interval,
             selected_expiry=expiry_value,
-            # The surface only needs smile IV per strike; skip the Greek passes.
             compute_greeks=False,
         )
-        chain_source = snap.get("chain_source", "unknown")
-        logger.info(
-            "IV surface expiry %s built in %.2fs via %s",
-            expiry_value,
-            time.monotonic() - expiry_started,
-            chain_source,
-        )
+        if not isinstance(snap, dict):
+            raise TypeError("build_option_chain_snapshot must return a dictionary")
 
-        atm = safe_float(snap.get("atm")) or 0.0
-        local_rows: list[Dict[str, Any]] = []
-        local_strikes: set[int] = set()
+        chain_source = str(snap.get("chain_source") or "unknown")
+        atm_value = safe_float(snap.get("atm"))
+        atm = int(round(atm_value)) if atm_value is not None else None
+        rows: list[Dict[str, Any]] = []
+        strikes: set[int] = set()
 
-        for row in snap.get("rows", []):
-            strike = row.get("strike")
-
-            if strike is None:
+        for raw_row in snap.get("rows") or []:
+            if not isinstance(raw_row, Mapping):
                 continue
+            strike_value = safe_float(raw_row.get("strike"))
+            if strike_value is None:
+                continue
+            strike = int(round(strike_value))
 
-            strike = int(strike)
-            local_strikes.add(strike)
+            ce = safe_float(raw_row.get("ce_iv"))
+            pe = safe_float(raw_row.get("pe_iv"))
+            if ce is not None and 0 < ce <= 1:
+                ce *= 100.0
+            if pe is not None and 0 < pe <= 1:
+                pe *= 100.0
 
-            ce = safe_float(row.get("ce_iv"))
-            pe = safe_float(row.get("pe_iv"))
-
-            if ce is not None and ce <= 1:
-                ce *= 100
-
-            if pe is not None and pe <= 1:
-                pe *= 100
-
-            if atm and strike < atm:
+            if atm is not None and strike < atm:
                 smile_iv = pe
-            elif atm and strike > atm:
+            elif atm is not None and strike > atm:
                 smile_iv = ce
             else:
-                vals = [v for v in (ce, pe) if v is not None]
-                smile_iv = sum(vals) / len(vals) if vals else None
+                valid_values = [value for value in (ce, pe) if value is not None and value > 0]
+                smile_iv = sum(valid_values) / len(valid_values) if valid_values else None
 
-            if smile_iv is None:
+            if smile_iv is None or smile_iv <= 0:
                 continue
 
-            local_rows.append({
+            strikes.add(strike)
+            rows.append({
                 "expiry": expiry_value,
                 "expiry_label": expiry_label,
                 "strike": strike,
                 "iv": round(float(smile_iv), 4),
-                "atm": strike == int(atm) if atm else False,
+                "ce_iv": round(float(ce), 4) if ce is not None else None,
+                "pe_iv": round(float(pe), 4) if pe is not None else None,
+                "atm": atm is not None and strike == atm,
             })
 
-        return local_rows, local_strikes, chain_source
+        meta = {
+            "expiry": expiry_value,
+            "chain_source": chain_source,
+            "row_count": len(rows),
+            "duration_ms": round((time.monotonic() - expiry_started) * 1000, 2),
+        }
+        logger.info("IV surface expiry complete %s", meta)
+        return rows, strikes, chain_source, meta
 
-    surface_rows: list[Dict[str, Any]] = []
-    strikes_set: set[int] = set()
+    rows: list[Dict[str, Any]] = []
+    strikes: set[int] = set()
     sources: set[str] = set()
+    expiry_meta: list[Dict[str, Any]] = []
+    errors: list[Dict[str, Any]] = []
 
-    worker_count = min(
-        len(expiries),
-        max(1, IV_SURFACE_MAX_WORKERS),
-        max(1, os.cpu_count() or 1),
-    )
-
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+    worker_count = min(len(expiries), IV_SURFACE_MAX_WORKERS, max(1, os.cpu_count() or 1))
+    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="iv-expiry") as executor:
         futures = {executor.submit(process_expiry, exp): exp for exp in expiries}
-
         for future in as_completed(futures):
             exp = futures[future]
-
             try:
-                rows, strikes, source = future.result()
-                surface_rows.extend(rows)
-                strikes_set.update(strikes)
+                exp_rows, exp_strikes, source, meta = future.result()
+                rows.extend(exp_rows)
+                strikes.update(exp_strikes)
                 sources.add(source)
-
+                expiry_meta.append(meta)
             except Exception as exc:
-                logger.exception("IV surface expiry failed: %s", exp)
-                surface_rows.append({
+                logger.exception("IV surface expiry failed expiry=%s", exp.get("value"))
+                errors.append({
                     "expiry": exp.get("value"),
                     "expiry_label": exp.get("label"),
                     "error": str(exc),
                 })
 
-    # Single source if every expiry agreed, else "mixed" (some consolidated,
-    # some fell back to per-contract reads).
     if not sources:
         chain_source = "none"
     elif len(sources) == 1:
@@ -227,30 +394,33 @@ def build_iv_surface_payload(
     else:
         chain_source = "mixed"
 
-    surface_rows.sort(
-        key=lambda r: (
-            str(r.get("expiry", "")),
-            int(r.get("strike", 0)) if r.get("strike") is not None else 0,
-        )
-    )
+    rows.sort(key=lambda row: (str(row.get("expiry", "")), int(row.get("strike", 0))))
+    expiry_meta.sort(key=lambda item: str(item.get("expiry", "")))
 
     return {
-        "ok": True,
-        "status": "ready",
+        "ok": not errors or bool(rows),
+        "status": "ready" if not errors else "ready_with_errors",
         "dataset": dataset,
         "query_date": query_date,
         "query_time": query_time,
         "interval": interval,
+        "strike_count": strike_count,
+        "max_months": max_months,
         "expiries": expiries,
-        "strikes": sorted(strikes_set),
+        "strikes": sorted(strikes),
         "chain_source": chain_source,
-        "rows": surface_rows,
+        "rows": rows,
+        "errors": errors,
+        "expiry_meta": expiry_meta,
+        "generated_at": utc_now_iso(),
+        "duration_ms": round((time.monotonic() - started) * 1000, 2),
     }
 
 
-# =========================================================
-# FLASK ROUTE REGISTRATION
-# =========================================================
+# ---------------------------------------------------------------------------
+# Flask integration
+# ---------------------------------------------------------------------------
+
 
 def register_iv_surface_routes(
     *,
@@ -267,134 +437,143 @@ def register_iv_surface_routes(
     json_error: Callable[..., Any],
     default_interval: int,
 ) -> None:
-    @app.route("/api/iv-surface")
+    """Register IV-surface routes on a Flask application."""
+
+    def parse_request() -> IVSurfaceRequest:
+        dataset = normalize_dataset(request.args.get("dataset") or request.args.get("underlying"))
+        raw_date = request.args.get("date") or request.args.get("query_date")
+        query_date = normalize_date(raw_date) if raw_date else None
+        query_time = normalize_time(request.args.get("time") or request.args.get("query_time"))
+        interval = _coerce_int("interval", request.args.get("interval", default_interval), 1, 60)
+        strike_count = _coerce_int(
+            "strike_count", request.args.get("strike_count", 10), 1, IV_SURFACE_MAX_STRIKES_EACH_SIDE
+        )
+        max_months = _coerce_int(
+            "max_months", request.args.get("max_months", 2), 1, IV_SURFACE_MAX_MONTHS_ALLOWED
+        )
+        if not query_date:
+            _, _, _, query_date = resolve_default_week_date(dataset)
+        return IVSurfaceRequest(dataset, query_date, query_time, interval, strike_count, max_months)
+
+    @app.get("/api/iv-surface")
     def api_iv_surface():
         try:
-            dataset = normalize_dataset(
-                request.args.get("dataset") or request.args.get("underlying")
-            )
+            params = parse_request()
+            cache_key = params.cache_key
 
-            query_date = request.args.get("date") or request.args.get("query_date")
-            query_date = normalize_date(query_date) if query_date else None
-
-            query_time = normalize_time(
-                request.args.get("time") or request.args.get("query_time")
-            )
-
-            interval = int(request.args.get("interval", default_interval))
-            strike_count = int(request.args.get("strike_count", 10))
-            max_months = int(request.args.get("max_months", 2))
-
-            if interval <= 0:
-                raise ValueError("interval must be greater than zero.")
-
-            if strike_count <= 0:
-                raise ValueError("strike_count must be greater than zero.")
-
-            if max_months <= 0:
-                raise ValueError("max_months must be greater than zero.")
-
-            if not query_date:
-                _, _, _, query_date = resolve_default_week_date(dataset)
-
-            cache_key = iv_surface_cache_key(
-                dataset=dataset,
-                query_date=query_date,
-                query_time=query_time,
-                interval=interval,
-                strike_count=strike_count,
-                max_months=max_months,
-            )
-
-            cached_result = redis_get_json(redis_client, cache_key)
-
-            if cached_result:
-                return jsonify(cached_result)
+            cached = redis_get_json(redis_client, cache_key)
+            if cached is not None:
+                cached["cache_hit"] = True
+                return jsonify(cached), 200
 
             lookup_key = job_lookup_key(cache_key)
-            existing_job_id = redis_client.get(lookup_key)
-
+            existing_job_id = _decode_redis_value(redis_client.get(lookup_key))
             if existing_job_id:
-                if isinstance(existing_job_id, bytes):
-                    existing_job_id = existing_job_id.decode("utf-8")
+                existing_job = redis_get_json(redis_client, job_key(existing_job_id))
+                if existing_job:
+                    return jsonify(existing_job), 202
+                redis_delete(redis_client, lookup_key)
 
-                return jsonify({
-                    "ok": True,
-                    "status": "processing",
-                    "job_id": existing_job_id,
-                    "cache_key": cache_key,
-                })
+            job_id = str(uuid.uuid4())
+            if not redis_set_if_absent(redis_client, lookup_key, job_id, IV_SURFACE_LOCK_TTL_SECONDS):
+                winner = _decode_redis_value(redis_client.get(lookup_key))
+                if winner:
+                    winner_job = redis_get_json(redis_client, job_key(winner))
+                    if winner_job:
+                        return jsonify(winner_job), 202
+                raise RuntimeError("Unable to acquire IV surface job lock")
 
-            new_job_id = str(uuid.uuid4())
-            new_job_key = job_key(new_job_id)
-
-            job_payload = {
+            current_job_key = job_key(job_id)
+            job_payload: Dict[str, Any] = {
                 "ok": True,
-                "status": "processing",
-                "job_id": new_job_id,
-                "job_key": new_job_key,
+                "status": "queued",
+                "job_id": job_id,
+                "job_key": current_job_key,
                 "cache_key": cache_key,
-                "dataset": dataset,
-                "query_date": query_date,
-                "query_time": query_time,
-                "interval": interval,
-                "strike_count": strike_count,
-                "max_months": max_months,
+                "lookup_key": lookup_key,
+                "dataset": params.dataset,
+                "query_date": params.query_date,
+                "query_time": params.query_time,
+                "interval": params.interval,
+                "strike_count": params.strike_count,
+                "max_months": params.max_months,
+                "created_at": utc_now_iso(),
             }
+            redis_set_json(redis_client, current_job_key, job_payload, IV_SURFACE_JOB_TTL_SECONDS)
 
-            redis_set_json(
-                redis_client,
-                new_job_key,
-                job_payload,
-                ex=IV_SURFACE_JOB_TTL_SECONDS,
-            )
+            try:
+                producer = get_kafka_producer()
+                send_future = producer.send(IV_SURFACE_TOPIC, value=job_payload)
+                if hasattr(send_future, "get"):
+                    send_future.get(timeout=KAFKA_SEND_TIMEOUT_SECONDS)
+            except Exception as exc:
+                failed = {**job_payload, "ok": False, "status": "failed", "error": "Unable to enqueue job"}
+                redis_set_json(redis_client, current_job_key, failed, IV_SURFACE_JOB_TTL_SECONDS)
+                redis_delete(redis_client, lookup_key)
+                logger.exception("Unable to publish IV surface job id=%s", job_id)
+                raise RuntimeError("Unable to queue IV surface calculation") from exc
 
-            redis_client.setex(
-                lookup_key,
-                IV_SURFACE_JOB_TTL_SECONDS,
-                new_job_id,
-            )
-
-            producer = get_kafka_producer()
-            producer.send(IV_SURFACE_TOPIC, job_payload)
-            producer.flush()
-
-            return jsonify({
-                "ok": True,
-                "status": "processing",
-                "job_id": new_job_id,
-                "cache_key": cache_key,
-            })
-
-        except Exception as exc:
+            return jsonify(job_payload), 202
+        except ValueError as exc:
             return json_error(str(exc), 400)
+        except Exception as exc:
+            logger.exception("IV surface request failed")
+            return json_error(str(exc), 503)
 
-    @app.route("/api/iv-surface/status/<job_id_value>")
+    @app.get("/api/iv-surface/status/<job_id_value>")
     def api_iv_surface_status(job_id_value: str):
         try:
-            current_job_key = job_key(job_id_value)
-            job_data = redis_get_json(redis_client, current_job_key)
-
-            if not job_data:
+            validated_job_id = _validate_job_id(job_id_value)
+            data = redis_get_json(redis_client, job_key(validated_job_id))
+            if not data:
                 return json_error("IV surface job not found or expired.", 404)
 
-            cache_key = job_data.get("cache_key")
-
+            cache_key = data.get("cache_key")
             if cache_key:
-                cached_result = redis_get_json(redis_client, cache_key)
+                result = redis_get_json(redis_client, cache_key)
+                if result is not None:
+                    result["cache_hit"] = True
+                    result["job_id"] = validated_job_id
+                    return jsonify(result), 200
 
-                if cached_result:
-                    return jsonify(cached_result)
-
-            return jsonify(job_data)
-
-        except Exception as exc:
+            status = data.get("status")
+            return jsonify(data), (500 if status == "failed" else 202)
+        except ValueError as exc:
             return json_error(str(exc), 400)
+        except Exception as exc:
+            logger.exception("IV surface status request failed")
+            return json_error(str(exc), 503)
 
 
-# =========================================================
-# KAFKA WORKER HELPERS
-# =========================================================
+# ---------------------------------------------------------------------------
+# Worker helpers
+# ---------------------------------------------------------------------------
+
+
+_REQUIRED_JOB_FIELDS: Sequence[str] = (
+    "job_id", "job_key", "cache_key", "lookup_key", "dataset", "query_date",
+    "query_time", "interval", "strike_count", "max_months",
+)
+
+
+def validate_job_message(message: Mapping[str, Any]) -> Dict[str, Any]:
+    if not isinstance(message, Mapping):
+        raise ValueError("IV surface message must be a JSON object")
+    missing = [key for key in _REQUIRED_JOB_FIELDS if not message.get(key)]
+    if missing:
+        raise ValueError(f"Invalid IV surface job. Missing keys: {missing}")
+
+    out = dict(message)
+    out["job_id"] = _validate_job_id(str(out["job_id"]))
+    out["interval"] = _coerce_int("interval", out["interval"], 1, 60)
+    out["strike_count"] = _coerce_int(
+        "strike_count", out["strike_count"], 1, IV_SURFACE_MAX_STRIKES_EACH_SIDE
+    )
+    out["max_months"] = _coerce_int(
+        "max_months", out["max_months"], 1, IV_SURFACE_MAX_MONTHS_ALLOWED
+    )
+    return out
+
 
 def process_iv_surface_message(
     *,
@@ -404,77 +583,67 @@ def process_iv_surface_message(
     get_available_expiries_for_date: Callable[..., Iterable[Dict[str, Any]]],
     safe_float: Callable[[Any], Optional[float]],
 ) -> Dict[str, Any]:
-    required = [
-        "job_id",
-        "job_key",
-        "cache_key",
-        "dataset",
-        "query_date",
-        "query_time",
-        "interval",
-        "strike_count",
-        "max_months",
-    ]
+    message = validate_job_message(message)
+    started = time.monotonic()
 
-    missing = [key for key in required if key not in message]
+    processing_state = {
+        **message,
+        "ok": True,
+        "status": "processing",
+        "started_at": utc_now_iso(),
+    }
+    redis_set_json(redis_client, message["job_key"], processing_state, IV_SURFACE_JOB_TTL_SECONDS)
 
-    if missing:
-        raise ValueError(f"Invalid IV surface job. Missing keys: {missing}")
+    # Another worker may have completed it while this message was waiting.
+    existing = redis_get_json(redis_client, message["cache_key"])
+    if existing is not None:
+        redis_delete(redis_client, message["lookup_key"])
+        return existing
 
     result = build_iv_surface_payload(
-        dataset=message["dataset"],
-        query_date=message["query_date"],
-        query_time=message["query_time"],
-        interval=int(message["interval"]),
-        strike_count=int(message["strike_count"]),
-        max_months=int(message["max_months"]),
+        dataset=str(message["dataset"]),
+        query_date=str(message["query_date"]),
+        query_time=str(message["query_time"]),
+        interval=message["interval"],
+        strike_count=message["strike_count"],
+        max_months=message["max_months"],
         build_option_chain_snapshot=build_option_chain_snapshot,
         get_available_expiries_for_date=get_available_expiries_for_date,
         safe_float=safe_float,
     )
+    result["job_id"] = message["job_id"]
+    result["cache_hit"] = False
 
-    redis_set_json(
-        redis_client,
-        message["cache_key"],
-        result,
-        ex=IV_SURFACE_CACHE_TTL_SECONDS,
-    )
-
-    redis_set_json(
-        redis_client,
-        message["job_key"],
-        {
-            "ok": True,
-            "status": "done",
-            "job_id": message["job_id"],
-            "cache_key": message["cache_key"],
-        },
-        ex=IV_SURFACE_JOB_TTL_SECONDS,
-    )
-
+    redis_set_json(redis_client, message["cache_key"], result, IV_SURFACE_CACHE_TTL_SECONDS)
+    done_state = {
+        "ok": True,
+        "status": "done",
+        "job_id": message["job_id"],
+        "cache_key": message["cache_key"],
+        "finished_at": utc_now_iso(),
+        "duration_ms": round((time.monotonic() - started) * 1000, 2),
+    }
+    redis_set_json(redis_client, message["job_key"], done_state, IV_SURFACE_JOB_TTL_SECONDS)
+    redis_delete(redis_client, message["lookup_key"])
     return result
 
 
 def mark_iv_surface_job_failed(
-    *,
-    redis_client: Any,
-    message: Dict[str, Any],
-    error: Exception,
+    *, redis_client: Any, message: Mapping[str, Any], error: Exception
 ) -> None:
-    current_job_key = message.get("job_key") or job_key(str(message.get("job_id", "")))
-
-    redis_set_json(
-        redis_client,
-        current_job_key,
-        {
-            "ok": False,
-            "status": "failed",
-            "job_id": message.get("job_id"),
-            "cache_key": message.get("cache_key"),
-            "error": str(error),
-        },
-        ex=IV_SURFACE_JOB_TTL_SECONDS,
-    )
+    current_job_key = str(message.get("job_key") or job_key(str(message.get("job_id", ""))))
+    failed = {
+        "ok": False,
+        "status": "failed",
+        "job_id": message.get("job_id"),
+        "cache_key": message.get("cache_key"),
+        "error": str(error),
+        "failed_at": utc_now_iso(),
+    }
+    try:
+        redis_set_json(redis_client, current_job_key, failed, IV_SURFACE_JOB_TTL_SECONDS)
+    finally:
+        redis_delete(redis_client, str(message.get("lookup_key") or ""))
 
 
 def run_iv_surface_worker(
@@ -484,47 +653,100 @@ def run_iv_surface_worker(
     get_available_expiries_for_date: Callable[..., Iterable[Dict[str, Any]]],
     safe_float: Callable[[Any], Optional[float]],
 ) -> None:
+    """Run a blocking Kafka worker with graceful shutdown and manual commits."""
     try:
-        from kafka import KafkaConsumer
+        from kafka import KafkaConsumer, KafkaProducer
     except Exception as exc:
-        raise RuntimeError("kafka-python is not installed or KafkaConsumer is unavailable.") from exc
+        raise RuntimeError("Install kafka-python; KafkaConsumer/KafkaProducer are unavailable") from exc
 
-    bootstrap_servers = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
-    group_id = os.getenv("KAFKA_IV_SURFACE_GROUP_ID", "iv-surface-workers")
+    bootstrap_servers = [
+        item.strip() for item in os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092").split(",") if item.strip()
+    ]
+    group_id = os.getenv("KAFKA_IV_SURFACE_GROUP_ID", "iv-surface-workers").strip()
+    client_id = os.getenv("KAFKA_IV_SURFACE_CLIENT_ID", f"iv-surface-{os.getpid()}").strip()
 
     consumer = KafkaConsumer(
         IV_SURFACE_TOPIC,
         bootstrap_servers=bootstrap_servers,
         group_id=group_id,
-        auto_offset_reset="latest",
+        client_id=client_id,
+        auto_offset_reset="earliest",
         enable_auto_commit=False,
-        value_deserializer=lambda v: json.loads(v.decode("utf-8")),
+        value_deserializer=lambda value: json.loads(value.decode("utf-8")),
+        max_poll_records=KAFKA_MAX_POLL_RECORDS,
+        session_timeout_ms=KAFKA_SESSION_TIMEOUT_MS,
+        max_poll_interval_ms=KAFKA_MAX_POLL_INTERVAL_MS,
     )
+    dlq_producer = KafkaProducer(
+        bootstrap_servers=bootstrap_servers,
+        client_id=f"{client_id}-dlq",
+        value_serializer=lambda value: _json_dumps(value).encode("utf-8"),
+        acks="all",
+        retries=5,
+    )
+
+    stopping = False
+
+    def request_stop(signum: int, _frame: Any) -> None:
+        nonlocal stopping
+        logger.info("Worker shutdown requested signal=%s", signum)
+        stopping = True
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, request_stop)
+        except ValueError:
+            pass
 
     logger.info(
-        "IV surface worker started. topic=%s group_id=%s",
-        IV_SURFACE_TOPIC,
-        group_id,
+        "IV surface worker started topic=%s group=%s client=%s brokers=%s",
+        IV_SURFACE_TOPIC, group_id, client_id, bootstrap_servers,
     )
 
-    for record in consumer:
-        message = record.value
+    try:
+        while not stopping:
+            records = consumer.poll(timeout_ms=1000, max_records=KAFKA_MAX_POLL_RECORDS)
+            if not records:
+                continue
 
+            for _, batch in records.items():
+                for record in batch:
+                    message = record.value
+                    try:
+                        process_iv_surface_message(
+                            message=message,
+                            redis_client=redis_client,
+                            build_option_chain_snapshot=build_option_chain_snapshot,
+                            get_available_expiries_for_date=get_available_expiries_for_date,
+                            safe_float=safe_float,
+                        )
+                        consumer.commit()
+                    except Exception as exc:
+                        logger.exception(
+                            "IV surface job failed partition=%s offset=%s", record.partition, record.offset
+                        )
+                        mark_iv_surface_job_failed(redis_client=redis_client, message=message, error=exc)
+                        dlq_payload = {
+                            "failed_at": utc_now_iso(),
+                            "error": str(exc),
+                            "source_topic": record.topic,
+                            "source_partition": record.partition,
+                            "source_offset": record.offset,
+                            "message": message,
+                        }
+                        try:
+                            dlq_producer.send(IV_SURFACE_DLQ_TOPIC, value=dlq_payload).get(
+                                timeout=KAFKA_SEND_TIMEOUT_SECONDS
+                            )
+                            consumer.commit()
+                        except Exception:
+                            # Do not commit when the DLQ write fails; Kafka will redeliver.
+                            logger.exception("Unable to publish failed job to DLQ")
+                            time.sleep(2)
+    finally:
         try:
-            process_iv_surface_message(
-                message=message,
-                redis_client=redis_client,
-                build_option_chain_snapshot=build_option_chain_snapshot,
-                get_available_expiries_for_date=get_available_expiries_for_date,
-                safe_float=safe_float,
-            )
-            consumer.commit()
-
-        except Exception as exc:
-            logger.exception("IV surface job failed")
-            mark_iv_surface_job_failed(
-                redis_client=redis_client,
-                message=message,
-                error=exc,
-            )
-            consumer.commit()
+            consumer.close(autocommit=False)
+        finally:
+            dlq_producer.flush(timeout=KAFKA_SEND_TIMEOUT_SECONDS)
+            dlq_producer.close(timeout=KAFKA_SEND_TIMEOUT_SECONDS)
+        logger.info("IV surface worker stopped")
