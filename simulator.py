@@ -23,6 +23,7 @@ Frontend files expected:
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import math
@@ -37,6 +38,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 from flask import Flask, g, jsonify, render_template, request
+from flask.json.provider import JSONProvider
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 try:
@@ -49,18 +51,35 @@ try:
 except ImportError:  # pragma: no cover
     KafkaProducer = None
 
+try:
+    import orjson
+except ImportError:  # pragma: no cover
+    orjson = None
+
 from black_scholes_iv_for_simulation import append_black_scholes_iv
+
+try:
+    from black_scholes_iv_for_simulation import clear_iv_cache, iv_cache_stats
+except ImportError:  # Backward compatibility with an older IV module.
+    def clear_iv_cache() -> None:
+        return None
+
+    def iv_cache_stats() -> dict:
+        return {"enabled": False}
 from chart import build_chart_payload
 from config_for_simulation import CANDLE_INTERVAL_MINUTES, IST, get_dataset_config
 from data_engine_for_simulation import (
+    clear_runtime_caches,
     create_candles,
     get_dates_for_week_folder,
     get_nearest_strike,
+    get_option_chain_snapshot,
     get_upcoming_expiry_np,
     get_week_folders,
     load_consolidated_option_chain,
     load_required_option_data_for_date,
     load_tick_data,
+    runtime_cache_stats,
 )
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -78,8 +97,28 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+
+class _OrjsonProvider(JSONProvider):
+    """Fast Flask JSON provider with safe fallback-compatible behavior."""
+
+    def dumps(self, obj: Any, **kwargs) -> str:
+        if orjson is None:
+            return json.dumps(obj, default=str, separators=(",", ":"))
+        return orjson.dumps(
+            obj,
+            option=orjson.OPT_NON_STR_KEYS | orjson.OPT_SERIALIZE_NUMPY,
+            default=str,
+        ).decode("utf-8")
+
+    def loads(self, value: Any, **kwargs) -> Any:
+        if orjson is None:
+            return json.loads(value)
+        return orjson.loads(value)
+
+
 def create_app() -> Flask:
     flask_app = Flask(__name__)
+    flask_app.json = _OrjsonProvider(flask_app)
     flask_app.config.update(
         JSON_SORT_KEYS=False,
         MAX_CONTENT_LENGTH=int(os.getenv("MAX_CONTENT_LENGTH", str(2 * 1024 * 1024))),
@@ -234,6 +273,56 @@ SPOT_CANDLE_CACHE: "OrderedDict[Tuple[Any, ...], pd.DataFrame]" = OrderedDict()
 OPTION_WINDOW_CACHE_LOCK = threading.RLock()
 SPOT_CANDLE_CACHE_LOCK = threading.RLock()
 
+# Complete option-chain payload cache. This avoids repeating spot resolution,
+# chain lookup, IV solving and JSON preparation for identical historical requests.
+MAX_CHAIN_SNAPSHOT_CACHE_SIZE = max(
+    1,
+    int(os.getenv("CHAIN_SNAPSHOT_CACHE_SIZE", "256")),
+)
+CHAIN_SNAPSHOT_CACHE_TTL_SECONDS = max(
+    0.0,
+    float(os.getenv("CHAIN_SNAPSHOT_CACHE_TTL_SECONDS", "900")),
+)
+CHAIN_SNAPSHOT_CACHE: "OrderedDict[Tuple[Any, ...], Tuple[float, Dict[str, Any]]]" = OrderedDict()
+CHAIN_SNAPSHOT_CACHE_LOCK = threading.RLock()
+
+
+def _get_chain_snapshot_cache(key: Tuple[Any, ...]) -> Optional[Dict[str, Any]]:
+    now = time.monotonic()
+    with CHAIN_SNAPSHOT_CACHE_LOCK:
+        item = CHAIN_SNAPSHOT_CACHE.get(key)
+        if item is None:
+            return None
+
+        created_at, payload = item
+        if (
+            CHAIN_SNAPSHOT_CACHE_TTL_SECONDS > 0
+            and now - created_at >= CHAIN_SNAPSHOT_CACHE_TTL_SECONDS
+        ):
+            CHAIN_SNAPSHOT_CACHE.pop(key, None)
+            return None
+
+        CHAIN_SNAPSHOT_CACHE.move_to_end(key)
+        return copy.deepcopy(payload)
+
+
+def _put_chain_snapshot_cache(
+    key: Tuple[Any, ...],
+    payload: Dict[str, Any],
+) -> None:
+    with CHAIN_SNAPSHOT_CACHE_LOCK:
+        CHAIN_SNAPSHOT_CACHE[key] = (time.monotonic(), copy.deepcopy(payload))
+        CHAIN_SNAPSHOT_CACHE.move_to_end(key)
+        while len(CHAIN_SNAPSHOT_CACHE) > MAX_CHAIN_SNAPSHOT_CACHE_SIZE:
+            CHAIN_SNAPSHOT_CACHE.popitem(last=False)
+
+
+def _clear_chain_snapshot_cache() -> None:
+    with CHAIN_SNAPSHOT_CACHE_LOCK:
+        CHAIN_SNAPSHOT_CACHE.clear()
+
+
+
 # Speed mode: IV/Greeks calculation is expensive.
 # Default OFF for faster simulation. Set ENABLE_IV_CALC=true to enable it.
 ENABLE_IV_CALC = _env_bool("ENABLE_IV_CALC", True)
@@ -279,9 +368,19 @@ def get_kafka_producer():
             try:
                 _kafka_producer = KafkaProducer(
                     bootstrap_servers=[x.strip() for x in KAFKA_BOOTSTRAP_SERVERS.split(",") if x.strip()],
-                    value_serializer=lambda value: json.dumps(
-                        value, separators=(",", ":"), default=str
-                    ).encode("utf-8"),
+                    value_serializer=(
+                        (lambda value: orjson.dumps(
+                            value,
+                            option=orjson.OPT_NON_STR_KEYS | orjson.OPT_SERIALIZE_NUMPY,
+                            default=str,
+                        ))
+                        if orjson is not None
+                        else (lambda value: json.dumps(
+                            value,
+                            separators=(",", ":"),
+                            default=str,
+                        ).encode("utf-8"))
+                    ),
                     acks="all",
                     retries=int(os.getenv("KAFKA_PRODUCER_RETRIES", "5")),
                     request_timeout_ms=int(os.getenv("KAFKA_REQUEST_TIMEOUT_MS", "15000")),
@@ -855,16 +954,25 @@ def build_option_chain_snapshot(
     selected_expiry: Optional[str] = None,
     compute_greeks: bool = True,
 ) -> Dict[str, Any]:
+    """Build one historical option-chain snapshot with profiling and caching."""
+
+    total_started = time.perf_counter()
+    timings: Dict[str, float] = {}
+
     dataset = _normalize_dataset(dataset)
     query_time = _normalize_time(query_time)
     candle_interval_minutes = int(candle_interval_minutes)
+    strike_count_each_side = int(strike_count_each_side)
 
     if candle_interval_minutes <= 0:
         raise ValueError("interval must be greater than zero.")
+    if strike_count_each_side < 0 or strike_count_each_side > 100:
+        raise ValueError("strike_count_each_side must be between 0 and 100.")
 
     cfg = get_dataset_config(dataset)
     strike_step = int(cfg["strike_step"])
 
+    stage = time.perf_counter()
     if query_date:
         query_date = _normalize_date(query_date)
         resolved_week, folder, date_str = _resolve_week_folder_for_date(
@@ -876,13 +984,44 @@ def build_option_chain_snapshot(
         resolved_week, folder, date_str, query_date = _resolve_default_week_date(
             dataset=dataset,
         )
+    timings["resolve_data_ms"] = round((time.perf_counter() - stage) * 1000, 3)
 
+    expiry_str = selected_expiry or get_upcoming_expiry_np(
+        datetime.strptime(date_str, "%Y%m%d").date(),
+        instrument=dataset,
+        expiry_rule=expiry_rule,
+    )
+    if expiry_str is None:
+        raise ValueError("No upcoming expiry found.")
+    expiry_str = str(expiry_str).strip()
+
+    cache_key = (
+        dataset,
+        date_str,
+        expiry_str,
+        query_time,
+        candle_interval_minutes,
+        strike_count_each_side,
+        spot_price_field,
+        bool(compute_greeks),
+    )
+    cached_payload = _get_chain_snapshot_cache(cache_key)
+    if cached_payload is not None:
+        cached_payload["cache_hit"] = True
+        cached_payload["performance"] = {
+            "cache_lookup_ms": round((time.perf_counter() - total_started) * 1000, 3),
+            "total_ms": round((time.perf_counter() - total_started) * 1000, 3),
+        }
+        return cached_payload
+
+    stage = time.perf_counter()
     spot_candles = _get_spot_candles_for_day(
         folder=folder,
         date_str=date_str,
         dataset=dataset,
         candle_interval_minutes=candle_interval_minutes,
     )
+    timings["spot_candles_ms"] = round((time.perf_counter() - stage) * 1000, 3)
 
     if spot_candles.empty:
         raise ValueError("No spot candles found for selected date.")
@@ -892,7 +1031,6 @@ def build_option_chain_snapshot(
         date_str=date_str,
         query_time=query_time,
     )
-
     target_ts = _to_ist_timestamp(target_ts)
 
     if spot_price_field not in {"open", "high", "low", "close"}:
@@ -902,45 +1040,7 @@ def build_option_chain_snapshot(
     if spot is None:
         raise ValueError(f"Spot candle field '{spot_price_field}' is missing or invalid.")
 
-    day_open = _safe_float(spot_candles.iloc[0].get("open"))
-    if day_open is None:
-        day_open = spot
-
-    # =========================
-    # INDIA VIX VALUE
-    # =========================
-    india_vix_value = None
-
-    try:
-        from data_engine_for_simulation import load_index_data_by_symbol
-
-        vix_df = load_index_data_by_symbol(
-            folder=folder,
-            date_str=date_str,
-            symbol_name="INDIAVIX",
-        )
-
-        if vix_df is not None and not vix_df.empty:
-            vix_df = vix_df.copy()
-            vix_df["datetime"] = pd.to_datetime(vix_df["datetime"], errors="coerce")
-            vix_df["value"] = pd.to_numeric(vix_df["value"], errors="coerce")
-            vix_df = vix_df.dropna(subset=["datetime", "value"])
-
-            if not vix_df.empty:
-                if getattr(vix_df["datetime"].dt, "tz", None) is None:
-                    vix_df["datetime"] = vix_df["datetime"].dt.tz_localize(IST)
-                else:
-                    vix_df["datetime"] = vix_df["datetime"].dt.tz_convert(IST)
-
-                target_vix = vix_df[vix_df["datetime"] <= target_ts]
-
-                if not target_vix.empty:
-                    india_vix_value = _safe_float(target_vix.iloc[-1]["value"])
-
-    except Exception as exc:
-        logger.warning("INDIA VIX load error: %s", exc)
-        india_vix_value = None
-
+    day_open = _safe_float(spot_candles.iloc[0].get("open"), spot)
     atm = int(
         get_nearest_strike(
             spot,
@@ -949,80 +1049,76 @@ def build_option_chain_snapshot(
         )
     )
 
-    expiry_str = selected_expiry or get_upcoming_expiry_np(
-        datetime.strptime(date_str, "%Y%m%d").date(),
-        instrument=dataset,
-        expiry_rule=expiry_rule,
-    )
-
-    if expiry_str is None:
-        raise ValueError("No upcoming expiry found.")
-
     strikes = [
-        atm + i * strike_step
-        for i in range(-int(strike_count_each_side), int(strike_count_each_side) + 1)
+        atm + offset * strike_step
+        for offset in range(-strike_count_each_side, strike_count_each_side + 1)
     ]
 
-    rows = []
+    # India VIX is best-effort and must not fail the main chain request.
+    stage = time.perf_counter()
+    india_vix_value = None
+    try:
+        from data_engine_for_simulation import load_index_data_by_symbol
 
-    consolidated_chain = load_consolidated_option_chain(
+        vix_df = load_index_data_by_symbol(
+            folder=folder,
+            date_str=date_str,
+            symbol_name="INDIAVIX",
+        )
+        if vix_df is not None and not vix_df.empty:
+            vix_ts = pd.to_datetime(vix_df["datetime"], errors="coerce")
+            vix_values = pd.to_numeric(vix_df["value"], errors="coerce")
+            vix_work = pd.DataFrame({"datetime": vix_ts, "value": vix_values}).dropna()
+            if not vix_work.empty:
+                if getattr(vix_work["datetime"].dt, "tz", None) is None:
+                    vix_work["datetime"] = vix_work["datetime"].dt.tz_localize(
+                        IST,
+                        ambiguous="NaT",
+                        nonexistent="NaT",
+                    )
+                else:
+                    vix_work["datetime"] = vix_work["datetime"].dt.tz_convert(IST)
+                values_before = vix_work.loc[vix_work["datetime"] <= target_ts, "value"]
+                if not values_before.empty:
+                    india_vix_value = _safe_float(values_before.iloc[-1])
+    except Exception as exc:
+        logger.warning("INDIA VIX load error: %s", exc)
+    timings["vix_ms"] = round((time.perf_counter() - stage) * 1000, 3)
+
+    # Fast path: data_engine performs one indexed lookup and binary-searches the
+    # latest timestamp at or before target_ts. This avoids scanning the full chain
+    # once for every strike.
+    stage = time.perf_counter()
+    snapshot = get_option_chain_snapshot(
         folder=folder,
         date_str=date_str,
         expiry_str=expiry_str,
+        target_timestamp=target_ts,
         instrument=dataset,
     )
+    timings["chain_snapshot_ms"] = round((time.perf_counter() - stage) * 1000, 3)
 
-    chain_source = "consolidated" if consolidated_chain is not None else "contracts"
+    rows: List[Dict[str, Any]] = []
+    chain_source = "consolidated"
 
-    for strike in strikes:
-        option_data = _load_option_data_fast(
-            folder=folder,
-            date_str=date_str,
-            expiry_str=expiry_str,
-            strike=int(strike),
-            dataset=dataset,
-            chain=consolidated_chain,
-        )
+    if snapshot is not None and not snapshot.empty:
+        snapshot = snapshot.loc[:, ["timestamp", "strike", "ce", "pe"]].copy(deep=False)
+        strike_values = pd.to_numeric(snapshot["strike"], errors="coerce")
+        snapshot = snapshot.loc[strike_values.notna()].copy()
+        snapshot["strike"] = strike_values.loc[strike_values.notna()].astype(int)
+        by_strike = snapshot.drop_duplicates("strike", keep="last").set_index("strike")
 
-        ce_cache_key = (
-            "option_window",
-            dataset,
-            date_str,
-            expiry_str,
-            int(strike),
-            "CE",
-            candle_interval_minutes,
-            target_ts.strftime("%Y-%m-%d %H:%M:%S%z"),
-        )
+        for strike in strikes:
+            ce_ltp = pe_ltp = None
+            if int(strike) in by_strike.index:
+                strike_row = by_strike.loc[int(strike)]
+                if isinstance(strike_row, pd.DataFrame):
+                    strike_row = strike_row.iloc[-1]
+                ce_ltp = _safe_float(strike_row.get("ce"))
+                pe_ltp = _safe_float(strike_row.get("pe"))
 
-        pe_cache_key = (
-            "option_window",
-            dataset,
-            date_str,
-            expiry_str,
-            int(strike),
-            "PE",
-            candle_interval_minutes,
-            target_ts.strftime("%Y-%m-%d %H:%M:%S%z"),
-        )
-
-        ce_ltp = _option_ltp_at_time_cached(
-            raw_df=option_data.get("CE"),
-            target_ts=target_ts,
-            candle_interval_minutes=candle_interval_minutes,
-            cache_key=ce_cache_key,
-        )
-
-        pe_ltp = _option_ltp_at_time_cached(
-            raw_df=option_data.get("PE"),
-            target_ts=target_ts,
-            candle_interval_minutes=candle_interval_minutes,
-            cache_key=pe_cache_key,
-        )
-
-        rows.append(
-            {
-                "timestamp": pd.Timestamp(target_ts).tz_convert(IST).tz_localize(None),
+            rows.append({
+                "timestamp": target_ts.tz_convert(IST).tz_localize(None),
                 "trade_date": datetime.strptime(date_str, "%Y%m%d").date(),
                 "instrument": dataset,
                 "expiry": expiry_str,
@@ -1031,66 +1127,107 @@ def build_option_chain_snapshot(
                 "close": float(spot),
                 "ce": ce_ltp,
                 "pe": pe_ltp,
-            }
-        )
+            })
+    else:
+        # Backward-compatible fallback for dates without a consolidated file.
+        chain_source = "contracts"
+        for strike in strikes:
+            option_data = load_required_option_data_for_date(
+                folder=folder,
+                date_str=date_str,
+                expiry_str=expiry_str,
+                strike=int(strike),
+                instrument=dataset,
+            )
 
-    chain_df = pd.DataFrame(rows)
+            ce_ltp = _option_ltp_at_time_cached(
+                raw_df=option_data.get("CE"),
+                target_ts=target_ts,
+                candle_interval_minutes=candle_interval_minutes,
+                cache_key=(
+                    "option_window", dataset, date_str, expiry_str, int(strike),
+                    "CE", candle_interval_minutes,
+                    target_ts.strftime("%Y-%m-%d %H:%M:%S%z"),
+                ),
+            )
+            pe_ltp = _option_ltp_at_time_cached(
+                raw_df=option_data.get("PE"),
+                target_ts=target_ts,
+                candle_interval_minutes=candle_interval_minutes,
+                cache_key=(
+                    "option_window", dataset, date_str, expiry_str, int(strike),
+                    "PE", candle_interval_minutes,
+                    target_ts.strftime("%Y-%m-%d %H:%M:%S%z"),
+                ),
+            )
 
+            rows.append({
+                "timestamp": target_ts.tz_convert(IST).tz_localize(None),
+                "trade_date": datetime.strptime(date_str, "%Y%m%d").date(),
+                "instrument": dataset,
+                "expiry": expiry_str,
+                "nearest_strike": int(strike),
+                "strike": int(strike),
+                "close": float(spot),
+                "ce": ce_ltp,
+                "pe": pe_ltp,
+            })
+
+    chain_df = pd.DataFrame.from_records(rows)
+
+    stage = time.perf_counter()
     if ENABLE_IV_CALC:
         try:
-            chain_df = append_black_scholes_iv(chain_df, compute_greeks=compute_greeks)
+            chain_df = append_black_scholes_iv(
+                chain_df,
+                compute_greeks=compute_greeks,
+                inplace=True,
+            )
+        except TypeError:
+            # Backward compatibility with an older function signature.
+            chain_df = append_black_scholes_iv(
+                chain_df,
+                compute_greeks=compute_greeks,
+            )
         except Exception as exc:
-            chain_df["iv"] = np.nan
-            chain_df["ce_iv"] = np.nan
-            chain_df["pe_iv"] = np.nan
-            chain_df["ce_delta"] = np.nan
-            chain_df["pe_delta"] = np.nan
-            chain_df["ce_gamma"] = np.nan
-            chain_df["pe_gamma"] = np.nan
-            chain_df["ce_vega"] = np.nan
-            chain_df["pe_vega"] = np.nan
-            chain_df["ce_theta"] = np.nan
-            chain_df["pe_theta"] = np.nan
+            logger.exception("IV calculation failed")
             chain_df["_iv_error"] = str(exc)
-    else:
-        chain_df["iv"] = np.nan
-        chain_df["ce_iv"] = np.nan
-        chain_df["pe_iv"] = np.nan
-        chain_df["ce_delta"] = np.nan
-        chain_df["pe_delta"] = np.nan
-        chain_df["ce_gamma"] = np.nan
-        chain_df["pe_gamma"] = np.nan
-        chain_df["ce_vega"] = np.nan
-        chain_df["pe_vega"] = np.nan
-        chain_df["ce_theta"] = np.nan
-        chain_df["pe_theta"] = np.nan
 
-    chain_rows = []
+    for column in (
+        "iv", "ce_iv", "pe_iv",
+        "ce_delta", "pe_delta",
+        "ce_gamma", "pe_gamma",
+        "ce_vega", "pe_vega",
+        "ce_theta", "pe_theta",
+    ):
+        if column not in chain_df.columns:
+            chain_df[column] = np.nan
+    timings["iv_greeks_ms"] = round((time.perf_counter() - stage) * 1000, 3)
 
-    for _, row in chain_df.iterrows():
-        strike = _safe_int(row.get("strike"))
+    stage = time.perf_counter()
+    chain_rows = [
+        {
+            "strike": _safe_int(row.strike),
+            "atm": _safe_int(row.strike) == atm,
+            "ce_ltp": _round_or_none(row.ce, 2),
+            "pe_ltp": _round_or_none(row.pe, 2),
+            "iv": _round_or_none(row.iv, 4),
+            "ce_iv": _round_or_none(row.ce_iv, 4),
+            "pe_iv": _round_or_none(row.pe_iv, 4),
+            "ce_delta": _round_or_none(row.ce_delta, 4),
+            "pe_delta": _round_or_none(row.pe_delta, 4),
+            "ce_gamma": _round_or_none(row.ce_gamma, 6),
+            "pe_gamma": _round_or_none(row.pe_gamma, 6),
+            "ce_vega": _round_or_none(row.ce_vega, 4),
+            "pe_vega": _round_or_none(row.pe_vega, 4),
+            "ce_theta": _round_or_none(row.ce_theta, 4),
+            "pe_theta": _round_or_none(row.pe_theta, 4),
+        }
+        for row in chain_df.itertuples(index=False)
+    ]
+    timings["response_build_ms"] = round((time.perf_counter() - stage) * 1000, 3)
 
-        chain_rows.append(
-            {
-                "strike": strike,
-                "atm": strike == atm,
-                "ce_ltp": _round_or_none(row.get("ce"), 2),
-                "pe_ltp": _round_or_none(row.get("pe"), 2),
-                "iv": _round_or_none(row.get("iv"), 4),
-                "ce_iv": _round_or_none(row.get("ce_iv"), 4),
-                "pe_iv": _round_or_none(row.get("pe_iv"), 4),
-                "ce_delta": _round_or_none(row.get("ce_delta"), 4),
-                "pe_delta": _round_or_none(row.get("pe_delta"), 4),
-                "ce_gamma": _round_or_none(row.get("ce_gamma"), 6),
-                "pe_gamma": _round_or_none(row.get("pe_gamma"), 6),
-                "ce_vega": _round_or_none(row.get("ce_vega"), 4),
-                "pe_vega": _round_or_none(row.get("pe_vega"), 4),
-                "ce_theta": _round_or_none(row.get("ce_theta"), 4),
-                "pe_theta": _round_or_none(row.get("pe_theta"), 4),
-            }
-        )
-
-    valid_iv = pd.to_numeric(chain_df.get("iv"), errors="coerce").dropna()
+    valid_iv = pd.to_numeric(chain_df["iv"], errors="coerce").dropna()
     atm_iv = valid_iv.mean() if not valid_iv.empty else None
 
     available_expiries = get_available_expiries_for_date(
@@ -1099,13 +1236,15 @@ def build_option_chain_snapshot(
         max_months=2,
     )
 
-    return {
+    timings["total_ms"] = round((time.perf_counter() - total_started) * 1000, 3)
+
+    payload = {
         "ok": True,
         "dataset": dataset,
         "underlying": dataset,
         "query_date": query_date,
         "date_str": date_str,
-        "query_time": pd.Timestamp(target_ts).strftime("%H:%M"),
+        "query_time": target_ts.strftime("%H:%M"),
         "resolved_week_number": resolved_week,
         "expiry": expiry_str,
         "expiry_label": _fmt_expiry_label(expiry_str),
@@ -1118,7 +1257,7 @@ def build_option_chain_snapshot(
         ),
         "day_open": round(float(day_open), 2),
         "atm": int(atm),
-        "strike_step": int(strike_step),
+        "strike_step": strike_step,
         "lot_size": int(LOT_SIZE_BY_INSTRUMENT.get(dataset, 65)),
         "interval": candle_interval_minutes,
         "max_allowed_query_date": MAX_ALLOWED_QUERY_DATE.strftime("%Y-%m-%d"),
@@ -1127,9 +1266,29 @@ def build_option_chain_snapshot(
         "option_window_cache_size": len(OPTION_WINDOW_CACHE),
         "iv_enabled": ENABLE_IV_CALC,
         "chain_source": chain_source,
-        "atm_iv": round(float(atm_iv), 4) if atm_iv is not None and np.isfinite(atm_iv) else None,
+        "cache_hit": False,
+        "atm_iv": (
+            round(float(atm_iv), 4)
+            if atm_iv is not None and np.isfinite(atm_iv)
+            else None
+        ),
+        "performance": timings,
         "rows": chain_rows,
     }
+
+    _put_chain_snapshot_cache(cache_key, payload)
+    logger.info(
+        "Option-chain snapshot dataset=%s date=%s time=%s expiry=%s "
+        "source=%s rows=%d timings=%s",
+        dataset,
+        date_str,
+        query_time,
+        expiry_str,
+        chain_source,
+        len(chain_rows),
+        timings,
+    )
+    return payload
 
 
 # =========================================================
@@ -1509,6 +1668,14 @@ def api_chain():
 
         strike_count = int(request.args.get("strike_count", 14))
         interval = int(request.args.get("interval", CANDLE_INTERVAL_MINUTES))
+        compute_greeks = _env_bool(
+            "DEFAULT_CHAIN_COMPUTE_GREEKS",
+            True,
+        )
+        if request.args.get("compute_greeks") is not None:
+            compute_greeks = str(request.args.get("compute_greeks")).strip().lower() in {
+                "1", "true", "yes", "on"
+            }
 
         selected_expiry = request.args.get("expiry")
 
@@ -1521,9 +1688,18 @@ def api_chain():
             strike_count_each_side=strike_count,
             candle_interval_minutes=interval,
             selected_expiry=selected_expiry,
+            compute_greeks=compute_greeks,
         )
 
-        return jsonify(result)
+        response = jsonify(result)
+        performance = result.get("performance") or {}
+        if performance:
+            response.headers["Server-Timing"] = ", ".join(
+                f"{name.replace('_ms', '')};dur={value}"
+                for name, value in performance.items()
+                if name.endswith("_ms")
+            )
+        return response
 
     except Exception as exc:
         return _json_error(str(exc), 400)
@@ -2346,6 +2522,11 @@ def api_cache_status():
             "window_candles_before": WINDOW_CANDLES_BEFORE,
             "window_candles_after": WINDOW_CANDLES_AFTER,
             "iv_enabled": ENABLE_IV_CALC,
+            "chain_snapshot_cache_size": len(CHAIN_SNAPSHOT_CACHE),
+            "chain_snapshot_cache_limit": MAX_CHAIN_SNAPSHOT_CACHE_SIZE,
+            "chain_snapshot_cache_ttl_seconds": CHAIN_SNAPSHOT_CACHE_TTL_SECONDS,
+            "data_engine": runtime_cache_stats(),
+            "iv_cache": iv_cache_stats(),
         }
     )
 
@@ -2359,7 +2540,13 @@ def api_cache_clear():
         OPTION_WINDOW_CACHE.clear()
     with SPOT_CANDLE_CACHE_LOCK:
         SPOT_CANDLE_CACHE.clear()
-    return jsonify({"ok": True, "message": "RAM caches cleared."})
+    _clear_chain_snapshot_cache()
+    clear_runtime_caches(clear_disk_option_cache=False)
+    clear_iv_cache()
+    return jsonify({
+        "ok": True,
+        "message": "Application, data-engine and IV RAM caches cleared.",
+    })
 
 
 @app.route("/api/health")
@@ -2390,7 +2577,7 @@ def _get_fut_folder(week_folder, date_str):
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     host = os.getenv("HOST", "0.0.0.0")
-    debug = os.getenv("DEBUG_MODE", "true").lower() in {"1", "true", "yes"}
+    debug = os.getenv("DEBUG_MODE", "false").lower() in {"1", "true", "yes", "on"}
 
     app.run(
         host=host,
