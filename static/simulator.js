@@ -919,7 +919,7 @@ async function renderIvSurface() {
       time: getQueryTime(),
       interval: String(getInterval()),
       strike_count: String(getStrikeCount()),
-      max_months: "2",
+      max_months: "4",
       _: String(Date.now())
     });
 
