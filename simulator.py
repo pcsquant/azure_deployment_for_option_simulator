@@ -586,52 +586,141 @@ def _get_spot_candles_for_day(
     dataset: str,
     candle_interval_minutes: int,
 ) -> pd.DataFrame:
+    """
+    Load and build spot/index candles for one trading day.
+
+    The function first checks the in-memory candle cache. If the data is not
+    cached, it loads the underlying index data through load_tick_data(),
+    creates candles, stores the result in cache, and returns a copy.
+
+    Parameters
+    ----------
+    folder : str
+        Root week folder or configured storage location.
+    date_str : str
+        Trading date in YYYYMMDD format.
+    dataset : str
+        Underlying instrument, for example NIFTY or SENSEX.
+    candle_interval_minutes : int
+        Candle interval in minutes.
+
+    Returns
+    -------
+    pd.DataFrame
+        Candle DataFrame. Returns an empty DataFrame when data is unavailable.
+    """
+
+    dataset = str(dataset).strip().upper()
+    date_str = str(date_str).strip()
+    folder = str(folder).strip()
+    candle_interval_minutes = int(candle_interval_minutes)
+
+    if not folder:
+        raise ValueError("folder cannot be empty")
+
+    if not dataset:
+        raise ValueError("dataset cannot be empty")
+
+    if not date_str:
+        raise ValueError("date_str cannot be empty")
+
+    if candle_interval_minutes <= 0:
+        raise ValueError(
+            "candle_interval_minutes must be greater than zero"
+        )
+
     cache_key = (
         "spot",
         dataset,
         date_str,
-        int(candle_interval_minutes),
+        candle_interval_minutes,
         folder,
     )
 
     cached = _get_cache(SPOT_CANDLE_CACHE, cache_key)
+
     if cached is not None:
         return cached.copy()
 
-    # Parquet-folder mode:
-    # Your data is stored as:
-    #   week_folder/
-    #       NSE_IDX_TICK_YYYYMMDD/
-    #       NSE_OPT_TICK_YYYYMMDD/
-    #       NSE_FUT_TICK_YYYYMMDD/
-    #
-    # So pass the week folder directly. data_engine_for_simulation.py
-    # will detect NSE_IDX_TICK_{date_str} internally.
-    tick_df = load_tick_data(
-        os.path.join(folder, f"NSE_IDX_TICK_{date_str}"),
-        instrument=dataset,
-    )
+    try:
+        # Pass the week/root folder directly.
+        #
+        # data_engine_for_simulation.py is responsible for resolving:
+        #
+        #   NSE_IDX_TICK_YYYYMMDD
+        #   BSE_IDX_TICK_YYYYMMDD
+        #
+        # This works for both local filesystem and Azure Blob Storage,
+        # provided load_tick_data() supports the configured storage mode.
+        tick_df = load_tick_data(
+            folder=folder,
+            date_str=date_str,
+            instrument=dataset,
+        )
 
-    if tick_df.empty:
+    except TypeError:
+        # Backward-compatible fallback for an older load_tick_data()
+        # signature that does not accept keyword arguments.
+        tick_df = load_tick_data(
+            folder,
+            date_str,
+            dataset,
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "Failed to load spot data: dataset=%s date=%s folder=%s",
+            dataset,
+            date_str,
+            folder,
+        )
         return pd.DataFrame()
 
-    candles = create_candles(
-        tick_df,
-        candle_interval_minutes,
-    )
-
-    if candles.empty:
+    if tick_df is None or tick_df.empty:
+        logger.warning(
+            "No spot tick data found: dataset=%s date=%s folder=%s",
+            dataset,
+            date_str,
+            folder,
+        )
         return pd.DataFrame()
+
+    try:
+        candles = create_candles(
+            tick_df,
+            candle_interval_minutes,
+        )
+
+    except Exception:
+        logger.exception(
+            "Failed to create spot candles: dataset=%s date=%s "
+            "interval=%s",
+            dataset,
+            date_str,
+            candle_interval_minutes,
+        )
+        return pd.DataFrame()
+
+    if candles is None or candles.empty:
+        logger.warning(
+            "Spot candle creation returned no rows: dataset=%s "
+            "date=%s interval=%s",
+            dataset,
+            date_str,
+            candle_interval_minutes,
+        )
+        return pd.DataFrame()
+
+    candles = candles.copy()
 
     _touch_cache(
         SPOT_CANDLE_CACHE,
         cache_key,
-        candles.copy(),
+        candles,
         MAX_SPOT_CANDLE_CACHE_SIZE,
     )
 
-    return candles
-
+    return candles.copy()
 
 def _nearest_candle_row(
     candles: pd.DataFrame,
