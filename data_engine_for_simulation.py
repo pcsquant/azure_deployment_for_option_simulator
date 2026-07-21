@@ -13,10 +13,17 @@ import time
 from collections import OrderedDict
 from pathlib import Path
 from threading import Lock, RLock
-from typing import Any, Optional
+from typing import Any, Optional, Iterable
 
 import numpy as np
 import pandas as pd
+
+try:
+    import pyarrow.dataset as pa_dataset
+    import pyarrow.parquet as pa_parquet
+except Exception:  # Optional at import time; pandas can still use another engine.
+    pa_dataset = None
+    pa_parquet = None
 
 from config_for_simulation import (
     IST,
@@ -52,6 +59,9 @@ DEBUG_MODE = os.getenv("DEBUG_MODE", "false").strip().lower() in {
 
 MAX_RAW_PARQUET_CACHE_SIZE = max(1, int(os.getenv("MAX_RAW_PARQUET_CACHE_SIZE", "128")))
 MAX_OPTION_CHAIN_CACHE_SIZE = max(1, int(os.getenv("MAX_OPTION_CHAIN_CACHE_SIZE", "16")))
+MAX_OPTION_CHAIN_INDEX_CACHE_SIZE = max(1, int(os.getenv("MAX_OPTION_CHAIN_INDEX_CACHE_SIZE", "16")))
+ENABLE_ARROW_PREDICATE_FILTER = os.getenv("ENABLE_ARROW_PREDICATE_FILTER", "true").strip().lower() in {"1", "true", "yes", "on"}
+
 
 
 class _ThreadSafeLRU:
@@ -112,6 +122,7 @@ PARQUET_FILE_PATH_CACHE: dict[tuple[str, str], Optional[str]] = {}
 RAW_PARQUET_CACHE = _ThreadSafeLRU(MAX_RAW_PARQUET_CACHE_SIZE)
 OPTION_PARQUET_CACHE = _ThreadSafeLRU(MAX_OPTION_CHAIN_CACHE_SIZE)
 OPTION_CONTRACT_CACHE = _ThreadSafeLRU(MAX_OPTION_CHAIN_CACHE_SIZE)
+OPTION_CHAIN_INDEX_CACHE = _ThreadSafeLRU(MAX_OPTION_CHAIN_INDEX_CACHE_SIZE)
 
 # Option-contract manifest cache. Building the manifest requires either a
 # recursive local filesystem walk or an Azure Blob listing, so it must never
@@ -405,23 +416,106 @@ def _resolve_option_week_folder(week_folder):
 # PARQUET READER
 # =========================================================
 
+def _available_local_parquet_columns(path: str) -> Optional[list[str]]:
+    """Return local Parquet schema names without reading row data."""
+    if pa_parquet is None:
+        return None
+    try:
+        return list(pa_parquet.ParquetFile(path).schema_arrow.names)
+    except Exception as exc:
+        logger.debug("Unable to inspect Parquet schema for %s: %s", path, exc)
+        return None
+
+
+def _select_projection(available: Optional[Iterable[str]], mode: str) -> Optional[list[str]]:
+    """Choose the smallest safe column projection for spot/option data."""
+    if not available:
+        return None
+    names = list(available)
+    lower = {str(name).lower(): name for name in names}
+    selected: list[str] = []
+
+    if "datetime" in lower:
+        selected.append(lower["datetime"])
+    elif "date" in lower and "time" in lower:
+        selected.extend([lower["date"], lower["time"]])
+    else:
+        return None
+
+    candidates = ("value", "ltp", "price", "close") if mode == "spot" else ("price", "ltp", "value", "close")
+    for candidate in candidates:
+        if candidate in lower:
+            selected.append(lower[candidate])
+            break
+    else:
+        return None
+
+    if mode != "spot":
+        for candidate in ("volume", "qty", "quantity"):
+            if candidate in lower:
+                selected.append(lower[candidate])
+                break
+
+    # Preserve order while removing duplicates.
+    return list(dict.fromkeys(selected))
+
+
+def _read_market_parquet(path: str, mode: str) -> pd.DataFrame:
+    """Read only columns needed by the normalizer, falling back to a full read."""
+    columns = None
+    if STORAGE_MODE == "local":
+        columns = _select_projection(_available_local_parquet_columns(path), mode)
+
+    try:
+        if STORAGE_MODE == "blob":
+            # The Blob helper should perform its own schema-safe projected read.
+            # Try the common named layouts first, then retry without projection.
+            projections = (
+                ["datetime", "value", "price", "ltp", "close", "volume", "qty", "quantity"],
+                ["date", "time", "value", "price", "ltp", "close", "volume", "qty", "quantity"],
+            )
+            for projection in projections:
+                try:
+                    return read_parquet_blob(path, columns=projection)
+                except Exception:
+                    continue
+            return read_parquet_blob(path)
+
+        return pd.read_parquet(path, columns=columns, engine="pyarrow") if columns else pd.read_parquet(path, engine="pyarrow")
+    except Exception:
+        if STORAGE_MODE == "blob":
+            return read_parquet_blob(path)
+        return pd.read_parquet(path, engine="pyarrow")
+
+
+def _local_file_version(path: str) -> tuple[int, int] | None:
+    """Return a stable local file version so changed files invalidate RAM cache."""
+    if STORAGE_MODE != "local":
+        return None
+    try:
+        stat = os.stat(path)
+        return stat.st_mtime_ns, stat.st_size
+    except OSError:
+        return None
+
+
 def _read_parquet_normalized(path, mode="spot"):
     path = str(path)
     mode = str(mode).lower()
-    cache_key = (path, mode)
+    if mode not in {"spot", "option"}:
+        raise ValueError("mode must be 'spot' or 'option'")
+
+    if STORAGE_MODE == "local":
+        path = os.path.abspath(path)
+    cache_key = (path, mode, _local_file_version(path))
 
     cached = RAW_PARQUET_CACHE.get(cache_key)
-
     if cached is not None:
-        # Shallow wrapper: avoids duplicating the full cached frame. Treat cached
-        # columns as read-only; make a deep copy only before destructive mutation.
         return cached.copy(deep=False)
 
-    if STORAGE_MODE == "blob":
-        df = read_parquet_blob(path)
-    else:
-        path = os.path.abspath(path)
-        df = pd.read_parquet(path)
+    df = _read_market_parquet(path, mode)
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["datetime", "value"] if mode == "spot" else ["datetime", "price", "volume"])
 
     lower_cols = {str(c).lower(): c for c in df.columns}
 
@@ -432,66 +526,45 @@ def _read_parquet_normalized(path, mode="spot"):
             df[lower_cols["date"]].astype(str) + " " + df[lower_cols["time"]].astype(str),
             errors="coerce",
         )
+    elif len(df.columns) >= 2:
+        dt = pd.to_datetime(df.iloc[:, 0].astype(str) + " " + df.iloc[:, 1].astype(str), errors="coerce")
     else:
-        dt = pd.to_datetime(
-            df.iloc[:, 0].astype(str) + " " + df.iloc[:, 1].astype(str),
-            errors="coerce",
-        )
+        return pd.DataFrame(columns=["datetime", "value"] if mode == "spot" else ["datetime", "price", "volume"])
 
     if mode == "spot":
-        value_col = (
-            lower_cols.get("value")
-            or lower_cols.get("ltp")
-            or lower_cols.get("price")
-            or lower_cols.get("close")
-            or df.columns[2]
-        )
-
+        value_col = next((lower_cols.get(c) for c in ("value", "ltp", "price", "close") if lower_cols.get(c) is not None), None)
+        if value_col is None:
+            if len(df.columns) < 3:
+                return pd.DataFrame(columns=["datetime", "value"])
+            value_col = df.columns[2]
         out = pd.DataFrame({
             "datetime": dt,
             "value": pd.to_numeric(df[value_col], errors="coerce"),
         }).dropna(subset=["datetime", "value"])
-
     else:
-        price_col = (
-            lower_cols.get("price")
-            or lower_cols.get("ltp")
-            or lower_cols.get("value")
-            or lower_cols.get("close")
-            or df.columns[2]
-        )
-
-        volume_col = (
-            lower_cols.get("volume")
-            or lower_cols.get("qty")
-            or lower_cols.get("quantity")
-        )
-
+        price_col = next((lower_cols.get(c) for c in ("price", "ltp", "value", "close") if lower_cols.get(c) is not None), None)
+        if price_col is None:
+            if len(df.columns) < 3:
+                return pd.DataFrame(columns=["datetime", "price", "volume"])
+            price_col = df.columns[2]
+        volume_col = next((lower_cols.get(c) for c in ("volume", "qty", "quantity") if lower_cols.get(c) is not None), None)
         out = pd.DataFrame({
             "datetime": dt,
             "price": pd.to_numeric(df[price_col], errors="coerce"),
-            "volume": pd.to_numeric(df[volume_col], errors="coerce") if volume_col else 0,
+            "volume": pd.to_numeric(df[volume_col], errors="coerce").fillna(0) if volume_col is not None else 0,
         }).dropna(subset=["datetime", "price"])
 
     if out.empty:
         return out
 
     if out["datetime"].dt.tz is None:
-        out["datetime"] = out["datetime"].dt.tz_localize(
-            IST,
-            ambiguous="NaT",
-            nonexistent="NaT",
-        )
+        out["datetime"] = out["datetime"].dt.tz_localize(IST, ambiguous="NaT", nonexistent="NaT")
     else:
         out["datetime"] = out["datetime"].dt.tz_convert(IST)
 
     out = out.dropna(subset=["datetime"])
-    out = out[
-        (out["datetime"].dt.time >= SESSION_START)
-        & (out["datetime"].dt.time <= SESSION_END)
-    ]
-
-    out = out.sort_values("datetime").reset_index(drop=True)
+    out = out[(out["datetime"].dt.time >= SESSION_START) & (out["datetime"].dt.time <= SESSION_END)]
+    out = out.sort_values("datetime", kind="mergesort").reset_index(drop=True)
 
     RAW_PARQUET_CACHE.put(cache_key, out)
     return out.copy(deep=False)
@@ -866,6 +939,103 @@ def load_consolidated_option_chain(
     return normalized.copy(deep=False)
 
 
+def _option_chain_index_key(folder, date_str, expiry_str, instrument) -> tuple[str, str, str, str]:
+    return (
+        str(instrument).upper(),
+        str(date_str),
+        str(expiry_str),
+        str(consolidated_chain_path(folder, date_str, expiry_str, instrument)),
+    )
+
+
+def get_indexed_option_chain(folder, date_str, expiry_str, instrument="NIFTY") -> Optional[pd.DataFrame]:
+    """Return a cached MultiIndex chain keyed by (timestamp, strike).
+
+    This avoids scanning the full DataFrame once per strike in app.py. The returned
+    object is a read-only cache master; callers must copy before mutation.
+    """
+    key = _option_chain_index_key(folder, date_str, expiry_str, instrument)
+    cached = OPTION_CHAIN_INDEX_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    chain = load_consolidated_option_chain(folder, date_str, expiry_str, instrument)
+    if chain is None or chain.empty:
+        return None
+
+    indexed = chain.loc[:, ["timestamp", "strike", "ce", "pe"]].copy()
+    indexed["timestamp"] = _normalize_timestamp_series(indexed["timestamp"])
+    indexed["strike"] = pd.to_numeric(indexed["strike"], errors="coerce")
+    indexed = indexed.dropna(subset=["timestamp", "strike"])
+    indexed["strike"] = indexed["strike"].astype("int32")
+    indexed = indexed.set_index(["timestamp", "strike"]).sort_index()
+    OPTION_CHAIN_INDEX_CACHE.put(key, indexed)
+    return indexed
+
+
+def get_option_chain_snapshot(
+    folder,
+    date_str,
+    expiry_str,
+    target_timestamp,
+    instrument="NIFTY",
+) -> Optional[pd.DataFrame]:
+    """Return the latest option-chain snapshot at or before target_timestamp.
+
+    Uses a sorted MultiIndex and binary search instead of repeatedly applying a
+    boolean filter over the whole trading day.
+    """
+    indexed = get_indexed_option_chain(folder, date_str, expiry_str, instrument)
+    if indexed is None or indexed.empty:
+        return None
+
+    target = pd.Timestamp(target_timestamp)
+    if target.tzinfo is None:
+        target = target.tz_localize(IST)
+    else:
+        target = target.tz_convert(IST)
+
+    timestamps = indexed.index.get_level_values("timestamp").unique()
+    position = int(timestamps.searchsorted(target, side="right")) - 1
+    if position < 0:
+        return None
+
+    selected_ts = timestamps[position]
+    snapshot = indexed.xs(selected_ts, level="timestamp").reset_index()
+    snapshot.insert(0, "timestamp", selected_ts)
+    return snapshot
+
+
+def read_option_chain_arrow_filtered(
+    local_path: str,
+    target_timestamp,
+    strikes: Optional[Iterable[int]] = None,
+) -> pd.DataFrame:
+    """Read a local wide-schema Parquet snapshot with Arrow predicate pushdown.
+
+    This is useful for cold reads of very large files. Once the day is in RAM,
+    get_option_chain_snapshot() is faster and should be preferred.
+    """
+    if not ENABLE_ARROW_PREDICATE_FILTER or pa_dataset is None:
+        raise RuntimeError("Arrow predicate filtering is disabled or pyarrow is unavailable")
+    local_path = os.path.abspath(local_path)
+    target = pd.Timestamp(target_timestamp)
+    if target.tzinfo is not None:
+        target = target.tz_convert(IST).tz_localize(None)
+
+    dataset = pa_dataset.dataset(local_path, format="parquet")
+    expression = pa_dataset.field("timestamp") <= target.to_pydatetime()
+    if strikes:
+        strike_values = [int(value) for value in strikes]
+        expression = expression & pa_dataset.field("strike").isin(strike_values)
+
+    table = dataset.to_table(
+        columns=["timestamp", "strike", "ce", "pe"],
+        filter=expression,
+    )
+    return table.to_pandas()
+
+
 def load_required_option_data_for_date(
     folder,
     date_str,
@@ -914,10 +1084,7 @@ def load_required_option_data_for_date(
         # -----------------------------------------------------
 
         try:
-            if STORAGE_MODE == "blob":
-                df = read_parquet_blob(matched_path)
-            else:
-                df = pd.read_parquet(matched_path)
+            df = _read_market_parquet(str(matched_path), "option")
 
         except Exception as exc:
             print(
@@ -1424,6 +1591,7 @@ def clear_runtime_caches(clear_disk_option_cache: bool = False) -> None:
     RAW_PARQUET_CACHE.clear()
     OPTION_PARQUET_CACHE.clear()
     OPTION_CONTRACT_CACHE.clear()
+    OPTION_CHAIN_INDEX_CACHE.clear()
     _OPTION_CHAIN_CACHE.clear()
     OPTION_WEEK_FOLDER_CACHE.clear()
     invalidate_option_contract_index()
@@ -1449,6 +1617,7 @@ def runtime_cache_stats() -> dict:
         "storage_mode": STORAGE_MODE,
         "raw_parquet": RAW_PARQUET_CACHE.stats(),
         "option_chain": _OPTION_CHAIN_CACHE.stats(),
+        "option_chain_index": OPTION_CHAIN_INDEX_CACHE.stats(),
         "path_cache_entries": len(PARQUET_FILE_PATH_CACHE),
         "option_manifest_entries": manifest_count,
         "week_date_cache_entries": week_date_entries,
