@@ -21,6 +21,14 @@ Frontend files expected:
     static/style.css
 """
 
+from __future__ import annotations
+
+import math
+import os
+import json
+import uuid
+import redis
+
 import logging
 
 logging.basicConfig(
@@ -30,13 +38,6 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-from __future__ import annotations
-
-import math
-import os
-import json
-import uuid
-import redis
 from kafka import KafkaProducer
 
 from collections import OrderedDict
