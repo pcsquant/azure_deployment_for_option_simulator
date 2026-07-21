@@ -23,37 +23,34 @@ Frontend files expected:
 
 from __future__ import annotations
 
+import json
+import logging
 import math
 import os
-import json
+import threading
+import time
 import uuid
-import redis
-
-import logging
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-
-logger = logging.getLogger(__name__)
-
-from kafka import KafkaProducer
-
 from collections import OrderedDict
-from datetime import datetime, timedelta, date
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, g, jsonify, render_template, request
+from werkzeug.middleware.proxy_fix import ProxyFix
 
-from chart import build_chart_payload
+try:
+    import redis
+except ImportError:  # pragma: no cover - dependency validation happens at startup
+    redis = None
 
-from flask import Flask
-
-app = Flask(__name__)
+try:
+    from kafka import KafkaProducer
+except ImportError:  # pragma: no cover
+    KafkaProducer = None
 
 from black_scholes_iv_for_simulation import append_black_scholes_iv
+from chart import build_chart_payload
 from config_for_simulation import CANDLE_INTERVAL_MINUTES, IST, get_dataset_config
 from data_engine_for_simulation import (
     create_candles,
@@ -66,15 +63,76 @@ from data_engine_for_simulation import (
     load_tick_data,
 )
 
-app = Flask(__name__)
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def create_app() -> Flask:
+    flask_app = Flask(__name__)
+    flask_app.config.update(
+        JSON_SORT_KEYS=False,
+        MAX_CONTENT_LENGTH=int(os.getenv("MAX_CONTENT_LENGTH", str(2 * 1024 * 1024))),
+        PROPAGATE_EXCEPTIONS=False,
+    )
+    if _env_bool("TRUST_PROXY_HEADERS", True):
+        flask_app.wsgi_app = ProxyFix(
+            flask_app.wsgi_app,
+            x_for=1,
+            x_proto=1,
+            x_host=1,
+            x_port=1,
+        )
+    return flask_app
+
+
+app = create_app()
+
+
+@app.before_request
+def _before_request():
+    g.request_started_at = time.monotonic()
+    g.request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex
 
 
 @app.after_request
-def add_no_cache_headers(response):
-    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-    response.headers["Pragma"] = "no-cache"
-    response.headers["Expires"] = "0"
+def add_response_headers(response):
+    response.headers["X-Request-ID"] = getattr(g, "request_id", uuid.uuid4().hex)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "SAMEORIGIN"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    if request.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    started = getattr(g, "request_started_at", None)
+    if started is not None:
+        response.headers["Server-Timing"] = f'app;dur={(time.monotonic() - started) * 1000:.2f}'
     return response
+
+
+@app.errorhandler(404)
+def _not_found(_error):
+    if request.path.startswith("/api/"):
+        return jsonify({"ok": False, "error": "Endpoint not found."}), 404
+    return render_template("simulator.html"), 404
+
+
+@app.errorhandler(500)
+def _internal_error(error):
+    logger.exception("Unhandled application error", exc_info=error)
+    return jsonify({"ok": False, "error": "Internal server error."}), 500
 
 
 
@@ -161,45 +219,81 @@ DEFAULT_QUERY_TIME = "09:30"
 MAX_ALLOWED_QUERY_DATE = date.max
 
 # Number of candles to keep before and after selected candle.
-WINDOW_CANDLES_BEFORE = 10
-WINDOW_CANDLES_AFTER = 10
+WINDOW_CANDLES_BEFORE = max(0, int(os.getenv("WINDOW_CANDLES_BEFORE", "10")))
+WINDOW_CANDLES_AFTER = max(0, int(os.getenv("WINDOW_CANDLES_AFTER", "10")))
 
 # Max option-window entries kept in RAM.
 # One entry is for one instrument/date/expiry/strike/CE-or-PE/interval/target-time.
-MAX_OPTION_WINDOW_CACHE_SIZE = int(os.getenv("OPTION_WINDOW_CACHE_SIZE", "500"))
+MAX_OPTION_WINDOW_CACHE_SIZE = max(1, int(os.getenv("OPTION_WINDOW_CACHE_SIZE", "500")))
 
 # Max spot candle-day entries kept in RAM.
-MAX_SPOT_CANDLE_CACHE_SIZE = int(os.getenv("SPOT_CANDLE_CACHE_SIZE", "50"))
+MAX_SPOT_CANDLE_CACHE_SIZE = max(1, int(os.getenv("SPOT_CANDLE_CACHE_SIZE", "50")))
 
 OPTION_WINDOW_CACHE: "OrderedDict[Tuple[Any, ...], pd.DataFrame]" = OrderedDict()
 SPOT_CANDLE_CACHE: "OrderedDict[Tuple[Any, ...], pd.DataFrame]" = OrderedDict()
+OPTION_WINDOW_CACHE_LOCK = threading.RLock()
+SPOT_CANDLE_CACHE_LOCK = threading.RLock()
 
 # Speed mode: IV/Greeks calculation is expensive.
 # Default OFF for faster simulation. Set ENABLE_IV_CALC=true to enable it.
-ENABLE_IV_CALC = True
+ENABLE_IV_CALC = _env_bool("ENABLE_IV_CALC", True)
 
 # Redis and kafka
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+REDIS_REQUIRED = _env_bool("REDIS_REQUIRED", False)
+KAFKA_REQUIRED = _env_bool("KAFKA_REQUIRED", False)
 
-redis_client = redis.Redis.from_url(
-    REDIS_URL,
-    decode_responses=True,
-)
+redis_client = None
+if redis is not None:
+    try:
+        redis_client = redis.Redis.from_url(
+            REDIS_URL,
+            decode_responses=True,
+            socket_connect_timeout=float(os.getenv("REDIS_CONNECT_TIMEOUT_SECONDS", "2")),
+            socket_timeout=float(os.getenv("REDIS_SOCKET_TIMEOUT_SECONDS", "3")),
+            health_check_interval=30,
+        )
+        redis_client.ping()
+    except Exception as exc:
+        redis_client = None
+        if REDIS_REQUIRED:
+            raise RuntimeError(f"Redis is required but unavailable: {exc}") from exc
+        logger.warning("Redis unavailable; async IV-surface routes are disabled: %s", exc)
+elif REDIS_REQUIRED:
+    raise RuntimeError("redis package is required but not installed.")
 
-kafka_producer = None
+_kafka_producer = None
+_kafka_lock = threading.Lock()
+
 
 def get_kafka_producer():
-    global kafka_producer
-
-    if kafka_producer is None:
-        kafka_producer = KafkaProducer(
-            bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-            value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-        )
-
-    return kafka_producer
+    global _kafka_producer
+    if KafkaProducer is None:
+        raise RuntimeError("kafka-python is not installed.")
+    if _kafka_producer is not None:
+        return _kafka_producer
+    with _kafka_lock:
+        if _kafka_producer is None:
+            try:
+                _kafka_producer = KafkaProducer(
+                    bootstrap_servers=[x.strip() for x in KAFKA_BOOTSTRAP_SERVERS.split(",") if x.strip()],
+                    value_serializer=lambda value: json.dumps(
+                        value, separators=(",", ":"), default=str
+                    ).encode("utf-8"),
+                    acks="all",
+                    retries=int(os.getenv("KAFKA_PRODUCER_RETRIES", "5")),
+                    request_timeout_ms=int(os.getenv("KAFKA_REQUEST_TIMEOUT_MS", "15000")),
+                    max_block_ms=int(os.getenv("KAFKA_MAX_BLOCK_MS", "15000")),
+                    linger_ms=int(os.getenv("KAFKA_LINGER_MS", "5")),
+                    compression_type=os.getenv("KAFKA_COMPRESSION_TYPE", "gzip"),
+                )
+            except Exception as exc:
+                if KAFKA_REQUIRED:
+                    raise
+                raise RuntimeError(f"Kafka producer unavailable: {exc}") from exc
+    return _kafka_producer
 
 
 # =========================================================
@@ -312,19 +406,24 @@ def _to_ist_timestamp(value: Any) -> pd.Timestamp:
     return ts.tz_convert(IST)
 
 
-def _touch_cache(cache: OrderedDict, key: Tuple[Any, ...], value: pd.DataFrame, max_size: int) -> None:
-    cache[key] = value
-    cache.move_to_end(key)
+def _cache_lock(cache: OrderedDict) -> threading.RLock:
+    return OPTION_WINDOW_CACHE_LOCK if cache is OPTION_WINDOW_CACHE else SPOT_CANDLE_CACHE_LOCK
 
-    while len(cache) > max_size:
-        cache.popitem(last=False)
+
+def _touch_cache(cache: OrderedDict, key: Tuple[Any, ...], value: pd.DataFrame, max_size: int) -> None:
+    with _cache_lock(cache):
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > max_size:
+            cache.popitem(last=False)
 
 
 def _get_cache(cache: OrderedDict, key: Tuple[Any, ...]) -> Optional[pd.DataFrame]:
-    value = cache.get(key)
-    if value is not None:
-        cache.move_to_end(key)
-    return value
+    with _cache_lock(cache):
+        value = cache.get(key)
+        if value is not None:
+            cache.move_to_end(key)
+        return value
 
 
 # =========================================================
@@ -754,6 +853,7 @@ def build_option_chain_snapshot(
     candle_interval_minutes: int = CANDLE_INTERVAL_MINUTES,
     spot_price_field: str = "close",
     selected_expiry: Optional[str] = None,
+    compute_greeks: bool = True,
 ) -> Dict[str, Any]:
     dataset = _normalize_dataset(dataset)
     query_time = _normalize_time(query_time)
@@ -838,7 +938,7 @@ def build_option_chain_snapshot(
                     india_vix_value = _safe_float(target_vix.iloc[-1]["value"])
 
     except Exception as exc:
-        print("INDIA VIX load error:", exc)
+        logger.warning("INDIA VIX load error: %s", exc)
         india_vix_value = None
 
     atm = int(
@@ -854,13 +954,6 @@ def build_option_chain_snapshot(
         instrument=dataset,
         expiry_rule=expiry_rule,
     )
-
-    print("DEBUG EXPIRY:", {
-        "date_str": date_str,
-        "target_date": pd.Timestamp(target_ts).date(),
-        "expiry_str": expiry_str,
-        "expiry_label": _fmt_expiry_label(expiry_str),
-    })
 
     if expiry_str is None:
         raise ValueError("No upcoming expiry found.")
@@ -878,6 +971,8 @@ def build_option_chain_snapshot(
         expiry_str=expiry_str,
         instrument=dataset,
     )
+
+    chain_source = "consolidated" if consolidated_chain is not None else "contracts"
 
     for strike in strikes:
         option_data = _load_option_data_fast(
@@ -943,7 +1038,7 @@ def build_option_chain_snapshot(
 
     if ENABLE_IV_CALC:
         try:
-            chain_df = append_black_scholes_iv(chain_df)
+            chain_df = append_black_scholes_iv(chain_df, compute_greeks=compute_greeks)
         except Exception as exc:
             chain_df["iv"] = np.nan
             chain_df["ce_iv"] = np.nan
@@ -1031,6 +1126,7 @@ def build_option_chain_snapshot(
         "window_candles_after": WINDOW_CANDLES_AFTER,
         "option_window_cache_size": len(OPTION_WINDOW_CACHE),
         "iv_enabled": ENABLE_IV_CALC,
+        "chain_source": chain_source,
         "atm_iv": round(float(atm_iv), 4) if atm_iv is not None and np.isfinite(atm_iv) else None,
         "rows": chain_rows,
     }
@@ -1432,237 +1528,42 @@ def api_chain():
     except Exception as exc:
         return _json_error(str(exc), 400)
 
-############################################ this is for surface #########################################################
-def _iv_surface_cache_key(
-    dataset,
-    query_date,
-    query_time,
-    interval,
-    strike_count,
-    max_months,
-):
-    return (
-        f"iv_surface:{dataset}:{query_date}:{query_time}:"
-        f"{interval}:{strike_count}:{max_months}"
-    )
+# =========================================================
+# ASYNC IV SURFACE ROUTES
+# =========================================================
 
-
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-
-def build_iv_surface_payload(
-    dataset,
-    query_date,
-    query_time,
-    interval,
-    strike_count,
-    max_months,
-):
-    all_expiries = get_available_expiries_for_date(
-        query_date=query_date,
-        dataset=dataset,
-        max_months=max_months,
-    )
-
-    expiries = all_expiries[:5]
-
-    def process_expiry(exp):
-        expiry_value = exp["value"]
-        expiry_label = exp["label"]
-
-        local_rows = []
-        local_strikes = set()
-
-        snap = build_option_chain_snapshot(
-            query_date=query_date,
-            query_time=query_time,
-            dataset=dataset,
-            expiry_rule="current expiry",
-            strike_count_each_side=strike_count,
-            candle_interval_minutes=interval,
-            selected_expiry=expiry_value,
-        )
-
-        atm = float(snap.get("atm") or 0)
-
-        for row in snap.get("rows", []):
-            strike = row.get("strike")
-            ce_iv = row.get("ce_iv")
-            pe_iv = row.get("pe_iv")
-
-            if strike is None:
-                continue
-
-            strike = int(strike)
-            local_strikes.add(strike)
-
-            ce = _safe_float(ce_iv)
-            pe = _safe_float(pe_iv)
-
-            if ce is not None and ce <= 1:
-                ce *= 100
-
-            if pe is not None and pe <= 1:
-                pe *= 100
-
-            if atm and strike < atm:
-                smile_iv = pe
-            elif atm and strike > atm:
-                smile_iv = ce
-            else:
-                vals = [v for v in [ce, pe] if v is not None]
-                smile_iv = sum(vals) / len(vals) if vals else None
-
-            if smile_iv is None:
-                continue
-
-            local_rows.append({
-                "expiry": expiry_value,
-                "expiry_label": expiry_label,
-                "strike": strike,
-                "iv": round(float(smile_iv), 4),
-                "atm": strike == int(atm) if atm else False,
-            })
-
-        return local_rows, local_strikes
-
-    surface_rows = []
-    strikes_set = set()
-
-    max_workers = min(
-        len(expiries),
-        max(2, os.cpu_count())
-    )
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(process_expiry, exp): exp
-            for exp in expiries
-        }
-
-        for future in as_completed(futures):
-            exp = futures[future]
-
-            try:
-                rows, strikes = future.result()
-                surface_rows.extend(rows)
-                strikes_set.update(strikes)
-
-            except Exception as exc:
-                surface_rows.append({
-                    "expiry": exp["value"],
-                    "expiry_label": exp["label"],
-                    "error": str(exc),
-                })
-
-    return {
-        "ok": True,
-        "status": "ready",
-        "dataset": dataset,
-        "query_date": query_date,
-        "query_time": query_time,
-        "interval": interval,
-        "expiries": expiries,
-        "strikes": sorted(strikes_set),
-        "rows": surface_rows,
-    }
-
-
-@app.route("/api/iv-surface")
-def api_iv_surface():
+if redis_client is not None:
     try:
-        dataset = _normalize_dataset(
-            request.args.get("dataset")
-            or request.args.get("underlying")
+        from iv_surface_async import register_iv_surface_routes
+
+        register_iv_surface_routes(
+            app=app,
+            redis_client=redis_client,
+            get_kafka_producer=get_kafka_producer,
+            build_option_chain_snapshot=build_option_chain_snapshot,
+            get_available_expiries_for_date=get_available_expiries_for_date,
+            normalize_dataset=_normalize_dataset,
+            normalize_date=_normalize_date,
+            normalize_time=_normalize_time,
+            resolve_default_week_date=_resolve_default_week_date,
+            safe_float=_safe_float,
+            json_error=_json_error,
+            default_interval=CANDLE_INTERVAL_MINUTES,
         )
-
-        query_date = request.args.get("date") or request.args.get("query_date")
-        query_date = _normalize_date(query_date) if query_date else None
-
-        query_time = _normalize_time(
-            request.args.get("time")
-            or request.args.get("query_time")
-        )
-
-        interval = int(request.args.get("interval", CANDLE_INTERVAL_MINUTES))
-        strike_count = int(request.args.get("strike_count", 10))
-        max_months = int(request.args.get("max_months", 2))
-
-        if not query_date:
-            _, _, _, query_date = _resolve_default_week_date(dataset)
-
-        cache_key = _iv_surface_cache_key(
-            dataset,
-            query_date,
-            query_time,
-            interval,
-            strike_count,
-            max_months,
-        )
-
-        cached = redis_client.get(cache_key)
-
-        if cached:
-            return jsonify(json.loads(cached))
-
-        job_id = str(uuid.uuid4())
-        job_key = f"job:iv_surface:{job_id}"
-
-        redis_client.set(
-            job_key,
-            json.dumps({
-                "ok": True,
-                "status": "processing",
-                "job_id": job_id,
-            }),
-            ex=600
-        ),
-
-        producer = get_kafka_producer()
-
-        producer.send(
-            "iv_surface_requests",
-            {
-                "job_id": job_id,
-                "cache_key": cache_key,
-                "dataset": dataset,
-                "query_date": query_date,
-                "query_time": query_time,
-                "interval": interval,
-                "strike_count": strike_count,
-                "max_months": max_months,
-            },
-        )
-
-        producer.flush()
-
-        return jsonify({
-            "ok": True,
-            "status": "processing",
-            "job_id": job_id,
-        })
-
     except Exception as exc:
-        return _json_error(str(exc), 400)
+        if REDIS_REQUIRED or KAFKA_REQUIRED:
+            raise
+        logger.exception("Unable to register async IV-surface routes: %s", exc)
+else:
+    @app.route("/api/iv-surface")
+    def api_iv_surface_unavailable():
+        return _json_error("IV-surface service is unavailable because Redis is not connected.", 503)
+
+    @app.route("/api/iv-surface/status/<job_id_value>")
+    def api_iv_surface_status_unavailable(job_id_value: str):
+        return _json_error("IV-surface service is unavailable because Redis is not connected.", 503)
 
 
-@app.route("/api/iv-surface/status/<job_id>")
-def api_iv_surface_status(job_id):
-    try:
-        job_key = f"job:iv_surface:{job_id}"
-        cached = redis_client.get(job_key)
-
-        if not cached:
-            return jsonify({
-                "ok": True,
-                "status": "processing",
-                "job_id": job_id,
-            })
-
-        return jsonify(json.loads(cached))
-
-    except Exception as exc:
-        return _json_error(str(exc), 400)
 @app.route("/api/index-chart")
 def api_index_chart():
     try:
@@ -2451,21 +2352,34 @@ def api_cache_status():
 
 @app.route("/api/cache/clear", methods=["POST"])
 def api_cache_clear():
-    OPTION_WINDOW_CACHE.clear()
-    SPOT_CANDLE_CACHE.clear()
+    configured_token = os.getenv("CACHE_ADMIN_TOKEN")
+    if configured_token and request.headers.get("X-Admin-Token") != configured_token:
+        return _json_error("Unauthorized.", 401)
+    with OPTION_WINDOW_CACHE_LOCK:
+        OPTION_WINDOW_CACHE.clear()
+    with SPOT_CANDLE_CACHE_LOCK:
+        SPOT_CANDLE_CACHE.clear()
     return jsonify({"ok": True, "message": "RAM caches cleared."})
 
 
 @app.route("/api/health")
 def api_health():
-    return jsonify(
-        {
-            "ok": True,
-            "service": "options-simulator",
-            "iv_enabled": ENABLE_IV_CALC,
-            "data_mode": "parquet-folder",
-        }
-    )
+    redis_ok = False
+    if redis_client is not None:
+        try:
+            redis_ok = bool(redis_client.ping())
+        except Exception:
+            redis_ok = False
+    payload = {
+        "ok": True,
+        "service": "options-simulator",
+        "iv_enabled": ENABLE_IV_CALC,
+        "redis_connected": redis_ok,
+        "kafka_configured": bool(KAFKA_BOOTSTRAP_SERVERS),
+        "option_window_cache_size": len(OPTION_WINDOW_CACHE),
+        "spot_candle_cache_size": len(SPOT_CANDLE_CACHE),
+    }
+    return jsonify(payload), 200
 
 def _get_fut_folder(week_folder, date_str):
     folder = os.path.join(week_folder, f"NSE_FUT_TICK_{date_str}")
