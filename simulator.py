@@ -587,42 +587,26 @@ def _get_spot_candles_for_day(
     candle_interval_minutes: int,
 ) -> pd.DataFrame:
     """
-    Load and build spot/index candles for one trading day.
+    Load spot/index candles for one trading day.
 
-    The function first checks the in-memory candle cache. If the data is not
-    cached, it loads the underlying index data through load_tick_data(),
-    creates candles, stores the result in cache, and returns a copy.
-
-    Parameters
-    ----------
-    folder : str
-        Root week folder or configured storage location.
-    date_str : str
-        Trading date in YYYYMMDD format.
-    dataset : str
-        Underlying instrument, for example NIFTY or SENSEX.
-    candle_interval_minutes : int
-        Candle interval in minutes.
-
-    Returns
-    -------
-    pd.DataFrame
-        Candle DataFrame. Returns an empty DataFrame when data is unavailable.
+    The daily IDX_TICK folder is constructed here because the current
+    load_tick_data() implementation accepts only the data path and,
+    optionally, the instrument name.
     """
 
-    dataset = str(dataset).strip().upper()
-    date_str = str(date_str).strip()
     folder = str(folder).strip()
+    date_str = str(date_str).strip()
+    dataset = str(dataset).strip().upper()
     candle_interval_minutes = int(candle_interval_minutes)
 
     if not folder:
         raise ValueError("folder cannot be empty")
 
-    if not dataset:
-        raise ValueError("dataset cannot be empty")
-
     if not date_str:
         raise ValueError("date_str cannot be empty")
+
+    if not dataset:
+        raise ValueError("dataset cannot be empty")
 
     if candle_interval_minutes <= 0:
         raise ValueError(
@@ -642,46 +626,40 @@ def _get_spot_candles_for_day(
     if cached is not None:
         return cached.copy()
 
+    # The current load_tick_data() signature accepts:
+    #
+    #     load_tick_data(path, instrument=None)
+    #
+    # Therefore, pass the daily index folder as the first argument and
+    # the dataset as the second argument.
+    index_folder = os.path.join(
+        folder,
+        f"NSE_IDX_TICK_{date_str}",
+    )
+
     try:
-        # Pass the week/root folder directly.
-        #
-        # data_engine_for_simulation.py is responsible for resolving:
-        #
-        #   NSE_IDX_TICK_YYYYMMDD
-        #   BSE_IDX_TICK_YYYYMMDD
-        #
-        # This works for both local filesystem and Azure Blob Storage,
-        # provided load_tick_data() supports the configured storage mode.
         tick_df = load_tick_data(
-            folder=folder,
-            date_str=date_str,
+            index_folder,
             instrument=dataset,
         )
 
-    except TypeError:
-        # Backward-compatible fallback for an older load_tick_data()
-        # signature that does not accept keyword arguments.
-        tick_df = load_tick_data(
-            folder,
-            date_str,
-            dataset,
-        )
-
-    except Exception as exc:
+    except Exception:
         logger.exception(
-            "Failed to load spot data: dataset=%s date=%s folder=%s",
+            "Failed to load spot tick data: "
+            "dataset=%s date=%s index_folder=%s",
             dataset,
             date_str,
-            folder,
+            index_folder,
         )
         return pd.DataFrame()
 
     if tick_df is None or tick_df.empty:
         logger.warning(
-            "No spot tick data found: dataset=%s date=%s folder=%s",
+            "No spot tick data found: "
+            "dataset=%s date=%s index_folder=%s",
             dataset,
             date_str,
-            folder,
+            index_folder,
         )
         return pd.DataFrame()
 
@@ -693,8 +671,8 @@ def _get_spot_candles_for_day(
 
     except Exception:
         logger.exception(
-            "Failed to create spot candles: dataset=%s date=%s "
-            "interval=%s",
+            "Failed to create spot candles: "
+            "dataset=%s date=%s interval=%s",
             dataset,
             date_str,
             candle_interval_minutes,
@@ -703,8 +681,8 @@ def _get_spot_candles_for_day(
 
     if candles is None or candles.empty:
         logger.warning(
-            "Spot candle creation returned no rows: dataset=%s "
-            "date=%s interval=%s",
+            "Spot candle creation returned no rows: "
+            "dataset=%s date=%s interval=%s",
             dataset,
             date_str,
             candle_interval_minutes,
