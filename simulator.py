@@ -9,6 +9,7 @@ This version adds:
 - only 10 candles before + current + 10 candles after are kept per option leg
 - works for 1m, 2m, 3m, 5m, 10m, 15m, etc.
 - keeps existing API contract unchanged
+- uses Redis + ThreadPoolExecutor for asynchronous IV-surface jobs
 
 It uses your existing modules:
     agent_for_data/config_for_simulation.py
@@ -46,10 +47,6 @@ try:
 except ImportError:  # pragma: no cover - dependency validation happens at startup
     redis = None
 
-try:
-    from kafka import KafkaProducer
-except ImportError:  # pragma: no cover
-    KafkaProducer = None
 
 try:
     import orjson
@@ -371,12 +368,10 @@ def _clear_metric_chart_cache() -> None:
 # Default OFF for faster simulation. Set ENABLE_IV_CALC=true to enable it.
 ENABLE_IV_CALC = _env_bool("ENABLE_IV_CALC", True)
 
-# Redis and kafka
+# Redis configuration
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 REDIS_REQUIRED = _env_bool("REDIS_REQUIRED", False)
-KAFKA_REQUIRED = _env_bool("KAFKA_REQUIRED", False)
 
 redis_client = None
 if redis is not None:
@@ -384,59 +379,30 @@ if redis is not None:
         redis_client = redis.Redis.from_url(
             REDIS_URL,
             decode_responses=True,
-            socket_connect_timeout=float(os.getenv("REDIS_CONNECT_TIMEOUT_SECONDS", "2")),
-            socket_timeout=float(os.getenv("REDIS_SOCKET_TIMEOUT_SECONDS", "3")),
+            socket_connect_timeout=float(
+                os.getenv("REDIS_CONNECT_TIMEOUT_SECONDS", "2")
+            ),
+            socket_timeout=float(
+                os.getenv("REDIS_SOCKET_TIMEOUT_SECONDS", "3")
+            ),
             health_check_interval=30,
+            retry_on_timeout=True,
         )
         redis_client.ping()
+        logger.info("Redis connection established.")
     except Exception as exc:
         redis_client = None
         if REDIS_REQUIRED:
-            raise RuntimeError(f"Redis is required but unavailable: {exc}") from exc
-        logger.warning("Redis unavailable; async IV-surface routes are disabled: %s", exc)
+            raise RuntimeError(
+                f"Redis is required but unavailable: {exc}"
+            ) from exc
+        logger.warning(
+            "Redis unavailable; async IV-surface routes will return 503: %s",
+            exc,
+        )
 elif REDIS_REQUIRED:
     raise RuntimeError("redis package is required but not installed.")
 
-_kafka_producer = None
-_kafka_lock = threading.Lock()
-
-
-def get_kafka_producer():
-    global _kafka_producer
-    if KafkaProducer is None:
-        raise RuntimeError("kafka-python is not installed.")
-    if _kafka_producer is not None:
-        return _kafka_producer
-    with _kafka_lock:
-        if _kafka_producer is None:
-            try:
-                _kafka_producer = KafkaProducer(
-                    bootstrap_servers=[x.strip() for x in KAFKA_BOOTSTRAP_SERVERS.split(",") if x.strip()],
-                    value_serializer=(
-                        (lambda value: orjson.dumps(
-                            value,
-                            option=orjson.OPT_NON_STR_KEYS | orjson.OPT_SERIALIZE_NUMPY,
-                            default=str,
-                        ))
-                        if orjson is not None
-                        else (lambda value: json.dumps(
-                            value,
-                            separators=(",", ":"),
-                            default=str,
-                        ).encode("utf-8"))
-                    ),
-                    acks="all",
-                    retries=int(os.getenv("KAFKA_PRODUCER_RETRIES", "5")),
-                    request_timeout_ms=int(os.getenv("KAFKA_REQUEST_TIMEOUT_MS", "15000")),
-                    max_block_ms=int(os.getenv("KAFKA_MAX_BLOCK_MS", "15000")),
-                    linger_ms=int(os.getenv("KAFKA_LINGER_MS", "5")),
-                    compression_type=os.getenv("KAFKA_COMPRESSION_TYPE", "gzip"),
-                )
-            except Exception as exc:
-                if KAFKA_REQUIRED:
-                    raise
-                raise RuntimeError(f"Kafka producer unavailable: {exc}") from exc
-    return _kafka_producer
 
 
 # =========================================================
@@ -1804,6 +1770,7 @@ def api_chain():
 
 # =========================================================
 # ASYNC IV SURFACE ROUTES
+# Redis + ThreadPoolExecutor
 # =========================================================
 
 if redis_client is not None:
@@ -1813,7 +1780,6 @@ if redis_client is not None:
         register_iv_surface_routes(
             app=app,
             redis_client=redis_client,
-            get_kafka_producer=get_kafka_producer,
             build_option_chain_snapshot=build_option_chain_snapshot,
             get_available_expiries_for_date=get_available_expiries_for_date,
             normalize_dataset=_normalize_dataset,
@@ -1824,18 +1790,32 @@ if redis_client is not None:
             json_error=_json_error,
             default_interval=CANDLE_INTERVAL_MINUTES,
         )
-    except Exception as exc:
-        if REDIS_REQUIRED or KAFKA_REQUIRED:
-            raise
-        logger.exception("Unable to register async IV-surface routes: %s", exc)
-else:
-    @app.route("/api/iv-surface")
-    def api_iv_surface_unavailable():
-        return _json_error("IV-surface service is unavailable because Redis is not connected.", 503)
 
-    @app.route("/api/iv-surface/status/<job_id_value>")
+        logger.info(
+            "IV-surface routes registered using Redis + ThreadPoolExecutor."
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "Unable to register async IV-surface routes: %s",
+            exc,
+        )
+        raise
+
+else:
+    @app.get("/api/iv-surface")
+    def api_iv_surface_unavailable():
+        return _json_error(
+            "IV-surface service is unavailable because Redis is not connected.",
+            503,
+        )
+
+    @app.get("/api/iv-surface/status/<job_id_value>")
     def api_iv_surface_status_unavailable(job_id_value: str):
-        return _json_error("IV-surface service is unavailable because Redis is not connected.", 503)
+        return _json_error(
+            "IV-surface service is unavailable because Redis is not connected.",
+            503,
+        )
 
 
 @app.route("/api/index-chart")
@@ -2696,7 +2676,7 @@ def api_health():
         "service": "options-simulator",
         "iv_enabled": ENABLE_IV_CALC,
         "redis_connected": redis_ok,
-        "kafka_configured": bool(KAFKA_BOOTSTRAP_SERVERS),
+        "iv_surface_backend": "redis_threadpool" if redis_ok else "unavailable",
         "option_window_cache_size": len(OPTION_WINDOW_CACHE),
         "spot_candle_cache_size": len(SPOT_CANDLE_CACHE),
         "chain_snapshot_cache_size": len(CHAIN_SNAPSHOT_CACHE),
