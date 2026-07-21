@@ -7,10 +7,10 @@ Features
     - GET /api/iv-surface
     - GET /api/iv-surface/status/<job_id>
 * Redis result cache and distributed in-flight job deduplication.
-* Kafka-backed background processing.
+* ThreadPoolExecutor-backed background processing.
 * Per-expiry parallelism with bounded workers.
 * Input validation, deterministic cache keys, structured job states, timing
-  metadata, safe cleanup, and resilient Redis/Kafka handling.
+  metadata, safe cleanup, and resilient Redis/background-worker handling.
 
 The module is dependency-injected from the Flask application, so it does not
 import the simulator application itself.
@@ -22,7 +22,6 @@ import hashlib
 import json
 import logging
 import os
-import signal
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -53,9 +52,7 @@ def _env_int(name: str, default: int, minimum: int = 1, maximum: int | None = No
     return value
 
 
-IV_SURFACE_TOPIC = os.getenv("IV_SURFACE_TOPIC", "iv_surface_requests").strip()
-IV_SURFACE_DLQ_TOPIC = os.getenv("IV_SURFACE_DLQ_TOPIC", "iv_surface_requests_dlq").strip()
-IV_SURFACE_CACHE_VERSION = os.getenv("IV_SURFACE_CACHE_VERSION", "v2").strip()
+IV_SURFACE_CACHE_VERSION = os.getenv("IV_SURFACE_CACHE_VERSION", "v3-threadpool").strip()
 IV_SURFACE_CACHE_TTL_SECONDS = _env_int("IV_SURFACE_CACHE_TTL_SECONDS", 3600, 30)
 IV_SURFACE_JOB_TTL_SECONDS = _env_int("IV_SURFACE_JOB_TTL_SECONDS", 900, 60)
 IV_SURFACE_LOCK_TTL_SECONDS = _env_int("IV_SURFACE_LOCK_TTL_SECONDS", 900, 60)
@@ -63,13 +60,12 @@ IV_SURFACE_MAX_EXPIRIES = _env_int("IV_SURFACE_MAX_EXPIRIES", 5, 1, 24)
 IV_SURFACE_MAX_WORKERS = _env_int("IV_SURFACE_MAX_WORKERS", 4, 1, 32)
 IV_SURFACE_MAX_STRIKES_EACH_SIDE = _env_int("IV_SURFACE_MAX_STRIKES_EACH_SIDE", 100, 1, 500)
 IV_SURFACE_MAX_MONTHS_ALLOWED = _env_int("IV_SURFACE_MAX_MONTHS_ALLOWED", 12, 1, 60)
-KAFKA_SEND_TIMEOUT_SECONDS = _env_int("KAFKA_SEND_TIMEOUT_SECONDS", 15, 1, 120)
-KAFKA_MAX_POLL_RECORDS = _env_int("KAFKA_MAX_POLL_RECORDS", 10, 1, 500)
-KAFKA_SESSION_TIMEOUT_MS = _env_int("KAFKA_SESSION_TIMEOUT_MS", 30000, 6000, 300000)
-KAFKA_MAX_POLL_INTERVAL_MS = _env_int("KAFKA_MAX_POLL_INTERVAL_MS", 900000, 30000, 3600000)
+IV_SURFACE_BACKGROUND_WORKERS = _env_int("IV_SURFACE_BACKGROUND_WORKERS", 2, 1, 16)
 
-if not IV_SURFACE_TOPIC:
-    raise RuntimeError("IV_SURFACE_TOPIC cannot be empty")
+_BACKGROUND_EXECUTOR = ThreadPoolExecutor(
+    max_workers=IV_SURFACE_BACKGROUND_WORKERS,
+    thread_name_prefix="iv-surface-job",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -417,6 +413,35 @@ def build_iv_surface_payload(
     }
 
 
+def _run_iv_surface_job(
+    *,
+    job_payload: Dict[str, Any],
+    redis_client: Any,
+    build_option_chain_snapshot: Callable[..., Dict[str, Any]],
+    get_available_expiries_for_date: Callable[..., Iterable[Dict[str, Any]]],
+    safe_float: Callable[[Any], Optional[float]],
+) -> None:
+    """Execute one IV-surface job in a shared background thread."""
+    try:
+        process_iv_surface_message(
+            message=job_payload,
+            redis_client=redis_client,
+            build_option_chain_snapshot=build_option_chain_snapshot,
+            get_available_expiries_for_date=get_available_expiries_for_date,
+            safe_float=safe_float,
+        )
+    except Exception as exc:
+        logger.exception(
+            "Background IV-surface job failed job_id=%s",
+            job_payload.get("job_id"),
+        )
+        mark_iv_surface_job_failed(
+            redis_client=redis_client,
+            message=job_payload,
+            error=exc,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Flask integration
 # ---------------------------------------------------------------------------
@@ -426,7 +451,6 @@ def register_iv_surface_routes(
     *,
     app: Any,
     redis_client: Any,
-    get_kafka_producer: Callable[[], Any],
     build_option_chain_snapshot: Callable[..., Dict[str, Any]],
     get_available_expiries_for_date: Callable[..., Iterable[Dict[str, Any]]],
     normalize_dataset: Callable[[Optional[str]], str],
@@ -437,7 +461,7 @@ def register_iv_surface_routes(
     json_error: Callable[..., Any],
     default_interval: int,
 ) -> None:
-    """Register IV-surface routes on a Flask application."""
+    """Register Redis-backed, ThreadPoolExecutor IV-surface routes."""
 
     def parse_request() -> IVSurfaceRequest:
         dataset = normalize_dataset(request.args.get("dataset") or request.args.get("underlying"))
@@ -502,15 +526,38 @@ def register_iv_surface_routes(
             redis_set_json(redis_client, current_job_key, job_payload, IV_SURFACE_JOB_TTL_SECONDS)
 
             try:
-                producer = get_kafka_producer()
-                send_future = producer.send(IV_SURFACE_TOPIC, value=job_payload)
-                if hasattr(send_future, "get"):
-                    send_future.get(timeout=KAFKA_SEND_TIMEOUT_SECONDS)
+                future = _BACKGROUND_EXECUTOR.submit(
+                    _run_iv_surface_job,
+                    job_payload=job_payload,
+                    redis_client=redis_client,
+                    build_option_chain_snapshot=build_option_chain_snapshot,
+                    get_available_expiries_for_date=get_available_expiries_for_date,
+                    safe_float=safe_float,
+                )
+                future.add_done_callback(
+                    lambda done: logger.error(
+                        "IV-surface executor task failed: %s",
+                        done.exception(),
+                    )
+                    if done.exception() is not None
+                    else None
+                )
             except Exception as exc:
-                failed = {**job_payload, "ok": False, "status": "failed", "error": "Unable to enqueue job"}
-                redis_set_json(redis_client, current_job_key, failed, IV_SURFACE_JOB_TTL_SECONDS)
+                failed = {
+                    **job_payload,
+                    "ok": False,
+                    "status": "failed",
+                    "error": "Unable to submit background job",
+                    "failed_at": utc_now_iso(),
+                }
+                redis_set_json(
+                    redis_client,
+                    current_job_key,
+                    failed,
+                    IV_SURFACE_JOB_TTL_SECONDS,
+                )
                 redis_delete(redis_client, lookup_key)
-                logger.exception("Unable to publish IV surface job id=%s", job_id)
+                logger.exception("Unable to submit IV surface job id=%s", job_id)
                 raise RuntimeError("Unable to queue IV surface calculation") from exc
 
             return jsonify(job_payload), 202
@@ -546,7 +593,7 @@ def register_iv_surface_routes(
 
 
 # ---------------------------------------------------------------------------
-# Worker helpers
+# Background executor lifecycle
 # ---------------------------------------------------------------------------
 
 
@@ -562,7 +609,6 @@ def validate_job_message(message: Mapping[str, Any]) -> Dict[str, Any]:
     missing = [key for key in _REQUIRED_JOB_FIELDS if not message.get(key)]
     if missing:
         raise ValueError(f"Invalid IV surface job. Missing keys: {missing}")
-
     out = dict(message)
     out["job_id"] = _validate_job_id(str(out["job_id"]))
     out["interval"] = _coerce_int("interval", out["interval"], 1, 60)
@@ -585,7 +631,6 @@ def process_iv_surface_message(
 ) -> Dict[str, Any]:
     message = validate_job_message(message)
     started = time.monotonic()
-
     processing_state = {
         **message,
         "ok": True,
@@ -593,13 +638,10 @@ def process_iv_surface_message(
         "started_at": utc_now_iso(),
     }
     redis_set_json(redis_client, message["job_key"], processing_state, IV_SURFACE_JOB_TTL_SECONDS)
-
-    # Another worker may have completed it while this message was waiting.
     existing = redis_get_json(redis_client, message["cache_key"])
     if existing is not None:
         redis_delete(redis_client, message["lookup_key"])
         return existing
-
     result = build_iv_surface_payload(
         dataset=str(message["dataset"]),
         query_date=str(message["query_date"]),
@@ -613,7 +655,6 @@ def process_iv_surface_message(
     )
     result["job_id"] = message["job_id"]
     result["cache_hit"] = False
-
     redis_set_json(redis_client, message["cache_key"], result, IV_SURFACE_CACHE_TTL_SECONDS)
     done_state = {
         "ok": True,
@@ -646,107 +687,12 @@ def mark_iv_surface_job_failed(
         redis_delete(redis_client, str(message.get("lookup_key") or ""))
 
 
-def run_iv_surface_worker(
-    *,
-    redis_client: Any,
-    build_option_chain_snapshot: Callable[..., Dict[str, Any]],
-    get_available_expiries_for_date: Callable[..., Iterable[Dict[str, Any]]],
-    safe_float: Callable[[Any], Optional[float]],
-) -> None:
-    """Run a blocking Kafka worker with graceful shutdown and manual commits."""
-    try:
-        from kafka import KafkaConsumer, KafkaProducer
-    except Exception as exc:
-        raise RuntimeError("Install kafka-python; KafkaConsumer/KafkaProducer are unavailable") from exc
+def shutdown_iv_surface_executor(wait: bool = True) -> None:
+    _BACKGROUND_EXECUTOR.shutdown(wait=bool(wait), cancel_futures=not bool(wait))
 
-    bootstrap_servers = [
-        item.strip() for item in os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092").split(",") if item.strip()
-    ]
-    group_id = os.getenv("KAFKA_IV_SURFACE_GROUP_ID", "iv-surface-workers").strip()
-    client_id = os.getenv("KAFKA_IV_SURFACE_CLIENT_ID", f"iv-surface-{os.getpid()}").strip()
 
-    consumer = KafkaConsumer(
-        IV_SURFACE_TOPIC,
-        bootstrap_servers=bootstrap_servers,
-        group_id=group_id,
-        client_id=client_id,
-        auto_offset_reset="earliest",
-        enable_auto_commit=False,
-        value_deserializer=lambda value: json.loads(value.decode("utf-8")),
-        max_poll_records=KAFKA_MAX_POLL_RECORDS,
-        session_timeout_ms=KAFKA_SESSION_TIMEOUT_MS,
-        max_poll_interval_ms=KAFKA_MAX_POLL_INTERVAL_MS,
+def run_iv_surface_worker(**_: Any) -> None:
+    raise RuntimeError(
+        "Kafka IV-surface workers are disabled. "
+        "IV-surface jobs now run inside the Flask process using ThreadPoolExecutor."
     )
-    dlq_producer = KafkaProducer(
-        bootstrap_servers=bootstrap_servers,
-        client_id=f"{client_id}-dlq",
-        value_serializer=lambda value: _json_dumps(value).encode("utf-8"),
-        acks="all",
-        retries=5,
-    )
-
-    stopping = False
-
-    def request_stop(signum: int, _frame: Any) -> None:
-        nonlocal stopping
-        logger.info("Worker shutdown requested signal=%s", signum)
-        stopping = True
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            signal.signal(sig, request_stop)
-        except ValueError:
-            pass
-
-    logger.info(
-        "IV surface worker started topic=%s group=%s client=%s brokers=%s",
-        IV_SURFACE_TOPIC, group_id, client_id, bootstrap_servers,
-    )
-
-    try:
-        while not stopping:
-            records = consumer.poll(timeout_ms=1000, max_records=KAFKA_MAX_POLL_RECORDS)
-            if not records:
-                continue
-
-            for _, batch in records.items():
-                for record in batch:
-                    message = record.value
-                    try:
-                        process_iv_surface_message(
-                            message=message,
-                            redis_client=redis_client,
-                            build_option_chain_snapshot=build_option_chain_snapshot,
-                            get_available_expiries_for_date=get_available_expiries_for_date,
-                            safe_float=safe_float,
-                        )
-                        consumer.commit()
-                    except Exception as exc:
-                        logger.exception(
-                            "IV surface job failed partition=%s offset=%s", record.partition, record.offset
-                        )
-                        mark_iv_surface_job_failed(redis_client=redis_client, message=message, error=exc)
-                        dlq_payload = {
-                            "failed_at": utc_now_iso(),
-                            "error": str(exc),
-                            "source_topic": record.topic,
-                            "source_partition": record.partition,
-                            "source_offset": record.offset,
-                            "message": message,
-                        }
-                        try:
-                            dlq_producer.send(IV_SURFACE_DLQ_TOPIC, value=dlq_payload).get(
-                                timeout=KAFKA_SEND_TIMEOUT_SECONDS
-                            )
-                            consumer.commit()
-                        except Exception:
-                            # Do not commit when the DLQ write fails; Kafka will redeliver.
-                            logger.exception("Unable to publish failed job to DLQ")
-                            time.sleep(2)
-    finally:
-        try:
-            consumer.close(autocommit=False)
-        finally:
-            dlq_producer.flush(timeout=KAFKA_SEND_TIMEOUT_SECONDS)
-            dlq_producer.close(timeout=KAFKA_SEND_TIMEOUT_SECONDS)
-        logger.info("IV surface worker stopped")
