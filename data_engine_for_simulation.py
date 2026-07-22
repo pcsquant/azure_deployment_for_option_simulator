@@ -73,19 +73,7 @@ from config_for_simulation import (
     log_configuration,
     validate_configuration,
 )
-from data_engine_for_simulation import (
-    create_candles,
-    get_dates_for_week_folder,
-    get_nearest_strike,
-    get_option_chain_snapshot,
-    get_upcoming_expiry_np,
-    get_week_folders,
-    load_consolidated_option_chain,
-    load_future_data_for_date,
-    load_index_data_by_symbol,
-    load_required_option_data_for_date,
-    runtime_cache_stats,
-)
+
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
