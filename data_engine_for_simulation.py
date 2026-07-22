@@ -60,10 +60,6 @@ DEBUG_MODE = os.getenv("DEBUG_MODE", "false").strip().lower() in {
 MAX_RAW_PARQUET_CACHE_SIZE = max(1, int(os.getenv("MAX_RAW_PARQUET_CACHE_SIZE", "128")))
 MAX_OPTION_CHAIN_CACHE_SIZE = max(1, int(os.getenv("MAX_OPTION_CHAIN_CACHE_SIZE", "16")))
 MAX_OPTION_CHAIN_INDEX_CACHE_SIZE = max(1, int(os.getenv("MAX_OPTION_CHAIN_INDEX_CACHE_SIZE", "16")))
-MAX_OPTION_CONTRACT_CACHE_SIZE = max(
-    1,
-    int(os.getenv("MAX_OPTION_CONTRACT_CACHE_SIZE", "100")),
-)
 ENABLE_ARROW_PREDICATE_FILTER = os.getenv("ENABLE_ARROW_PREDICATE_FILTER", "true").strip().lower() in {"1", "true", "yes", "on"}
 
 
@@ -125,7 +121,7 @@ class _ThreadSafeLRU:
 PARQUET_FILE_PATH_CACHE: dict[tuple[str, str], Optional[str]] = {}
 RAW_PARQUET_CACHE = _ThreadSafeLRU(MAX_RAW_PARQUET_CACHE_SIZE)
 OPTION_PARQUET_CACHE = _ThreadSafeLRU(MAX_OPTION_CHAIN_CACHE_SIZE)
-OPTION_CONTRACT_CACHE = _ThreadSafeLRU(MAX_OPTION_CONTRACT_CACHE_SIZE)
+OPTION_CONTRACT_CACHE = _ThreadSafeLRU(MAX_OPTION_CHAIN_CACHE_SIZE)
 OPTION_CHAIN_INDEX_CACHE = _ThreadSafeLRU(MAX_OPTION_CHAIN_INDEX_CACHE_SIZE)
 
 # Option-contract manifest cache. Building the manifest requires either a
@@ -1084,35 +1080,19 @@ def load_required_option_data_for_date(
             continue
 
         # -----------------------------------------------------
-        # 2. Read the Parquet file through the bounded contract cache
+        # 2. Read the Parquet file
         # -----------------------------------------------------
-        matched_path = str(matched_path)
-        contract_cache_key = (
-            STORAGE_MODE,
-            matched_path,
-            _local_file_version(matched_path),
-        )
 
         try:
-            df = OPTION_CONTRACT_CACHE.get(contract_cache_key)
-
-            if df is None:
-                df = _read_market_parquet(matched_path, "option")
-
-                if df is not None and not df.empty:
-                    # Store the raw DataFrame as a read-only cache master.
-                    OPTION_CONTRACT_CACHE.put(contract_cache_key, df)
-            else:
-                # Return a shallow copy so downstream code cannot replace columns
-                # on the cached master object. Column arrays remain shared.
-                df = df.copy(deep=False)
+            df = _read_market_parquet(str(matched_path), "option")
 
         except Exception as exc:
-            logger.exception(
-                "Unable to read option file %s: %s",
-                matched_path,
-                exc,
+            print(
+                f"Unable to read option file: {matched_path}. "
+                f"Error: {exc}",
+                flush=True,
             )
+
             result[side] = empty[side]
             continue
 
@@ -1636,7 +1616,6 @@ def runtime_cache_stats() -> dict:
     return {
         "storage_mode": STORAGE_MODE,
         "raw_parquet": RAW_PARQUET_CACHE.stats(),
-        "option_contract": OPTION_CONTRACT_CACHE.stats(),
         "option_chain": _OPTION_CHAIN_CACHE.stats(),
         "option_chain_index": OPTION_CHAIN_INDEX_CACHE.stats(),
         "path_cache_entries": len(PARQUET_FILE_PATH_CACHE),
