@@ -66,7 +66,6 @@ except ImportError:  # Backward compatibility with an older IV module.
 from chart import build_chart_payload
 from config_for_simulation import CANDLE_INTERVAL_MINUTES, IST, get_dataset_config
 from data_engine_for_simulation import (
-    clear_runtime_caches,
     create_candles,
     get_dates_for_week_folder,
     get_nearest_strike,
@@ -2655,7 +2654,6 @@ def api_cache_clear():
         SPOT_CANDLE_CACHE.clear()
     _clear_chain_snapshot_cache()
     _clear_metric_chart_cache()
-    clear_runtime_caches(clear_disk_option_cache=False)
     clear_iv_cache()
     return jsonify({
         "ok": True,
