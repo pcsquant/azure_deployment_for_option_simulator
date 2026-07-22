@@ -1692,3 +1692,113 @@ def load_future_data_for_date(
         return pd.DataFrame(
             columns=["datetime", "price", "volume"]
         )
+# =========================================================
+# OPTION CHAIN SNAPSHOT / CACHE STATUS HELPERS
+# =========================================================
+
+def get_option_chain_snapshot(
+    folder,
+    date_str,
+    expiry_str,
+    target_timestamp,
+    instrument="NIFTY",
+):
+    """Return the latest CE/PE values for every strike at or before a timestamp.
+
+    This is a compatibility helper used by ``simulator.py``. It loads the
+    consolidated option-chain DataFrame and selects the most recent record for
+    each strike at or before ``target_timestamp``.
+    """
+    chain = load_consolidated_option_chain(
+        folder=folder,
+        date_str=date_str,
+        expiry_str=expiry_str,
+        instrument=instrument,
+    )
+
+    empty = pd.DataFrame(columns=["timestamp", "strike", "ce", "pe"])
+
+    if chain is None or chain.empty:
+        return empty
+
+    required = {"timestamp", "strike", "ce", "pe"}
+    if not required.issubset(chain.columns):
+        logger.warning(
+            "Consolidated option chain is missing required columns. "
+            "Required=%s Available=%s",
+            sorted(required),
+            list(chain.columns),
+        )
+        return empty
+
+    frame = chain.loc[:, ["timestamp", "strike", "ce", "pe"]].copy()
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"], errors="coerce")
+    frame["strike"] = pd.to_numeric(frame["strike"], errors="coerce")
+    frame["ce"] = pd.to_numeric(frame["ce"], errors="coerce")
+    frame["pe"] = pd.to_numeric(frame["pe"], errors="coerce")
+    frame = frame.dropna(subset=["timestamp", "strike"])
+
+    if frame.empty:
+        return empty
+
+    if getattr(frame["timestamp"].dt, "tz", None) is None:
+        frame["timestamp"] = frame["timestamp"].dt.tz_localize(
+            IST,
+            ambiguous="NaT",
+            nonexistent="NaT",
+        )
+    else:
+        frame["timestamp"] = frame["timestamp"].dt.tz_convert(IST)
+
+    frame = frame.dropna(subset=["timestamp"])
+    if frame.empty:
+        return empty
+
+    target = pd.Timestamp(target_timestamp)
+    if target.tzinfo is None:
+        target = target.tz_localize(IST)
+    else:
+        target = target.tz_convert(IST)
+
+    frame = frame.loc[frame["timestamp"] <= target]
+    if frame.empty:
+        return empty
+
+    frame["strike"] = frame["strike"].astype(int)
+
+    # The latest row per strike is enough for one option-chain snapshot.
+    frame = (
+        frame.sort_values(["strike", "timestamp"])
+        .drop_duplicates(subset=["strike"], keep="last")
+        .sort_values("strike")
+        .reset_index(drop=True)
+    )
+
+    return frame.loc[:, ["timestamp", "strike", "ce", "pe"]]
+
+
+def runtime_cache_stats():
+    """Return lightweight diagnostics for the data-engine caches."""
+    with _OPTION_CHAIN_CACHE_LOCK:
+        option_chain_cache_size = len(_OPTION_CHAIN_CACHE)
+
+    with _OPTION_CONTRACT_INDEX_CACHE_LOCK:
+        option_contract_index_cache_size = len(_OPTION_CONTRACT_INDEX_CACHE)
+
+    with _WEEK_DATES_CACHE_LOCK:
+        week_dates_cache_size = len(_WEEK_DATES_CACHE)
+
+    return {
+        "storage_mode": STORAGE_MODE,
+        "parquet_file_path_cache_size": len(PARQUET_FILE_PATH_CACHE),
+        "raw_parquet_cache_size": len(RAW_PARQUET_CACHE),
+        "raw_parquet_cache_limit": MAX_RAW_PARQUET_CACHE_SIZE,
+        "option_parquet_cache_size": len(OPTION_PARQUET_CACHE),
+        "option_contract_cache_size": len(OPTION_CONTRACT_CACHE),
+        "option_contract_index_cache_size": option_contract_index_cache_size,
+        "option_contract_index_ttl_seconds": OPTION_CONTRACT_INDEX_TTL_SECONDS,
+        "option_week_folder_cache_size": len(OPTION_WEEK_FOLDER_CACHE),
+        "option_chain_cache_size": option_chain_cache_size,
+        "week_dates_cache_size": week_dates_cache_size,
+        "shared_option_cache_dir": SHARED_OPTION_CACHE_DIR,
+    }
