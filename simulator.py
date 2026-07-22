@@ -64,7 +64,15 @@ except ImportError:  # Backward compatibility with an older IV module.
     def iv_cache_stats() -> dict:
         return {"enabled": False}
 from chart import build_chart_payload
-from config_for_simulation import CANDLE_INTERVAL_MINUTES, IST, get_dataset_config
+from config_for_simulation import (
+    CANDLE_INTERVAL_MINUTES,
+    DATA_LAYOUT,
+    IST,
+    STORAGE_MODE,
+    get_dataset_config,
+    log_configuration,
+    validate_configuration,
+)
 from data_engine_for_simulation import (
     create_candles,
     get_dates_for_week_folder,
@@ -73,8 +81,9 @@ from data_engine_for_simulation import (
     get_upcoming_expiry_np,
     get_week_folders,
     load_consolidated_option_chain,
+    load_future_data_for_date,
+    load_index_data_by_symbol,
     load_required_option_data_for_date,
-    load_tick_data,
     runtime_cache_stats,
 )
 
@@ -132,6 +141,16 @@ def create_app() -> Flask:
 
 
 app = create_app()
+
+# Validate static configuration at process startup. Historical paths are checked
+# lazily because Blob mode does not require local data directories.
+validate_configuration(require_data_paths=False)
+log_configuration()
+logger.info(
+    "Options Simulator startup: storage_mode=%s data_layout=%s",
+    STORAGE_MODE,
+    DATA_LAYOUT,
+)
 
 
 @app.before_request
@@ -844,17 +863,16 @@ def _get_spot_candles_for_day(
         return cached.copy()
 
     try:
-        # Important:
-        # Pass the week folder directly.
+        # Date-aware loader supports the production layout:
         #
-        # For Azure Blob Storage, load_tick_data() internally resolves:
+        #   <week_folder>/IDX_TICK/<YYYYMMDD>/<SYMBOL>.parquet
         #
-        #   <week_folder>/IDX_TICK/NIFTY.parquet
-        #
-        # Do not append NSE_IDX_TICK_YYYYMMDD here.
-        tick_df = load_tick_data(
-            folder,
-            instrument=dataset,
+        # It also preserves compatibility with older flat layouts through the
+        # path-resolution logic inside data_engine_for_simulation.py.
+        tick_df = load_index_data_by_symbol(
+            folder=folder,
+            date_str=date_str,
+            symbol_name=dataset,
         )
 
     except Exception:
@@ -1121,8 +1139,6 @@ def build_option_chain_snapshot(
     stage = time.perf_counter()
     india_vix_value = None
     try:
-        from data_engine_for_simulation import load_index_data_by_symbol
-
         vix_df = load_index_data_by_symbol(
             folder=folder,
             date_str=date_str,
@@ -2315,8 +2331,6 @@ def api_india_vix_chart():
                 dataset=dataset,
             )
 
-        from data_engine_for_simulation import load_index_data_by_symbol
-
         vix_df = load_index_data_by_symbol(
             folder=folder,
             date_str=date_str,
@@ -2413,9 +2427,6 @@ def api_future_chart():
 
         if interval <= 0:
             raise ValueError("interval must be greater than zero.")
-
-        from data_engine_for_simulation import load_future_data_for_date
-        from chart import build_chart_payload
 
         start_day = datetime.strptime(start_date, "%Y-%m-%d").date()
         end_day = datetime.strptime(end_date, "%Y-%m-%d").date()
@@ -2657,7 +2668,7 @@ def api_cache_clear():
     clear_iv_cache()
     return jsonify({
         "ok": True,
-        "message": "Application, data-engine and IV RAM caches cleared.",
+        "message": "Application and IV RAM caches cleared.",
     })
 
 
@@ -2672,6 +2683,8 @@ def api_health():
     payload = {
         "ok": True,
         "service": "options-simulator",
+        "storage_mode": STORAGE_MODE,
+        "data_layout": DATA_LAYOUT,
         "iv_enabled": ENABLE_IV_CALC,
         "redis_connected": redis_ok,
         "iv_surface_backend": "redis_threadpool" if redis_ok else "unavailable",
@@ -2682,13 +2695,11 @@ def api_health():
     }
     return jsonify(payload), 200
 
-def _get_fut_folder(week_folder, date_str):
-    folder = os.path.join(week_folder, f"NSE_FUT_TICK_{date_str}")
-    return folder if os.path.isdir(folder) else week_folder
-
 
 
 if __name__ == "__main__":
+    # Development runner only. In production use Gunicorn, for example:
+    # gunicorn --workers 2 --threads 4 --timeout 120 --bind 0.0.0.0:8000 simulator:app
     port = int(os.getenv("PORT", "8000"))
     host = os.getenv("HOST", "0.0.0.0")
     debug = os.getenv("DEBUG_MODE", "false").lower() in {"1", "true", "yes", "on"}
