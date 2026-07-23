@@ -935,204 +935,101 @@ def load_required_option_data_for_date(
     strike,
     instrument="NIFTY",
 ):
-    empty = {
-        "CE": pd.DataFrame(
-            columns=["datetime", "price", "volume"]
-        ),
-        "PE": pd.DataFrame(
-            columns=["datetime", "price", "volume"]
-        ),
+    """
+    Load CE and PE data for one strike from the underlying-level
+    consolidated option Parquet file.
+    """
+
+    empty_frame = pd.DataFrame(
+        columns=["datetime", "price", "volume"]
+    )
+
+    empty_result = {
+        "CE": empty_frame.copy(),
+        "PE": empty_frame.copy(),
     }
-
-    cfg = get_dataset_config(instrument)
-    symbol = str(cfg["symbol"]).upper()
-    opt_folder = _get_opt_folder(folder, date_str)
-
-    result = {}
-    contract_index = _get_option_contract_index(opt_folder)
 
     try:
         normalized_strike = int(float(strike))
     except (TypeError, ValueError, OverflowError):
-        logger.warning("Invalid option strike requested: %r", strike)
-        return empty
-
-    normalized_expiry = str(expiry_str).strip()
-
-    for side in ["CE", "PE"]:
-        # -----------------------------------------------------
-        # 1. Resolve the option contract from the cached manifest
-        # -----------------------------------------------------
-        matched_path = contract_index.get(
-            (symbol, normalized_expiry, normalized_strike, side)
+        logger.warning(
+            "Invalid option strike requested: %r",
+            strike,
         )
+        return empty_result
 
-        if not matched_path:
-            result[side] = empty[side]
-            continue
+    chain = load_consolidated_option_chain(
+        folder=folder,
+        date_str=date_str,
+        expiry_str=expiry_str,
+        instrument=instrument,
+    )
 
-        # -----------------------------------------------------
-        # 2. Read the Parquet file
-        # -----------------------------------------------------
+    if chain is None or chain.empty:
+        return empty_result
 
-        try:
-            if STORAGE_MODE == "blob":
-                df = read_parquet_blob(matched_path)
-            else:
-                df = pd.read_parquet(matched_path)
+    required_columns = {
+        "timestamp",
+        "strike",
+        "ce",
+        "pe",
+    }
 
-        except Exception as exc:
-            print(
-                f"Unable to read option file: {matched_path}. "
-                f"Error: {exc}",
-                flush=True,
-            )
-
-            result[side] = empty[side]
-            continue
-
-        if df is None or df.empty:
-            result[side] = empty[side]
-            continue
-
-        # -----------------------------------------------------
-        # 3. Detect columns
-        # -----------------------------------------------------
-
-        lower_cols = {
-            str(column).lower(): column
-            for column in df.columns
-        }
-
-        # Create timestamp
-        if "datetime" in lower_cols:
-            dt = pd.to_datetime(
-                df[lower_cols["datetime"]],
-                errors="coerce",
-            )
-
-        elif {
-            "date",
-            "time",
-        }.issubset(lower_cols):
-            dt = pd.to_datetime(
-                df[lower_cols["date"]].astype(str)
-                + " "
-                + df[lower_cols["time"]].astype(str),
-                errors="coerce",
-            )
-
-        elif len(df.columns) >= 2:
-            dt = pd.to_datetime(
-                df.iloc[:, 0].astype(str)
-                + " "
-                + df.iloc[:, 1].astype(str),
-                errors="coerce",
-            )
-
-        else:
-            result[side] = empty[side]
-            continue
-
-        price_col = (
-            lower_cols.get("price")
-            or lower_cols.get("ltp")
-            or lower_cols.get("value")
-            or lower_cols.get("close")
+    if not required_columns.issubset(chain.columns):
+        logger.warning(
+            "Consolidated chain missing columns. "
+            "Required=%s Available=%s",
+            sorted(required_columns),
+            list(chain.columns),
         )
+        return empty_result
 
-        if price_col is None:
-            if len(df.columns) >= 3:
-                price_col = df.columns[2]
-            else:
-                result[side] = empty[side]
-                continue
+    selected = chain[
+        pd.to_numeric(
+            chain["strike"],
+            errors="coerce",
+        ) == normalized_strike
+    ].copy()
 
-        volume_col = (
-            lower_cols.get("volume")
-            or lower_cols.get("qty")
-            or lower_cols.get("quantity")
-        )
+    if selected.empty:
+        return empty_result
 
-        # -----------------------------------------------------
-        # 4. Normalize option data
-        # -----------------------------------------------------
+    result = {}
 
-        out = pd.DataFrame(
+    for side, price_column in (
+        ("CE", "ce"),
+        ("PE", "pe"),
+    ):
+        side_frame = pd.DataFrame(
             {
-                "datetime": dt,
-                "price": pd.to_numeric(
-                    df[price_col],
+                "datetime": pd.to_datetime(
+                    selected["timestamp"],
                     errors="coerce",
                 ),
-                "volume": (
-                    pd.to_numeric(
-                        df[volume_col],
-                        errors="coerce",
-                    ).fillna(0)
-                    if volume_col is not None
-                    else 0
+                "price": pd.to_numeric(
+                    selected[price_column],
+                    errors="coerce",
                 ),
+                "volume": 0,
             }
         )
 
-        out = out.dropna(
-            subset=[
-                "datetime",
-                "price",
-            ]
-        )
-
-        if out.empty:
-            result[side] = empty[side]
-            continue
-
-        # -----------------------------------------------------
-        # 5. Convert timestamps to IST
-        # -----------------------------------------------------
-
-        if out["datetime"].dt.tz is None:
-            out["datetime"] = (
-                out["datetime"].dt.tz_localize(
-                    IST,
-                    ambiguous="NaT",
-                    nonexistent="NaT",
-                )
-            )
-        else:
-            out["datetime"] = (
-                out["datetime"].dt.tz_convert(IST)
-            )
-
-        out = out.dropna(subset=["datetime"])
-
-        # -----------------------------------------------------
-        # 6. Filter trading-session records
-        # -----------------------------------------------------
-
-        out = out[
-            (
-                out["datetime"].dt.time
-                >= SESSION_START
-            )
-            & (
-                out["datetime"].dt.time
-                <= SESSION_END
-            )
-        ]
-
-        if out.empty:
-            result[side] = empty[side]
-            continue
-
-        result[side] = (
-            out.sort_values("datetime")
+        side_frame = (
+            side_frame
+            .dropna(subset=["datetime", "price"])
+            .sort_values("datetime")
             .reset_index(drop=True)
         )
 
+        result[side] = (
+            side_frame
+            if not side_frame.empty
+            else empty_frame.copy()
+        )
+
     return {
-        "CE": result.get("CE", empty["CE"]),
-        "PE": result.get("PE", empty["PE"]),
+        "CE": result.get("CE", empty_frame.copy()),
+        "PE": result.get("PE", empty_frame.copy()),
     }
 
 
