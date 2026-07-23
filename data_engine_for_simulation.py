@@ -113,18 +113,35 @@ def _join_storage_path(*parts):
 
 def _get_idx_folder(week_folder, date_str=None):
     if STORAGE_MODE == "blob":
-        return _join_storage_path(week_folder, "IDX_TICK")
-
-    folder = os.path.join(week_folder, "IDX_TICK")
-    return folder if os.path.isdir(folder) else week_folder
+        return _join_storage_path(week_folder, date_str, "IDX_TICK") if date_str else _join_storage_path(week_folder, "IDX_TICK")
+    if date_str:
+        candidate = os.path.join(week_folder, str(date_str), "IDX_TICK")
+        if os.path.isdir(candidate):
+            return candidate
+    candidate = os.path.join(week_folder, "IDX_TICK")
+    return candidate if os.path.isdir(candidate) else week_folder
 
 
 def _get_opt_folder(week_folder, date_str=None):
     if STORAGE_MODE == "blob":
-        return _join_storage_path(week_folder, "OPT_TICK")
+        return _join_storage_path(week_folder, date_str, "OPT_TICK") if date_str else _join_storage_path(week_folder, "OPT_TICK")
+    if date_str:
+        candidate = os.path.join(week_folder, str(date_str), "OPT_TICK")
+        if os.path.isdir(candidate):
+            return candidate
+    candidate = os.path.join(week_folder, "OPT_TICK")
+    return candidate if os.path.isdir(candidate) else week_folder
 
-    folder = os.path.join(week_folder, "OPT_TICK")
-    return folder if os.path.isdir(folder) else week_folder
+
+def _get_fut_folder(week_folder, date_str=None):
+    if STORAGE_MODE == "blob":
+        return _join_storage_path(week_folder, date_str, "FUT_TICK") if date_str else _join_storage_path(week_folder, "FUT_TICK")
+    if date_str:
+        candidate = os.path.join(week_folder, str(date_str), "FUT_TICK")
+        if os.path.isdir(candidate):
+            return candidate
+    candidate = os.path.join(week_folder, "FUT_TICK")
+    return candidate if os.path.isdir(candidate) else week_folder
 
 
 def _normalize_storage_folder(folder):
@@ -554,7 +571,7 @@ def consolidated_chain_path(
     cfg = get_dataset_config(instrument)
     symbol = str(cfg["symbol"]).upper()
     option_week_folder = _resolve_option_week_folder(week_folder)
-    filename = f"{symbol}_{expiry_str}.parquet"
+    filename = f"{symbol}.parquet"
 
     if STORAGE_MODE == "blob":
         return _join_storage_path(
@@ -1692,3 +1709,88 @@ def load_future_data_for_date(
         return pd.DataFrame(
             columns=["datetime", "price", "volume"]
         )
+
+
+def get_option_chain_snapshot(
+    folder,
+    date_str,
+    expiry_str,
+    target_timestamp,
+    instrument="NIFTY",
+):
+    """Return the latest CE/PE value for each strike at or before target_timestamp."""
+    empty = pd.DataFrame(columns=["timestamp", "strike", "ce", "pe"])
+    chain = load_consolidated_option_chain(
+        folder=folder, date_str=date_str, expiry_str=expiry_str, instrument=instrument
+    )
+    if chain is None or chain.empty:
+        return empty
+    required = {"timestamp", "strike", "ce", "pe"}
+    if not required.issubset(chain.columns):
+        logger.warning("Option chain missing columns: %s", sorted(required - set(chain.columns)))
+        return empty
+    frame = chain[["timestamp", "strike", "ce", "pe"]].copy()
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"], errors="coerce")
+    frame["strike"] = pd.to_numeric(frame["strike"], errors="coerce")
+    frame["ce"] = pd.to_numeric(frame["ce"], errors="coerce")
+    frame["pe"] = pd.to_numeric(frame["pe"], errors="coerce")
+    frame = frame.dropna(subset=["timestamp", "strike"])
+    if frame.empty:
+        return empty
+    if frame["timestamp"].dt.tz is None:
+        frame["timestamp"] = frame["timestamp"].dt.tz_localize(IST, ambiguous="NaT", nonexistent="NaT")
+    else:
+        frame["timestamp"] = frame["timestamp"].dt.tz_convert(IST)
+    target = pd.Timestamp(target_timestamp)
+    target = target.tz_localize(IST) if target.tzinfo is None else target.tz_convert(IST)
+    frame = frame[(frame["timestamp"] <= target)].dropna(subset=["timestamp"])
+    if frame.empty:
+        return empty
+    frame["strike"] = frame["strike"].astype(int)
+    return (
+        frame.sort_values(["strike", "timestamp"])
+        .drop_duplicates(["strike"], keep="last")
+        .sort_values("strike")
+        .reset_index(drop=True)[["timestamp", "strike", "ce", "pe"]]
+    )
+
+
+def clear_runtime_caches(clear_disk_option_cache=False):
+    """Clear all process-local caches and optionally disk option-chain caches."""
+    PARQUET_FILE_PATH_CACHE.clear()
+    RAW_PARQUET_CACHE.clear()
+    OPTION_PARQUET_CACHE.clear()
+    OPTION_CONTRACT_CACHE.clear()
+    OPTION_WEEK_FOLDER_CACHE.clear()
+    with _OPTION_CONTRACT_INDEX_CACHE_LOCK:
+        _OPTION_CONTRACT_INDEX_CACHE.clear()
+    with _WEEK_DATES_CACHE_LOCK:
+        _WEEK_DATES_CACHE.clear()
+    with _OPTION_CHAIN_CACHE_LOCK:
+        _OPTION_CHAIN_CACHE.clear()
+    if clear_disk_option_cache and os.path.isdir(SHARED_OPTION_CACHE_DIR):
+        for entry in os.scandir(SHARED_OPTION_CACHE_DIR):
+            if entry.is_file() and entry.name.lower().endswith(".parquet"):
+                try:
+                    os.remove(entry.path)
+                except OSError as exc:
+                    logger.warning("Unable to remove cache file %s: %s", entry.path, exc)
+
+
+def runtime_cache_stats():
+    """Return lightweight cache diagnostics."""
+    with _OPTION_CONTRACT_INDEX_CACHE_LOCK:
+        manifest_entries = len(_OPTION_CONTRACT_INDEX_CACHE)
+    with _WEEK_DATES_CACHE_LOCK:
+        week_date_entries = len(_WEEK_DATES_CACHE)
+    return {
+        "storage_mode": STORAGE_MODE,
+        "raw_parquet_cache_entries": len(RAW_PARQUET_CACHE),
+        "option_chain_cache_entries": len(_OPTION_CHAIN_CACHE),
+        "option_parquet_cache_entries": len(OPTION_PARQUET_CACHE),
+        "option_contract_cache_entries": len(OPTION_CONTRACT_CACHE),
+        "path_cache_entries": len(PARQUET_FILE_PATH_CACHE),
+        "option_manifest_entries": manifest_entries,
+        "week_date_cache_entries": week_date_entries,
+        "shared_option_cache_dir": SHARED_OPTION_CACHE_DIR,
+    }
