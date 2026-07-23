@@ -94,6 +94,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(logging.WARNING)
+logging.getLogger("azure.storage.blob").setLevel(logging.WARNING)
+
 
 def _env_bool(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
@@ -554,6 +557,39 @@ def _get_cache(cache: OrderedDict, key: Tuple[Any, ...]) -> Optional[pd.DataFram
 
 
 # =========================================================
+# DATA RESOLUTION CACHE
+# =========================================================
+
+MAX_DATA_RESOLUTION_CACHE_SIZE = max(1, int(os.getenv("DATA_RESOLUTION_CACHE_SIZE", "256")))
+DATA_RESOLUTION_CACHE_TTL_SECONDS = max(0.0, float(os.getenv("DATA_RESOLUTION_CACHE_TTL_SECONDS", "3600")))
+DATA_RESOLUTION_CACHE: "OrderedDict[Tuple[Any, ...], Tuple[float, Tuple[Any, ...]]]" = OrderedDict()
+DATA_RESOLUTION_CACHE_LOCK = threading.RLock()
+
+def _get_data_resolution_cache(key: Tuple[Any, ...]) -> Optional[Tuple[Any, ...]]:
+    now = time.monotonic()
+    with DATA_RESOLUTION_CACHE_LOCK:
+        item = DATA_RESOLUTION_CACHE.get(key)
+        if item is None:
+            return None
+        created_at, value = item
+        if DATA_RESOLUTION_CACHE_TTL_SECONDS > 0 and now - created_at >= DATA_RESOLUTION_CACHE_TTL_SECONDS:
+            DATA_RESOLUTION_CACHE.pop(key, None)
+            return None
+        DATA_RESOLUTION_CACHE.move_to_end(key)
+        return tuple(value)
+
+def _put_data_resolution_cache(key: Tuple[Any, ...], value: Tuple[Any, ...]) -> None:
+    with DATA_RESOLUTION_CACHE_LOCK:
+        DATA_RESOLUTION_CACHE[key] = (time.monotonic(), tuple(value))
+        DATA_RESOLUTION_CACHE.move_to_end(key)
+        while len(DATA_RESOLUTION_CACHE) > MAX_DATA_RESOLUTION_CACHE_SIZE:
+            DATA_RESOLUTION_CACHE.popitem(last=False)
+
+def _clear_data_resolution_cache() -> None:
+    with DATA_RESOLUTION_CACHE_LOCK:
+        DATA_RESOLUTION_CACHE.clear()
+
+# =========================================================
 # DATA RESOLUTION
 # =========================================================
 
@@ -562,79 +598,64 @@ def _resolve_week_folder_for_date(
     dataset: str,
     week_number: Optional[int] = None,
 ) -> Tuple[int, str, str]:
+    """Resolve dataset/date metadata once and reuse it for later time clicks."""
     query_date = _normalize_date(query_date)
-    target_date = datetime.strptime(query_date, "%Y-%m-%d").date()
+    dataset = _normalize_dataset(dataset)
+    normalized_week = int(week_number) if week_number is not None else None
+    cache_key = ("date", dataset, query_date, normalized_week)
+    cached = _get_data_resolution_cache(cache_key)
+    if cached is not None:
+        return int(cached[0]), str(cached[1]), str(cached[2])
 
+    target_date = datetime.strptime(query_date, "%Y-%m-%d").date()
     if target_date > MAX_ALLOWED_QUERY_DATE:
         raise ValueError(
             f"Selected date {query_date} is after allowed cutoff "
             f"{MAX_ALLOWED_QUERY_DATE.strftime('%Y-%m-%d')}."
         )
-
+    target_key = target_date.strftime("%Y%m%d")
     for num, folder in get_week_folders(instrument=dataset):
-        if week_number is not None and int(num) != int(week_number):
+        if normalized_week is not None and int(num) != normalized_week:
             continue
-
-        available_dates = get_dates_for_week_folder(
-            num,
-            folder,
-            instrument=dataset,
-        )
-
-        for date_str in available_dates:
-            current_date = datetime.strptime(date_str, "%Y%m%d").date()
-
-            if current_date > MAX_ALLOWED_QUERY_DATE:
-                continue
-
-            if current_date == target_date:
-                return int(num), folder, date_str
-
-    if week_number is not None:
-        raise ValueError(f"{dataset} date {query_date} not found in week {week_number}.")
-
+        available_dates = get_dates_for_week_folder(num, folder, instrument=dataset)
+        if target_key in {str(x) for x in available_dates}:
+            result = (int(num), str(folder), target_key)
+            _put_data_resolution_cache(cache_key, result)
+            return result
+    if normalized_week is not None:
+        raise ValueError(f"{dataset} date {query_date} not found in week {normalized_week}.")
     raise ValueError(f"{dataset} date {query_date} not found in historical data folders.")
 
-
 def _resolve_default_week_date(dataset: str) -> Tuple[int, str, str, str]:
+    """Resolve and cache the latest available trading date."""
+    dataset = _normalize_dataset(dataset)
+    cache_key = ("default", dataset)
+    cached = _get_data_resolution_cache(cache_key)
+    if cached is not None:
+        return int(cached[0]), str(cached[1]), str(cached[2]), str(cached[3])
+
     latest_item = None
-
     for num, folder in get_week_folders(instrument=dataset):
-        dates = get_dates_for_week_folder(
-            num,
-            folder,
-            instrument=dataset,
-        )
-
-        for date_str in dates:
+        for date_str in get_dates_for_week_folder(num, folder, instrument=dataset):
             try:
-                dt = datetime.strptime(date_str, "%Y%m%d").date()
+                dt = datetime.strptime(str(date_str), "%Y%m%d").date()
             except Exception:
                 continue
-
-            # Do not choose any default date after the allowed cutoff.
             if dt > MAX_ALLOWED_QUERY_DATE:
                 continue
-
-            item = (dt, int(num), folder, date_str)
-
+            item = (dt, int(num), str(folder), str(date_str))
             if latest_item is None or item[0] > latest_item[0]:
                 latest_item = item
-
     if latest_item is None:
         raise ValueError(
             f"No available historical dates found for {dataset} on or before "
             f"{MAX_ALLOWED_QUERY_DATE.strftime('%Y-%m-%d')}."
         )
-
     dt, week_number, folder, date_str = latest_item
+    result = (week_number, folder, date_str, dt.strftime("%Y-%m-%d"))
+    _put_data_resolution_cache(cache_key, result)
+    return result
 
-    return (
-        week_number,
-        folder,
-        date_str,
-        dt.strftime("%Y-%m-%d"),
-    )
 def get_available_expiries_for_date(query_date, dataset="NIFTY", max_months=4):
     cfg = get_dataset_config(dataset)
     expiries = pd.to_datetime(cfg["combined_expiry"])
@@ -2648,6 +2669,9 @@ def api_cache_status():
             "metric_chart_cache_size": len(METRIC_CHART_CACHE),
             "metric_chart_cache_limit": MAX_METRIC_CHART_CACHE_SIZE,
             "metric_chart_cache_ttl_seconds": METRIC_CHART_CACHE_TTL_SECONDS,
+            "data_resolution_cache_size": len(DATA_RESOLUTION_CACHE),
+            "data_resolution_cache_limit": MAX_DATA_RESOLUTION_CACHE_SIZE,
+            "data_resolution_cache_ttl_seconds": DATA_RESOLUTION_CACHE_TTL_SECONDS,
             "data_engine": runtime_cache_stats(),
             "iv_cache": iv_cache_stats(),
         }
@@ -2665,6 +2689,7 @@ def api_cache_clear():
         SPOT_CANDLE_CACHE.clear()
     _clear_chain_snapshot_cache()
     _clear_metric_chart_cache()
+    _clear_data_resolution_cache()
     clear_iv_cache()
     return jsonify({
         "ok": True,
@@ -2692,6 +2717,7 @@ def api_health():
         "spot_candle_cache_size": len(SPOT_CANDLE_CACHE),
         "chain_snapshot_cache_size": len(CHAIN_SNAPSHOT_CACHE),
         "metric_chart_cache_size": len(METRIC_CHART_CACHE),
+        "data_resolution_cache_size": len(DATA_RESOLUTION_CACHE),
     }
     return jsonify(payload), 200
 
