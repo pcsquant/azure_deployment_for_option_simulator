@@ -42,13 +42,12 @@ if STORAGE_MODE not in {"local", "blob"}:
 # DATA LAYOUT SETTINGS
 # =========================================================
 
-# Production layout:
+# Recommended production layout:
 #
 # <week_folder>/
-# ├── <YYYYMMDD>/
-# │   ├── OPT_TICK/
-# │   ├── FUT_TICK/
-# │   └── IDX_TICK/
+# ├── OPT_TICK/<YYYYMMDD>/
+# ├── FUT_TICK/<YYYYMMDD>/
+# └── IDX_TICK/<YYYYMMDD>/
 #
 # Supported values:
 #   segment_date -> <week>/<segment>/<date>/
@@ -56,7 +55,7 @@ if STORAGE_MODE not in {"local", "blob"}:
 #   flat         -> <week>/<segment>/
 DATA_LAYOUT = os.getenv(
     "DATA_LAYOUT",
-    "date_segment",
+    "segment_date",
 ).strip().lower()
 
 SUPPORTED_DATA_LAYOUTS = {
@@ -96,10 +95,10 @@ def build_segment_path(
     """
     Build a local filesystem path for the configured historical-data layout.
 
-    Examples for DATA_LAYOUT="date_segment":
-        <week>/20260330/OPT_TICK
-        <week>/20260330/FUT_TICK
-        <week>/20260330/IDX_TICK
+    Examples for DATA_LAYOUT="segment_date":
+        <week>/OPT_TICK/20260330
+        <week>/FUT_TICK/20260330
+        <week>/IDX_TICK/20260330
     """
 
     week_path = Path(week_folder).expanduser()
