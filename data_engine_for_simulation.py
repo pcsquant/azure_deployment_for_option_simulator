@@ -1,19 +1,10 @@
-"""Production data-access layer for the historical option simulator.
-
-Supports local Parquet and Azure Blob Storage, bounded in-process LRU caches,
-contract manifests, normalized consolidated option-chain reads, and session-aligned
-candle creation. Cached DataFrames are treated as read-only master objects.
-"""
-
 import hashlib
 import logging
 import os
 import re
 import time
-from collections import OrderedDict
 from pathlib import Path
-from threading import Lock, RLock
-from typing import Any, Optional
+from threading import Lock
 
 import numpy as np
 import pandas as pd
@@ -50,68 +41,20 @@ DEBUG_MODE = os.getenv("DEBUG_MODE", "false").strip().lower() in {
     "on",
 }
 
-MAX_RAW_PARQUET_CACHE_SIZE = max(1, int(os.getenv("MAX_RAW_PARQUET_CACHE_SIZE", "128")))
-MAX_OPTION_CHAIN_CACHE_SIZE = max(1, int(os.getenv("MAX_OPTION_CHAIN_CACHE_SIZE", "16")))
+PARQUET_FILE_PATH_CACHE = {}
+RAW_PARQUET_CACHE = {}
+MAX_RAW_PARQUET_CACHE_SIZE = int(os.getenv("MAX_RAW_PARQUET_CACHE_SIZE", "1000"))
 
+OPTION_PARQUET_CACHE = {}
+OPTION_CONTRACT_CACHE = {}
 
-class _ThreadSafeLRU:
-    """Small process-local LRU used for metadata and DataFrame caches.
-
-    The cache is intentionally bounded. Values are returned by reference; callers that
-    mutate a cached DataFrame must first make a copy. The data engine treats cached
-    frames as read-only master objects and only mutates timestamp-specific slices.
-    """
-
-    def __init__(self, max_entries: int):
-        self.max_entries = max(1, int(max_entries))
-        self._items: "OrderedDict[Any, Any]" = OrderedDict()
-        self._lock = RLock()
-
-    def get(self, key, default=None):
-        with self._lock:
-            if key not in self._items:
-                return default
-            value = self._items.pop(key)
-            self._items[key] = value
-            return value
-
-    def put(self, key, value):
-        with self._lock:
-            if key in self._items:
-                self._items.pop(key)
-            self._items[key] = value
-            while len(self._items) > self.max_entries:
-                self._items.popitem(last=False)
-
-    def pop(self, key, default=None):
-        with self._lock:
-            return self._items.pop(key, default)
-
-    def clear(self):
-        with self._lock:
-            self._items.clear()
-
-    def __len__(self):
-        with self._lock:
-            return len(self._items)
-
-    def stats(self) -> dict:
-        with self._lock:
-            approx_bytes = 0
-            for value in self._items.values():
-                if isinstance(value, pd.DataFrame):
-                    approx_bytes += int(value.memory_usage(index=True, deep=True).sum())
-            return {
-                "entries": len(self._items),
-                "max_entries": self.max_entries,
-                "approx_bytes": approx_bytes,
-            }
-
-
-PARQUET_FILE_PATH_CACHE: dict[tuple[str, str], Optional[str]] = {}
-RAW_PARQUET_CACHE = _ThreadSafeLRU(MAX_RAW_PARQUET_CACHE_SIZE)
-OPTION_PARQUET_CACHE = _ThreadSafeLRU(MAX_OPTION_CHAIN_CACHE_SIZE)
-OPTION_CONTRACT_CACHE = _ThreadSafeLRU(MAX_OPTION_CHAIN_CACHE_SIZE)
+# Full consolidated source-file cache. Each NIFTY.parquet/BANKNIFTY.parquet
+# is downloaded once per Python worker and reused for all timestamp requests.
+_OPTION_SOURCE_CACHE = {}
+_OPTION_SOURCE_CACHE_LOCK = Lock()
+MAX_OPTION_SOURCE_CACHE_SIZE = max(
+    1, int(os.getenv("MAX_OPTION_SOURCE_CACHE_SIZE", "8"))
+)
 
 # Option-contract manifest cache. Building the manifest requires either a
 # recursive local filesystem walk or an Azure Blob listing, so it must never
@@ -135,31 +78,31 @@ _OPTION_CONTRACT_FILENAME_PATTERN = re.compile(
 # =========================================================
 
 def is_path_allowed(path, instrument="NIFTY"):
-    """Validate a local path or Blob prefix before reading market data."""
     if STORAGE_MODE == "blob":
         value = str(path).replace("\\", "/").strip("/")
-        parts = [part for part in value.split("/") if part]
-        return bool(value) and ".." not in parts
+        return ".." not in value.split("/")
 
     cfg = get_dataset_config(instrument)
-    roots = [
-        os.path.abspath(str(cfg.get("base_path") or PARQUET_BASE_PATH)),
-        os.path.abspath(str(OPTION_PARQUET_BASE_PATH)),
-    ]
-    target = os.path.abspath(os.path.expanduser(str(path)))
 
-    if not os.path.exists(target) and target.lower().endswith(".zip"):
+    base = os.path.abspath(
+        str(cfg.get("base_path") or PARQUET_BASE_PATH)
+    )
+    option_base = os.path.abspath(
+        str(OPTION_PARQUET_BASE_PATH)
+    )
+    target = os.path.abspath(str(path))
+
+    if (
+        not os.path.exists(target)
+        and target.lower().endswith(".zip")
+    ):
         target = os.path.dirname(target)
 
-    for root in roots:
-        try:
-            if os.path.commonpath([root, target]) == root:
-                return True
-        except ValueError:
-            # Different Windows drives, or otherwise incomparable roots.
-            continue
-    return False
-
+    return (
+        os.path.commonpath([base, target]) == base
+        or os.path.commonpath([option_base, target])
+        == option_base
+    )
 
 def _extract_date_from_text(text):
     match = re.search(r"(\d{8})", str(text))
@@ -177,19 +120,51 @@ def _join_storage_path(*parts):
 
 
 def _get_idx_folder(week_folder, date_str=None):
+    """Resolve <week>/<YYYYMMDD>/IDX_TICK with legacy fallback."""
     if STORAGE_MODE == "blob":
+        if date_str:
+            return _join_storage_path(week_folder, date_str, "IDX_TICK")
         return _join_storage_path(week_folder, "IDX_TICK")
 
-    folder = os.path.join(week_folder, "IDX_TICK")
-    return folder if os.path.isdir(folder) else week_folder
+    if date_str:
+        candidate = os.path.join(week_folder, str(date_str), "IDX_TICK")
+        if os.path.isdir(candidate):
+            return candidate
+
+    legacy = os.path.join(week_folder, "IDX_TICK")
+    return legacy if os.path.isdir(legacy) else week_folder
 
 
 def _get_opt_folder(week_folder, date_str=None):
+    """Resolve <week>/<YYYYMMDD>/OPT_TICK with legacy fallback."""
     if STORAGE_MODE == "blob":
+        if date_str:
+            return _join_storage_path(week_folder, date_str, "OPT_TICK")
         return _join_storage_path(week_folder, "OPT_TICK")
 
-    folder = os.path.join(week_folder, "OPT_TICK")
-    return folder if os.path.isdir(folder) else week_folder
+    if date_str:
+        candidate = os.path.join(week_folder, str(date_str), "OPT_TICK")
+        if os.path.isdir(candidate):
+            return candidate
+
+    legacy = os.path.join(week_folder, "OPT_TICK")
+    return legacy if os.path.isdir(legacy) else week_folder
+
+
+def _get_fut_folder(week_folder, date_str=None):
+    """Resolve <week>/<YYYYMMDD>/FUT_TICK with legacy fallback."""
+    if STORAGE_MODE == "blob":
+        if date_str:
+            return _join_storage_path(week_folder, date_str, "FUT_TICK")
+        return _join_storage_path(week_folder, "FUT_TICK")
+
+    if date_str:
+        candidate = os.path.join(week_folder, str(date_str), "FUT_TICK")
+        if os.path.isdir(candidate):
+            return candidate
+
+    legacy = os.path.join(week_folder, "FUT_TICK")
+    return legacy if os.path.isdir(legacy) else week_folder
 
 
 def _normalize_storage_folder(folder):
@@ -413,9 +388,7 @@ def _read_parquet_normalized(path, mode="spot"):
     cached = RAW_PARQUET_CACHE.get(cache_key)
 
     if cached is not None:
-        # Shallow wrapper: avoids duplicating the full cached frame. Treat cached
-        # columns as read-only; make a deep copy only before destructive mutation.
-        return cached.copy(deep=False)
+        return cached.copy()
 
     if STORAGE_MODE == "blob":
         df = read_parquet_blob(path)
@@ -493,8 +466,11 @@ def _read_parquet_normalized(path, mode="spot"):
 
     out = out.sort_values("datetime").reset_index(drop=True)
 
-    RAW_PARQUET_CACHE.put(cache_key, out)
-    return out.copy(deep=False)
+    if len(RAW_PARQUET_CACHE) >= MAX_RAW_PARQUET_CACHE_SIZE:
+        RAW_PARQUET_CACHE.pop(next(iter(RAW_PARQUET_CACHE)))
+
+    RAW_PARQUET_CACHE[cache_key] = out.copy()
+    return out
 
 
 # =========================================================
@@ -600,12 +576,12 @@ def load_index_data_by_symbol(
 # OPTIONS - NEW OPTION PATH ONLY
 # =========================================================
 
-CONSOLIDATED_SCHEMA_VERSION = 2
+CONSOLIDATED_SCHEMA_VERSION = 3
 
 
 def consolidated_chain_folder(week_folder, date_str):
-    return _resolve_option_week_folder(week_folder)
-
+    option_week_folder = _resolve_option_week_folder(week_folder)
+    return _get_opt_folder(option_week_folder, date_str)
 
 
 def consolidated_chain_path(
@@ -614,164 +590,76 @@ def consolidated_chain_path(
     expiry_str,
     instrument="NIFTY",
 ):
-    """Return the consolidated option-chain path or blob name."""
+    """Return <week>/<YYYYMMDD>/OPT_TICK/<SYMBOL>.parquet."""
     cfg = get_dataset_config(instrument)
     symbol = str(cfg["symbol"]).upper()
-    option_week_folder = _resolve_option_week_folder(week_folder)
-    filename = f"{symbol}_{expiry_str}.parquet"
-
-    if STORAGE_MODE == "blob":
-        return _join_storage_path(
-            option_week_folder,
-            "OPT_TICK",
-            filename,
-        )
-
-    return os.path.join(
-        option_week_folder,
-        "OPT_TICK",
-        filename,
+    return _join_storage_path(
+        consolidated_chain_folder(week_folder, date_str),
+        f"{symbol}.parquet",
+    ) if STORAGE_MODE == "blob" else os.path.join(
+        consolidated_chain_folder(week_folder, date_str),
+        f"{symbol}.parquet",
     )
 
 
-_OPTION_CHAIN_CACHE = _ThreadSafeLRU(MAX_OPTION_CHAIN_CACHE_SIZE)
-_OPTION_CHAIN_CACHE_LOCK = RLock()
+_OPTION_CHAIN_CACHE = {}
+_OPTION_CHAIN_CACHE_LOCK = Lock()
 
 _DEFAULT_CACHE_DIR = (
-    Path.home()
-    / ".cache"
-    / "option-simulator"
-    / "option_chain"
+    Path.home() / ".cache" / "option-simulator" / "option_chain"
 )
-
 SHARED_OPTION_CACHE_DIR = os.path.abspath(
     os.path.expanduser(
-        os.getenv(
-            "SHARED_OPTION_CACHE_DIR",
-            str(_DEFAULT_CACHE_DIR),
-        )
+        os.getenv("SHARED_OPTION_CACHE_DIR", str(_DEFAULT_CACHE_DIR))
     )
 )
-
-os.makedirs(
-    SHARED_OPTION_CACHE_DIR,
-    exist_ok=True,
-)
+os.makedirs(SHARED_OPTION_CACHE_DIR, exist_ok=True)
 
 
 def _option_chain_disk_cache_path(cache_key):
     key_hash = hashlib.md5(
-        cache_key.encode("utf-8"),
-        usedforsecurity=False,
+        cache_key.encode("utf-8"), usedforsecurity=False
     ).hexdigest()
     return os.path.join(SHARED_OPTION_CACHE_DIR, f"{key_hash}.parquet")
 
 
-def _normalize_timestamp_series(values: pd.Series) -> pd.Series:
-    ts = pd.to_datetime(values, errors="coerce")
-    if getattr(ts.dt, "tz", None) is None:
-        return ts.dt.tz_localize(IST, ambiguous="NaT", nonexistent="NaT")
-    return ts.dt.tz_convert(IST)
+def _load_consolidated_option_source(path):
+    """Download/read one consolidated option source once per Python process."""
+    normalized_path = str(path).replace("\\", "/").strip("/")
 
+    with _OPTION_SOURCE_CACHE_LOCK:
+        cached = _OPTION_SOURCE_CACHE.get(normalized_path)
+        if cached is not None:
+            return cached
 
-def _normalize_wide_consolidated(df: pd.DataFrame, date_str: str) -> Optional[pd.DataFrame]:
-    """Normalize schema [timestamp, strike, ce, pe]."""
-    required = {"timestamp", "strike", "ce", "pe"}
-    if not required.issubset(df.columns):
-        return None
-
-    out = df.loc[:, ["timestamp", "strike", "ce", "pe"]].copy()
-    out["timestamp"] = _normalize_timestamp_series(out["timestamp"])
-    out["strike"] = pd.to_numeric(out["strike"], errors="coerce")
-    out["ce"] = pd.to_numeric(out["ce"], errors="coerce")
-    out["pe"] = pd.to_numeric(out["pe"], errors="coerce")
-    out = out.dropna(subset=["timestamp", "strike"])
-
-    requested = pd.to_datetime(str(date_str), format="%Y%m%d", errors="coerce")
-    if pd.isna(requested):
-        return None
-    out = out[out["timestamp"].dt.strftime("%Y%m%d") == requested.strftime("%Y%m%d")]
-    out = out[
-        (out["timestamp"].dt.time >= SESSION_START)
-        & (out["timestamp"].dt.time <= SESSION_END)
-    ]
-    if out.empty:
-        return None
-
-    out["strike"] = out["strike"].astype("int32")
-    return (
-        out.drop_duplicates(subset=["timestamp", "strike"], keep="last")
-        .sort_values(["timestamp", "strike"], kind="mergesort")
-        .reset_index(drop=True)
-    )
-
-
-def _normalize_long_consolidated(df: pd.DataFrame, date_str: str) -> Optional[pd.DataFrame]:
-    """Normalize legacy schema [date, time, strike, option_type, price]."""
-    required = {"date", "time", "strike", "option_type", "price"}
-    if not required.issubset(df.columns):
-        return None
-
-    work = df.loc[:, ["date", "time", "strike", "option_type", "price"]].copy()
-    work["date"] = pd.to_numeric(work["date"], errors="coerce")
-    requested_date = pd.to_numeric(date_str, errors="coerce")
-    if pd.isna(requested_date):
-        return None
-    work = work[work["date"] == int(requested_date)]
-    if work.empty:
-        return None
-
-    work["timestamp"] = _normalize_timestamp_series(
-        work["date"].astype("Int64").astype(str) + " " + work["time"].astype(str)
-    )
-    work["strike"] = pd.to_numeric(work["strike"], errors="coerce")
-    work["price"] = pd.to_numeric(work["price"], errors="coerce")
-    work["option_type"] = work["option_type"].astype(str).str.upper().str.strip()
-    work = work.dropna(subset=["timestamp", "strike", "price"])
-    work = work[work["option_type"].isin(["CE", "PE"])]
-    work = work[
-        (work["timestamp"].dt.time >= SESSION_START)
-        & (work["timestamp"].dt.time <= SESSION_END)
-    ]
-    if work.empty:
-        return None
-
-    work["strike"] = work["strike"].astype("int32")
-    # Last tick in each minute for each strike/side.
-    work["timestamp"] = work["timestamp"].dt.floor("min")
-    work = (
-        work.sort_values("timestamp", kind="mergesort")
-        .drop_duplicates(["timestamp", "strike", "option_type"], keep="last")
-    )
-    out = work.pivot_table(
-        index=["timestamp", "strike"],
-        columns="option_type",
-        values="price",
-        aggfunc="last",
-    ).reset_index()
-    out.columns.name = None
-    out = out.rename(columns={"CE": "ce", "PE": "pe"})
-    if "ce" not in out.columns:
-        out["ce"] = np.nan
-    if "pe" not in out.columns:
-        out["pe"] = np.nan
-    return out[["timestamp", "strike", "ce", "pe"]].sort_values(
-        ["timestamp", "strike"], kind="mergesort"
-    ).reset_index(drop=True)
-
-
-def _atomic_write_parquet(df: pd.DataFrame, destination: str) -> None:
-    os.makedirs(os.path.dirname(destination), exist_ok=True)
-    tmp_path = f"{destination}.{os.getpid()}.{time.time_ns()}.tmp"
+    started = time.perf_counter()
     try:
-        df.to_parquet(tmp_path, engine="pyarrow", compression="snappy", index=False)
-        os.replace(tmp_path, destination)
-    finally:
-        try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except OSError:
-            pass
+        source = (
+            read_parquet_blob(normalized_path)
+            if STORAGE_MODE == "blob"
+            else pd.read_parquet(normalized_path)
+        )
+    except Exception as exc:
+        logger.exception("Unable to read option source %s: %s", normalized_path, exc)
+        return None
+
+    if source is None or source.empty:
+        logger.warning("Option source is empty: %s", normalized_path)
+        return None
+
+    with _OPTION_SOURCE_CACHE_LOCK:
+        if len(_OPTION_SOURCE_CACHE) >= MAX_OPTION_SOURCE_CACHE_SIZE:
+            _OPTION_SOURCE_CACHE.pop(next(iter(_OPTION_SOURCE_CACHE)), None)
+        _OPTION_SOURCE_CACHE[normalized_path] = source
+
+    logger.info(
+        "Loaded and cached option source path=%s rows=%d columns=%d time_ms=%.2f",
+        normalized_path,
+        len(source),
+        len(source.columns),
+        (time.perf_counter() - started) * 1000,
+    )
+    return source
 
 
 def load_consolidated_option_chain(
@@ -780,32 +668,27 @@ def load_consolidated_option_chain(
     expiry_str,
     instrument="NIFTY",
 ):
-    """Load one consolidated option chain as [timestamp, strike, ce, pe].
-
-    Supports both the production wide schema generated by the current builder and
-    the older long schema. The normalized frame is cached in a bounded process-local
-    LRU and in an atomic local Parquet cache.
-    """
+    """Normalize a consolidated underlying Parquet into timestamp/strike/ce/pe."""
     path = consolidated_chain_path(folder, date_str, expiry_str, instrument)
-    cache_key = f"v{CONSOLIDATED_SCHEMA_VERSION}|{STORAGE_MODE}|{path}|{date_str}|{instrument.upper()}"
+    cache_key = (
+        f"schema-{CONSOLIDATED_SCHEMA_VERSION}|{STORAGE_MODE}|{path}|"
+        f"{date_str}|{expiry_str}|{str(instrument).upper()}"
+    )
     disk_cache_path = _option_chain_disk_cache_path(cache_key)
 
-    cached = _OPTION_CHAIN_CACHE.get(cache_key)
+    with _OPTION_CHAIN_CACHE_LOCK:
+        cached = _OPTION_CHAIN_CACHE.get(cache_key)
     if cached is not None:
-        return cached.copy(deep=False)
+        return cached.copy()
 
     if os.path.isfile(disk_cache_path):
         try:
-            cached_disk = pd.read_parquet(
-                disk_cache_path,
-                columns=["timestamp", "strike", "ce", "pe"],
-            )
-            normalized = _normalize_wide_consolidated(cached_disk, date_str)
-            if normalized is not None and not normalized.empty:
-                _OPTION_CHAIN_CACHE.put(cache_key, normalized)
-                return normalized.copy(deep=False)
-        except Exception as exc:
-            logger.warning("Discarding invalid option-chain disk cache %s: %s", disk_cache_path, exc)
+            cached_df = pd.read_parquet(disk_cache_path)
+            if {"timestamp", "strike", "ce", "pe"}.issubset(cached_df.columns):
+                with _OPTION_CHAIN_CACHE_LOCK:
+                    _OPTION_CHAIN_CACHE[cache_key] = cached_df.copy()
+                return cached_df.copy()
+        except Exception:
             try:
                 os.remove(disk_cache_path)
             except OSError:
@@ -814,56 +697,131 @@ def load_consolidated_option_chain(
     if STORAGE_MODE == "blob":
         try:
             if not blob_exists(path):
+                logger.warning("Option Parquet not found: %s", path)
                 return None
         except Exception as exc:
-            logger.exception("Unable to check consolidated option-chain blob %s: %s", path, exc)
+            logger.exception("Unable to check option blob %s: %s", path, exc)
             return None
     elif not os.path.isfile(path):
+        logger.warning("Option Parquet not found: %s", path)
         return None
 
-    df = None
-    # Prefer the wide production schema and projected reads.
-    projections = [
-        ["timestamp", "strike", "ce", "pe"],
-        ["date", "time", "strike", "option_type", "price"],
-        None,
-    ]
-    last_error = None
-    for columns in projections:
-        try:
-            if STORAGE_MODE == "blob":
-                df = read_parquet_blob(path, columns=columns)
-            else:
-                df = pd.read_parquet(path, columns=columns)
-            break
-        except Exception as exc:
-            last_error = exc
-            df = None
-
-    if df is None:
-        logger.error("Unable to read consolidated option chain %s: %s", path, last_error)
-        return None
-    if df.empty:
+    source = _load_consolidated_option_source(path)
+    if source is None or source.empty:
         return None
 
-    normalized = _normalize_wide_consolidated(df, date_str)
-    if normalized is None:
-        normalized = _normalize_long_consolidated(df, date_str)
-    if normalized is None or normalized.empty:
+    lower = {str(c).strip().lower(): c for c in source.columns}
+    required = {"date", "time", "price", "contract_name"}
+    if not required.issubset(lower):
         logger.error(
-            "Unsupported or empty consolidated schema in %s; columns=%s",
-            path,
-            list(df.columns),
+            "Unsupported option schema in %s. Required=%s Available=%s",
+            path, sorted(required), list(source.columns),
         )
         return None
 
-    _OPTION_CHAIN_CACHE.put(cache_key, normalized)
-    try:
-        _atomic_write_parquet(normalized, disk_cache_path)
-    except Exception as exc:
-        logger.warning("Unable to save option-chain disk cache %s: %s", disk_cache_path, exc)
+    work = source[[
+        lower["date"], lower["time"], lower["price"], lower["contract_name"]
+    ]].copy()
+    work.columns = ["date", "time", "price", "contract_name"]
 
-    return normalized.copy(deep=False)
+    requested_date = pd.to_numeric(str(date_str), errors="coerce")
+    if pd.isna(requested_date):
+        return None
+    work["date"] = pd.to_numeric(work["date"], errors="coerce")
+    work = work[work["date"] == int(requested_date)]
+    if work.empty:
+        logger.warning("No option rows for date=%s in %s", date_str, path)
+        return None
+
+    contract = (
+        work["contract_name"].astype(str).str.strip().str.upper()
+        .str.replace(".PARQUET", "", regex=False)
+        .str.replace(".CSV", "", regex=False)
+    )
+    extracted = contract.str.extract(
+        r"^(?P<symbol>[A-Z]+)(?P<expiry>\d{6})"
+        r"(?P<strike>\d+(?:\.\d+)?)(?P<option_type>CE|PE)$"
+    )
+    work = work.join(extracted)
+    cfg = get_dataset_config(instrument)
+    symbol = str(cfg["symbol"]).upper()
+    work["price"] = pd.to_numeric(work["price"], errors="coerce")
+    work["strike"] = pd.to_numeric(work["strike"], errors="coerce")
+    work = work.dropna(subset=["price", "strike"])
+    work = work[
+        work["symbol"].eq(symbol)
+        & work["expiry"].eq(str(expiry_str).strip())
+        & work["option_type"].isin(["CE", "PE"])
+    ]
+    if work.empty:
+        logger.warning(
+            "No option contracts matched instrument=%s date=%s expiry=%s in %s",
+            symbol, date_str, expiry_str, path,
+        )
+        return None
+
+    work["timestamp"] = pd.to_datetime(
+        work["date"].astype("Int64").astype(str) + " " + work["time"].astype(str),
+        errors="coerce",
+    )
+    work = work.dropna(subset=["timestamp"])
+    if getattr(work["timestamp"].dt, "tz", None) is None:
+        work["timestamp"] = work["timestamp"].dt.tz_localize(
+            IST, ambiguous="NaT", nonexistent="NaT"
+        )
+    else:
+        work["timestamp"] = work["timestamp"].dt.tz_convert(IST)
+    work = work.dropna(subset=["timestamp"])
+    work = work[
+        (work["timestamp"].dt.time >= SESSION_START)
+        & (work["timestamp"].dt.time <= SESSION_END)
+    ]
+    if work.empty:
+        return None
+
+    work["strike"] = work["strike"].round().astype("int32")
+    work["timestamp"] = work["timestamp"].dt.floor("min")
+    work = (
+        work.sort_values("timestamp", kind="mergesort")
+        .drop_duplicates(["timestamp", "strike", "option_type"], keep="last")
+    )
+
+    out = (
+        work.pivot_table(
+            index=["timestamp", "strike"],
+            columns="option_type",
+            values="price",
+            aggfunc="last",
+        )
+        .reset_index()
+        .rename(columns={"CE": "ce", "PE": "pe"})
+    )
+    out.columns.name = None
+    if "ce" not in out.columns:
+        out["ce"] = np.nan
+    if "pe" not in out.columns:
+        out["pe"] = np.nan
+    out = out[["timestamp", "strike", "ce", "pe"]].sort_values(
+        ["timestamp", "strike"], kind="mergesort"
+    ).reset_index(drop=True)
+    if out.empty:
+        return None
+
+    with _OPTION_CHAIN_CACHE_LOCK:
+        _OPTION_CHAIN_CACHE[cache_key] = out.copy()
+
+    try:
+        tmp = f"{disk_cache_path}.{os.getpid()}.tmp"
+        out.to_parquet(tmp, index=False)
+        os.replace(tmp, disk_cache_path)
+    except Exception as exc:
+        logger.warning("Unable to save option-chain cache %s: %s", disk_cache_path, exc)
+
+    logger.info(
+        "Loaded option chain instrument=%s date=%s expiry=%s rows=%d strikes=%d",
+        symbol, date_str, expiry_str, len(out), out["strike"].nunique(),
+    )
+    return out.copy()
 
 
 def load_required_option_data_for_date(
@@ -873,205 +831,32 @@ def load_required_option_data_for_date(
     strike,
     instrument="NIFTY",
 ):
-    empty = {
-        "CE": pd.DataFrame(
-            columns=["datetime", "price", "volume"]
-        ),
-        "PE": pd.DataFrame(
-            columns=["datetime", "price", "volume"]
-        ),
-    }
-
-    cfg = get_dataset_config(instrument)
-    symbol = str(cfg["symbol"]).upper()
-    opt_folder = _get_opt_folder(folder, date_str)
-
-    result = {}
-    contract_index = _get_option_contract_index(opt_folder)
-
+    """Return CE and PE time-series for one strike from the consolidated chain."""
+    empty_frame = pd.DataFrame(columns=["datetime", "price", "volume"])
+    empty = {"CE": empty_frame.copy(), "PE": empty_frame.copy()}
     try:
-        normalized_strike = int(float(strike))
+        strike_value = int(float(strike))
     except (TypeError, ValueError, OverflowError):
-        logger.warning("Invalid option strike requested: %r", strike)
         return empty
 
-    normalized_expiry = str(expiry_str).strip()
+    chain = load_consolidated_option_chain(
+        folder, date_str, expiry_str, instrument
+    )
+    if chain is None or chain.empty:
+        return empty
+    selected = chain[pd.to_numeric(chain["strike"], errors="coerce") == strike_value]
+    if selected.empty:
+        return empty
 
-    for side in ["CE", "PE"]:
-        # -----------------------------------------------------
-        # 1. Resolve the option contract from the cached manifest
-        # -----------------------------------------------------
-        matched_path = contract_index.get(
-            (symbol, normalized_expiry, normalized_strike, side)
-        )
-
-        if not matched_path:
-            result[side] = empty[side]
-            continue
-
-        # -----------------------------------------------------
-        # 2. Read the Parquet file
-        # -----------------------------------------------------
-
-        try:
-            if STORAGE_MODE == "blob":
-                df = read_parquet_blob(matched_path)
-            else:
-                df = pd.read_parquet(matched_path)
-
-        except Exception as exc:
-            print(
-                f"Unable to read option file: {matched_path}. "
-                f"Error: {exc}",
-                flush=True,
-            )
-
-            result[side] = empty[side]
-            continue
-
-        if df is None or df.empty:
-            result[side] = empty[side]
-            continue
-
-        # -----------------------------------------------------
-        # 3. Detect columns
-        # -----------------------------------------------------
-
-        lower_cols = {
-            str(column).lower(): column
-            for column in df.columns
-        }
-
-        # Create timestamp
-        if "datetime" in lower_cols:
-            dt = pd.to_datetime(
-                df[lower_cols["datetime"]],
-                errors="coerce",
-            )
-
-        elif {
-            "date",
-            "time",
-        }.issubset(lower_cols):
-            dt = pd.to_datetime(
-                df[lower_cols["date"]].astype(str)
-                + " "
-                + df[lower_cols["time"]].astype(str),
-                errors="coerce",
-            )
-
-        elif len(df.columns) >= 2:
-            dt = pd.to_datetime(
-                df.iloc[:, 0].astype(str)
-                + " "
-                + df.iloc[:, 1].astype(str),
-                errors="coerce",
-            )
-
-        else:
-            result[side] = empty[side]
-            continue
-
-        price_col = (
-            lower_cols.get("price")
-            or lower_cols.get("ltp")
-            or lower_cols.get("value")
-            or lower_cols.get("close")
-        )
-
-        if price_col is None:
-            if len(df.columns) >= 3:
-                price_col = df.columns[2]
-            else:
-                result[side] = empty[side]
-                continue
-
-        volume_col = (
-            lower_cols.get("volume")
-            or lower_cols.get("qty")
-            or lower_cols.get("quantity")
-        )
-
-        # -----------------------------------------------------
-        # 4. Normalize option data
-        # -----------------------------------------------------
-
-        out = pd.DataFrame(
-            {
-                "datetime": dt,
-                "price": pd.to_numeric(
-                    df[price_col],
-                    errors="coerce",
-                ),
-                "volume": (
-                    pd.to_numeric(
-                        df[volume_col],
-                        errors="coerce",
-                    ).fillna(0)
-                    if volume_col is not None
-                    else 0
-                ),
-            }
-        )
-
-        out = out.dropna(
-            subset=[
-                "datetime",
-                "price",
-            ]
-        )
-
-        if out.empty:
-            result[side] = empty[side]
-            continue
-
-        # -----------------------------------------------------
-        # 5. Convert timestamps to IST
-        # -----------------------------------------------------
-
-        if out["datetime"].dt.tz is None:
-            out["datetime"] = (
-                out["datetime"].dt.tz_localize(
-                    IST,
-                    ambiguous="NaT",
-                    nonexistent="NaT",
-                )
-            )
-        else:
-            out["datetime"] = (
-                out["datetime"].dt.tz_convert(IST)
-            )
-
-        out = out.dropna(subset=["datetime"])
-
-        # -----------------------------------------------------
-        # 6. Filter trading-session records
-        # -----------------------------------------------------
-
-        out = out[
-            (
-                out["datetime"].dt.time
-                >= SESSION_START
-            )
-            & (
-                out["datetime"].dt.time
-                <= SESSION_END
-            )
-        ]
-
-        if out.empty:
-            result[side] = empty[side]
-            continue
-
-        result[side] = (
-            out.sort_values("datetime")
-            .reset_index(drop=True)
-        )
-
-    return {
-        "CE": result.get("CE", empty["CE"]),
-        "PE": result.get("PE", empty["PE"]),
-    }
+    result = {}
+    for side, column in (("CE", "ce"), ("PE", "pe")):
+        frame = pd.DataFrame({
+            "datetime": pd.to_datetime(selected["timestamp"], errors="coerce"),
+            "price": pd.to_numeric(selected[column], errors="coerce"),
+            "volume": 0,
+        }).dropna(subset=["datetime", "price"])
+        result[side] = frame.sort_values("datetime").reset_index(drop=True)
+    return result
 
 
 def load_single_option_file_from_zip(folder, member_name):
@@ -1111,48 +896,27 @@ def find_option_contract_files(
 
 
 def create_candles(tick_df, interval_minutes):
-    """Create session-aligned OHLC candles without copying unrelated columns."""
     if tick_df is None or tick_df.empty:
-        return pd.DataFrame(columns=["open", "high", "low", "close"])
-    if "datetime" not in tick_df.columns or "value" not in tick_df.columns:
-        raise ValueError("tick_df must contain 'datetime' and 'value' columns")
+        return pd.DataFrame()
 
-    interval = int(interval_minutes)
-    if interval <= 0 or interval > 1440:
-        raise ValueError("interval_minutes must be between 1 and 1440")
+    df = tick_df.copy()
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    df = df.dropna(subset=["datetime", "value"])
 
-    df = pd.DataFrame({
-        "datetime": pd.to_datetime(tick_df["datetime"], errors="coerce"),
-        "value": pd.to_numeric(tick_df["value"], errors="coerce"),
-    }).dropna(subset=["datetime", "value"])
     if df.empty:
-        return pd.DataFrame(columns=["open", "high", "low", "close"])
+        return pd.DataFrame()
 
     if getattr(df["datetime"].dt, "tz", None) is None:
-        df["datetime"] = df["datetime"].dt.tz_localize(
-            IST, ambiguous="NaT", nonexistent="NaT"
-        )
+        df["datetime"] = df["datetime"].dt.tz_localize(IST)
     else:
         df["datetime"] = df["datetime"].dt.tz_convert(IST)
-    df = df.dropna(subset=["datetime"])
 
-    session_offset = pd.Timedelta(
-        hours=SESSION_START.hour,
-        minutes=SESSION_START.minute,
-        seconds=SESSION_START.second,
-    )
     candles = (
         df.set_index("datetime")["value"]
-        .sort_index()
-        .resample(
-            f"{interval}min",
-            origin="start_day",
-            offset=session_offset,
-            label="left",
-            closed="left",
-        )
+        .resample(f"{int(interval_minutes)}min")
         .ohlc()
-        .dropna(how="any")
+        .dropna()
     )
     candles.columns = ["open", "high", "low", "close"]
     return candles
@@ -1418,44 +1182,6 @@ def get_dates_for_week_folder(
     return sorted(dates)
 
 
-def clear_runtime_caches(clear_disk_option_cache: bool = False) -> None:
-    """Clear process-local caches; optionally remove normalized disk cache files."""
-    PARQUET_FILE_PATH_CACHE.clear()
-    RAW_PARQUET_CACHE.clear()
-    OPTION_PARQUET_CACHE.clear()
-    OPTION_CONTRACT_CACHE.clear()
-    _OPTION_CHAIN_CACHE.clear()
-    OPTION_WEEK_FOLDER_CACHE.clear()
-    invalidate_option_contract_index()
-    with _WEEK_DATES_CACHE_LOCK:
-        _WEEK_DATES_CACHE.clear()
-
-    if clear_disk_option_cache and os.path.isdir(SHARED_OPTION_CACHE_DIR):
-        for entry in os.scandir(SHARED_OPTION_CACHE_DIR):
-            if entry.is_file() and entry.name.lower().endswith(".parquet"):
-                try:
-                    os.remove(entry.path)
-                except OSError as exc:
-                    logger.warning("Unable to remove cache file %s: %s", entry.path, exc)
-
-
-def runtime_cache_stats() -> dict:
-    """Return lightweight process-local cache diagnostics."""
-    with _OPTION_CONTRACT_INDEX_CACHE_LOCK:
-        manifest_count = len(_OPTION_CONTRACT_INDEX_CACHE)
-    with _WEEK_DATES_CACHE_LOCK:
-        week_date_entries = len(_WEEK_DATES_CACHE)
-    return {
-        "storage_mode": STORAGE_MODE,
-        "raw_parquet": RAW_PARQUET_CACHE.stats(),
-        "option_chain": _OPTION_CHAIN_CACHE.stats(),
-        "path_cache_entries": len(PARQUET_FILE_PATH_CACHE),
-        "option_manifest_entries": manifest_count,
-        "week_date_cache_entries": week_date_entries,
-        "shared_option_cache_dir": SHARED_OPTION_CACHE_DIR,
-    }
-
-
 # =========================================================
 # OPTION HELPERS
 # =========================================================
@@ -1525,6 +1251,7 @@ def load_future_data_for_date(
 
     if STORAGE_MODE == "blob":
         candidate_folders = [
+            _get_fut_folder(folder, date_str),
             _join_storage_path(folder, "FUT_TICK"),
             _join_storage_path(
                 folder,
@@ -1539,6 +1266,7 @@ def load_future_data_for_date(
         ]
     else:
         candidate_folders = [
+            _get_fut_folder(folder, date_str),
             os.path.join(folder, "FUT_TICK"),
             os.path.join(
                 folder,
@@ -1657,7 +1385,7 @@ def load_future_data_for_date(
     )
     selected = future_files[selected_index][1]
 
-    logger.info("Using future file: %s", selected)
+    print("Using future file:", selected, flush=True)
 
     try:
         return _read_parquet_normalized(
@@ -1672,3 +1400,96 @@ def load_future_data_for_date(
         return pd.DataFrame(
             columns=["datetime", "price", "volume"]
         )
+
+
+# =========================================================
+# PUBLIC OPTION SNAPSHOT AND CACHE DIAGNOSTICS
+# =========================================================
+
+def get_option_chain_snapshot(
+    folder,
+    date_str,
+    expiry_str,
+    target_timestamp,
+    instrument="NIFTY",
+):
+    """Return latest CE/PE values by strike at or before target_timestamp."""
+    empty = pd.DataFrame(columns=["timestamp", "strike", "ce", "pe"])
+    chain = load_consolidated_option_chain(
+        folder, date_str, expiry_str, instrument
+    )
+    if chain is None or chain.empty:
+        return empty
+
+    frame = chain[["timestamp", "strike", "ce", "pe"]].copy()
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"], errors="coerce")
+    frame["strike"] = pd.to_numeric(frame["strike"], errors="coerce")
+    frame["ce"] = pd.to_numeric(frame["ce"], errors="coerce")
+    frame["pe"] = pd.to_numeric(frame["pe"], errors="coerce")
+    frame = frame.dropna(subset=["timestamp", "strike"])
+    if frame.empty:
+        return empty
+
+    if getattr(frame["timestamp"].dt, "tz", None) is None:
+        frame["timestamp"] = frame["timestamp"].dt.tz_localize(
+            IST, ambiguous="NaT", nonexistent="NaT"
+        )
+    else:
+        frame["timestamp"] = frame["timestamp"].dt.tz_convert(IST)
+
+    target = pd.Timestamp(target_timestamp)
+    target = target.tz_localize(IST) if target.tzinfo is None else target.tz_convert(IST)
+    frame = frame[frame["timestamp"] <= target]
+    if frame.empty:
+        return empty
+
+    frame["strike"] = frame["strike"].astype("int32")
+    return (
+        frame.sort_values(["strike", "timestamp"], kind="mergesort")
+        .drop_duplicates("strike", keep="last")
+        .sort_values("strike", kind="mergesort")
+        .reset_index(drop=True)
+    )[["timestamp", "strike", "ce", "pe"]]
+
+
+def runtime_cache_stats():
+    with _OPTION_SOURCE_CACHE_LOCK:
+        source_entries = len(_OPTION_SOURCE_CACHE)
+        source_rows = sum(
+            len(value) for value in _OPTION_SOURCE_CACHE.values()
+            if isinstance(value, pd.DataFrame)
+        )
+    with _OPTION_CHAIN_CACHE_LOCK:
+        chain_entries = len(_OPTION_CHAIN_CACHE)
+    return {
+        "storage_mode": STORAGE_MODE,
+        "option_source_cache_entries": source_entries,
+        "option_source_cache_rows": source_rows,
+        "option_chain_cache_entries": chain_entries,
+        "raw_parquet_cache_entries": len(RAW_PARQUET_CACHE),
+        "path_cache_entries": len(PARQUET_FILE_PATH_CACHE),
+        "week_folder_cache_entries": len(OPTION_WEEK_FOLDER_CACHE),
+    }
+
+
+def clear_runtime_caches(clear_disk_option_cache=False):
+    PARQUET_FILE_PATH_CACHE.clear()
+    RAW_PARQUET_CACHE.clear()
+    OPTION_PARQUET_CACHE.clear()
+    OPTION_CONTRACT_CACHE.clear()
+    OPTION_WEEK_FOLDER_CACHE.clear()
+    with _OPTION_SOURCE_CACHE_LOCK:
+        _OPTION_SOURCE_CACHE.clear()
+    with _OPTION_CHAIN_CACHE_LOCK:
+        _OPTION_CHAIN_CACHE.clear()
+    with _OPTION_CONTRACT_INDEX_CACHE_LOCK:
+        _OPTION_CONTRACT_INDEX_CACHE.clear()
+    with _WEEK_DATES_CACHE_LOCK:
+        _WEEK_DATES_CACHE.clear()
+
+    if clear_disk_option_cache and os.path.isdir(SHARED_OPTION_CACHE_DIR):
+        for item in Path(SHARED_OPTION_CACHE_DIR).glob("*.parquet"):
+            try:
+                item.unlink()
+            except OSError:
+                logger.warning("Unable to delete cache file %s", item)
