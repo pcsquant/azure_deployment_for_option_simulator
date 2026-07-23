@@ -1692,3 +1692,143 @@ def load_future_data_for_date(
         return pd.DataFrame(
             columns=["datetime", "price", "volume"]
         )
+
+
+cat >> data_engine_for_simulation.py <<'PY'
+
+
+def get_option_chain_snapshot(
+    folder,
+    date_str,
+    expiry_str,
+    target_timestamp,
+    instrument="NIFTY",
+):
+    """
+    Return the latest available CE and PE prices for each strike
+    at or before the requested timestamp.
+    """
+
+    empty = pd.DataFrame(
+        columns=["timestamp", "strike", "ce", "pe"]
+    )
+
+    chain = load_consolidated_option_chain(
+        folder=folder,
+        date_str=date_str,
+        expiry_str=expiry_str,
+        instrument=instrument,
+    )
+
+    if chain is None or chain.empty:
+        logger.warning(
+            "No consolidated option-chain data found: "
+            "instrument=%s date=%s expiry=%s",
+            instrument,
+            date_str,
+            expiry_str,
+        )
+        return empty
+
+    required_columns = {
+        "timestamp",
+        "strike",
+        "ce",
+        "pe",
+    }
+
+    if not required_columns.issubset(chain.columns):
+        logger.error(
+            "Option-chain columns are invalid. "
+            "Required=%s Available=%s",
+            sorted(required_columns),
+            list(chain.columns),
+        )
+        return empty
+
+    frame = chain.loc[
+        :,
+        ["timestamp", "strike", "ce", "pe"],
+    ].copy()
+
+    frame["timestamp"] = pd.to_datetime(
+        frame["timestamp"],
+        errors="coerce",
+    )
+
+    frame["strike"] = pd.to_numeric(
+        frame["strike"],
+        errors="coerce",
+    )
+
+    frame["ce"] = pd.to_numeric(
+        frame["ce"],
+        errors="coerce",
+    )
+
+    frame["pe"] = pd.to_numeric(
+        frame["pe"],
+        errors="coerce",
+    )
+
+    frame = frame.dropna(
+        subset=["timestamp", "strike"]
+    )
+
+    if frame.empty:
+        return empty
+
+    if getattr(frame["timestamp"].dt, "tz", None) is None:
+        frame["timestamp"] = frame["timestamp"].dt.tz_localize(
+            IST,
+            ambiguous="NaT",
+            nonexistent="NaT",
+        )
+    else:
+        frame["timestamp"] = frame["timestamp"].dt.tz_convert(
+            IST
+        )
+
+    frame = frame.dropna(subset=["timestamp"])
+
+    if frame.empty:
+        return empty
+
+    target = pd.Timestamp(target_timestamp)
+
+    if target.tzinfo is None:
+        target = target.tz_localize(IST)
+    else:
+        target = target.tz_convert(IST)
+
+    frame = frame.loc[
+        frame["timestamp"] <= target
+    ]
+
+    if frame.empty:
+        return empty
+
+    frame["strike"] = frame["strike"].astype("int32")
+
+    snapshot = (
+        frame
+        .sort_values(
+            ["strike", "timestamp"],
+            kind="mergesort",
+        )
+        .drop_duplicates(
+            subset=["strike"],
+            keep="last",
+        )
+        .sort_values(
+            "strike",
+            kind="mergesort",
+        )
+        .reset_index(drop=True)
+    )
+
+    return snapshot.loc[
+        :,
+        ["timestamp", "strike", "ce", "pe"],
+    ]
+PY
