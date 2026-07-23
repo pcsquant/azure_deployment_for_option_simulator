@@ -688,45 +688,38 @@ def consolidated_chain_path(
     expiry_str,
     instrument="NIFTY",
 ):
-    """Return the consolidated option-chain path or blob name."""
+    """
+    Return the consolidated option file.
+
+    Actual production structure:
+
+    <week>/<YYYYMMDD>/OPT_TICK/NIFTY.parquet
+    <week>/<YYYYMMDD>/OPT_TICK/BANKNIFTY.parquet
+
+    expiry_str is retained for compatibility, but expiry filtering
+    must happen inside the Parquet DataFrame.
+    """
+
     cfg = get_dataset_config(instrument)
     symbol = str(cfg["symbol"]).upper()
+
     option_folder = consolidated_chain_folder(
         week_folder,
         date_str,
     )
-    filename = f"{symbol}_{expiry_str}.parquet"
+
+    filename = f"{symbol}.parquet"
 
     if STORAGE_MODE == "blob":
-        return _join_storage_path(option_folder, filename)
-
-    return os.path.join(option_folder, filename)
-
-
-_OPTION_CHAIN_CACHE = _ThreadSafeLRU(MAX_OPTION_CHAIN_CACHE_SIZE)
-_OPTION_CHAIN_CACHE_LOCK = RLock()
-
-_DEFAULT_CACHE_DIR = (
-    Path.home()
-    / ".cache"
-    / "option-simulator"
-    / "option_chain"
-)
-
-SHARED_OPTION_CACHE_DIR = os.path.abspath(
-    os.path.expanduser(
-        os.getenv(
-            "SHARED_OPTION_CACHE_DIR",
-            str(_DEFAULT_CACHE_DIR),
+        return _join_storage_path(
+            option_folder,
+            filename,
         )
+
+    return os.path.join(
+        option_folder,
+        filename,
     )
-)
-
-os.makedirs(
-    SHARED_OPTION_CACHE_DIR,
-    exist_ok=True,
-)
-
 
 def _option_chain_disk_cache_path(cache_key):
     key_hash = hashlib.md5(
