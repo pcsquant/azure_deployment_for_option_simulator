@@ -1692,3 +1692,110 @@ def load_future_data_for_date(
         return pd.DataFrame(
             columns=["datetime", "price", "volume"]
         )
+
+# =========================================================
+# OPTION CHAIN SNAPSHOT
+# =========================================================
+
+def get_option_chain_snapshot(
+    folder,
+    date_str,
+    expiry_str,
+    timestamp,
+    instrument="NIFTY",
+):
+    """
+    Returns the latest CE/PE prices for every strike
+    at or before the requested timestamp.
+    """
+
+    df = load_consolidated_option_chain(
+        folder=folder,
+        date_str=date_str,
+        expiry_str=expiry_str,
+        instrument=instrument,
+    )
+
+    if df is None or df.empty:
+        return pd.DataFrame(
+            columns=["timestamp", "strike", "ce", "pe"]
+        )
+
+    ts = pd.to_datetime(timestamp)
+
+    if ts.tzinfo is None:
+        ts = ts.tz_localize(IST)
+    else:
+        ts = ts.tz_convert(IST)
+
+    df = df[df["timestamp"] <= ts]
+
+    if df.empty:
+        return pd.DataFrame(
+            columns=["timestamp", "strike", "ce", "pe"]
+        )
+
+    snapshot = (
+        df.sort_values("timestamp")
+          .groupby("strike", as_index=False)
+          .tail(1)
+          .sort_values("strike")
+          .reset_index(drop=True)
+    )
+
+    return snapshot[
+        ["timestamp", "strike", "ce", "pe"]
+    ]
+
+
+# =========================================================
+# CACHE UTILITIES
+# =========================================================
+
+def runtime_cache_stats():
+    """
+    Return cache statistics.
+    """
+
+    return {
+        "storage_mode": STORAGE_MODE,
+        "raw_parquet_cache": len(RAW_PARQUET_CACHE),
+        "option_chain_cache": len(_OPTION_CHAIN_CACHE),
+        "option_contract_cache": len(OPTION_CONTRACT_CACHE),
+        "parquet_file_cache": len(PARQUET_FILE_PATH_CACHE),
+        "week_folder_cache": len(OPTION_WEEK_FOLDER_CACHE),
+        "week_dates_cache": len(_WEEK_DATES_CACHE),
+        "option_contract_index_cache": len(
+            _OPTION_CONTRACT_INDEX_CACHE
+        ),
+    }
+
+
+def clear_runtime_caches(clear_disk_option_cache=False):
+    """
+    Clear all runtime caches.
+    """
+
+    RAW_PARQUET_CACHE.clear()
+    PARQUET_FILE_PATH_CACHE.clear()
+    OPTION_PARQUET_CACHE.clear()
+    OPTION_CONTRACT_CACHE.clear()
+    OPTION_WEEK_FOLDER_CACHE.clear()
+
+    with _OPTION_CHAIN_CACHE_LOCK:
+        _OPTION_CHAIN_CACHE.clear()
+
+    with _OPTION_CONTRACT_INDEX_CACHE_LOCK:
+        _OPTION_CONTRACT_INDEX_CACHE.clear()
+
+    with _WEEK_DATES_CACHE_LOCK:
+        _WEEK_DATES_CACHE.clear()
+
+    if clear_disk_option_cache:
+        try:
+            for file in Path(SHARED_OPTION_CACHE_DIR).glob("*.parquet"):
+                file.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    logger.info("Runtime caches cleared.")
