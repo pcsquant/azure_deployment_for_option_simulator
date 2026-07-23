@@ -623,44 +623,317 @@ def _option_chain_disk_cache_path(cache_key):
     return os.path.join(SHARED_OPTION_CACHE_DIR, f"{key_hash}.parquet")
 
 
-def _load_consolidated_option_source(path):
-    """Download/read one consolidated option source once per Python process."""
-    normalized_path = str(path).replace("\\", "/").strip("/")
+def _load_consolidated_option_source(
+    path=None,
+    *,
+    folder=None,
+    date_str=None,
+    instrument="NIFTY",
+):
+    """
+    Read and cache the complete consolidated option Parquet file.
+
+    Supported calls
+    ---------------
+
+    1. Direct path:
+
+        _load_consolidated_option_source(
+            "166 13 Jul to 17 Jul (NSE FO) - TICK - CSV/"
+            "20260717/OPT_TICK/NIFTY.parquet"
+        )
+
+    2. Build the path from its components:
+
+        _load_consolidated_option_source(
+            folder=folder,
+            date_str="20260717",
+            instrument="NIFTY",
+        )
+
+    The complete daily Parquet file is loaded only once per
+    Python process and is then reused from RAM.
+    """
+
+    # -----------------------------------------------------
+    # Validate and normalize the instrument
+    # -----------------------------------------------------
+
+    instrument = str(instrument or "NIFTY").strip().upper()
+
+    if not instrument:
+        raise ValueError("instrument cannot be empty")
+
+    # -----------------------------------------------------
+    # Resolve the complete Parquet path
+    # -----------------------------------------------------
+
+    if path is None:
+        if folder is None:
+            raise ValueError(
+                "Either path or folder must be provided."
+            )
+
+        if date_str is None:
+            raise ValueError(
+                "date_str is required when folder is provided."
+            )
+
+        normalized_folder = (
+            str(folder)
+            .replace("\\", "/")
+            .strip()
+            .strip("/")
+        )
+
+        normalized_date = (
+            str(date_str)
+            .strip()
+            .replace("-", "")
+            .replace("/", "")
+        )
+
+        if not normalized_folder:
+            raise ValueError("folder cannot be empty")
+
+        if (
+            len(normalized_date) != 8
+            or not normalized_date.isdigit()
+        ):
+            raise ValueError(
+                "date_str must be in YYYYMMDD or YYYY-MM-DD format."
+            )
+
+        # Production Azure layout:
+        #
+        # <week-folder>/
+        #     <YYYYMMDD>/
+        #         OPT_TICK/
+        #             NIFTY.parquet
+        #
+        path = (
+            f"{normalized_folder}/"
+            f"{normalized_date}/"
+            f"OPT_TICK/"
+            f"{instrument}.parquet"
+        )
+
+    normalized_path = (
+        str(path)
+        .replace("\\", "/")
+        .strip()
+        .strip("/")
+    )
+
+    if not normalized_path:
+        raise ValueError(
+            "Resolved consolidated option path is empty."
+        )
+
+    # -----------------------------------------------------
+    # Return the complete day from RAM when available
+    # -----------------------------------------------------
 
     with _OPTION_SOURCE_CACHE_LOCK:
-        cached = _OPTION_SOURCE_CACHE.get(normalized_path)
+        cached = _OPTION_SOURCE_CACHE.get(
+            normalized_path
+        )
+
         if cached is not None:
+            logger.debug(
+                "Option source cache hit path=%s rows=%d",
+                normalized_path,
+                len(cached),
+            )
+
             return cached
 
+    # -----------------------------------------------------
+    # Read the complete daily Parquet source
+    # -----------------------------------------------------
+
     started = time.perf_counter()
+
     try:
-        source = (
-            read_parquet_blob(normalized_path)
-            if STORAGE_MODE == "blob"
-            else pd.read_parquet(normalized_path)
-        )
+        if STORAGE_MODE == "blob":
+            source = read_parquet_blob(
+                normalized_path
+            )
+        else:
+            source = pd.read_parquet(
+                normalized_path
+            )
+
     except Exception as exc:
-        logger.exception("Unable to read option source %s: %s", normalized_path, exc)
+        logger.exception(
+            "Unable to read consolidated option source "
+            "path=%s storage_mode=%s error=%s",
+            normalized_path,
+            STORAGE_MODE,
+            exc,
+        )
+
         return None
 
-    if source is None or source.empty:
-        logger.warning("Option source is empty: %s", normalized_path)
+    # -----------------------------------------------------
+    # Validate the loaded DataFrame
+    # -----------------------------------------------------
+
+    if source is None:
+        logger.warning(
+            "Option source loader returned None: %s",
+            normalized_path,
+        )
+
         return None
+
+    if not isinstance(source, pd.DataFrame):
+        logger.error(
+            "Option source is not a DataFrame: "
+            "path=%s type=%s",
+            normalized_path,
+            type(source).__name__,
+        )
+
+        return None
+
+    if source.empty:
+        logger.warning(
+            "Option source is empty: %s",
+            normalized_path,
+        )
+
+        return None
+
+    required_columns = {
+        "date",
+        "time",
+        "price",
+        "contract_name",
+    }
+
+    missing_columns = (
+        required_columns - set(source.columns)
+    )
+
+    if missing_columns:
+        logger.error(
+            "Option source is missing columns: "
+            "path=%s missing=%s available=%s",
+            normalized_path,
+            sorted(missing_columns),
+            source.columns.tolist(),
+        )
+
+        return None
+
+    # -----------------------------------------------------
+    # Normalize important source columns once
+    # -----------------------------------------------------
+
+    source = source.copy()
+
+    source["contract_name"] = (
+        source["contract_name"]
+        .astype(str)
+        .str.upper()
+        .str.replace(r"\s+", "", regex=True)
+        .str.strip()
+    )
+
+    source["price"] = pd.to_numeric(
+        source["price"],
+        errors="coerce",
+    )
+
+    if "qty" in source.columns:
+        source["qty"] = pd.to_numeric(
+            source["qty"],
+            errors="coerce",
+        ).fillna(0)
+
+    if "oi" in source.columns:
+        source["oi"] = pd.to_numeric(
+            source["oi"],
+            errors="coerce",
+        ).fillna(0)
+
+    source = source.dropna(
+        subset=[
+            "price",
+            "contract_name",
+        ]
+    ).reset_index(drop=True)
+
+    if source.empty:
+        logger.warning(
+            "Option source contains no valid rows after "
+            "normalization: %s",
+            normalized_path,
+        )
+
+        return None
+
+    # -----------------------------------------------------
+    # Save the complete daily DataFrame in RAM
+    # -----------------------------------------------------
 
     with _OPTION_SOURCE_CACHE_LOCK:
-        if len(_OPTION_SOURCE_CACHE) >= MAX_OPTION_SOURCE_CACHE_SIZE:
-            _OPTION_SOURCE_CACHE.pop(next(iter(_OPTION_SOURCE_CACHE)), None)
-        _OPTION_SOURCE_CACHE[normalized_path] = source
+        # Another thread may have loaded the same source while
+        # this thread was reading it.
+        existing = _OPTION_SOURCE_CACHE.get(
+            normalized_path
+        )
+
+        if existing is not None:
+            return existing
+
+        while (
+            len(_OPTION_SOURCE_CACHE)
+            >= MAX_OPTION_SOURCE_CACHE_SIZE
+        ):
+            oldest_key = next(
+                iter(_OPTION_SOURCE_CACHE),
+                None,
+            )
+
+            if oldest_key is None:
+                break
+
+            _OPTION_SOURCE_CACHE.pop(
+                oldest_key,
+                None,
+            )
+
+            logger.info(
+                "Evicted option source cache entry path=%s",
+                oldest_key,
+            )
+
+        _OPTION_SOURCE_CACHE[
+            normalized_path
+        ] = source
+
+    elapsed_ms = (
+        time.perf_counter() - started
+    ) * 1000
 
     logger.info(
-        "Loaded and cached option source path=%s rows=%d columns=%d time_ms=%.2f",
+        "Loaded and cached option source "
+        "path=%s rows=%d columns=%d "
+        "memory_mb=%.2f time_ms=%.2f",
         normalized_path,
         len(source),
         len(source.columns),
-        (time.perf_counter() - started) * 1000,
+        source.memory_usage(
+            index=True,
+            deep=True,
+        ).sum()
+        / (1024 * 1024),
+        elapsed_ms,
     )
-    return source
 
+    return source
 
 def load_consolidated_option_chain(
     folder,
