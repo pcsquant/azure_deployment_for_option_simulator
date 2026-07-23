@@ -39,149 +39,6 @@ if STORAGE_MODE not in {"local", "blob"}:
 
 
 # =========================================================
-# DATA LAYOUT SETTINGS
-# =========================================================
-
-# Recommended production layout:
-#
-# <week_folder>/
-# ├── OPT_TICK/<YYYYMMDD>/
-# ├── FUT_TICK/<YYYYMMDD>/
-# └── IDX_TICK/<YYYYMMDD>/
-#
-# Supported values:
-#   segment_date -> <week>/<segment>/<date>/
-#   date_segment -> <week>/<date>/<segment>/
-#   flat         -> <week>/<segment>/
-DATA_LAYOUT = os.getenv(
-    "DATA_LAYOUT",
-    "segment_date",
-).strip().lower()
-
-SUPPORTED_DATA_LAYOUTS = {
-    "segment_date",
-    "date_segment",
-    "flat",
-}
-
-if DATA_LAYOUT not in SUPPORTED_DATA_LAYOUTS:
-    raise ValueError(
-        "DATA_LAYOUT must be one of "
-        f"{sorted(SUPPORTED_DATA_LAYOUTS)}. "
-        f"Received: {DATA_LAYOUT!r}"
-    )
-
-OPT_SEGMENT_NAME = os.getenv(
-    "OPT_SEGMENT_NAME",
-    "OPT_TICK",
-).strip()
-
-FUT_SEGMENT_NAME = os.getenv(
-    "FUT_SEGMENT_NAME",
-    "FUT_TICK",
-).strip()
-
-IDX_SEGMENT_NAME = os.getenv(
-    "IDX_SEGMENT_NAME",
-    "IDX_TICK",
-).strip()
-
-
-def build_segment_path(
-    week_folder: str | os.PathLike,
-    segment_name: str,
-    date_str: str | None = None,
-) -> Path:
-    """
-    Build a local filesystem path for the configured historical-data layout.
-
-    Examples for DATA_LAYOUT="segment_date":
-        <week>/OPT_TICK/20260330
-        <week>/FUT_TICK/20260330
-        <week>/IDX_TICK/20260330
-    """
-
-    week_path = Path(week_folder).expanduser()
-    normalized_segment = str(segment_name).strip()
-    normalized_date = (
-        str(date_str).strip()
-        if date_str is not None and str(date_str).strip()
-        else None
-    )
-
-    if DATA_LAYOUT == "segment_date":
-        path = week_path / normalized_segment
-        if normalized_date:
-            path = path / normalized_date
-        return path
-
-    if DATA_LAYOUT == "date_segment":
-        if normalized_date:
-            return week_path / normalized_date / normalized_segment
-        return week_path / normalized_segment
-
-    return week_path / normalized_segment
-
-
-def build_blob_prefix(
-    week_folder: str,
-    segment_name: str,
-    date_str: str | None = None,
-) -> str:
-    """Build an Azure Blob prefix using forward slashes."""
-
-    week_value = str(week_folder).replace("\\", "/").strip("/")
-    segment_value = str(segment_name).replace("\\", "/").strip("/")
-    date_value = (
-        str(date_str).replace("\\", "/").strip("/")
-        if date_str is not None and str(date_str).strip()
-        else ""
-    )
-
-    parts = [week_value]
-
-    if DATA_LAYOUT == "segment_date":
-        parts.append(segment_value)
-        if date_value:
-            parts.append(date_value)
-    elif DATA_LAYOUT == "date_segment":
-        if date_value:
-            parts.append(date_value)
-        parts.append(segment_value)
-    else:
-        parts.append(segment_value)
-
-    return "/".join(part for part in parts if part)
-
-
-def get_segment_name(segment: str) -> str:
-    """Return the configured folder name for a logical market-data segment."""
-
-    normalized = str(segment).strip().upper()
-    mapping = {
-        "OPT": OPT_SEGMENT_NAME,
-        "OPTION": OPT_SEGMENT_NAME,
-        "OPTIONS": OPT_SEGMENT_NAME,
-        "OPT_TICK": OPT_SEGMENT_NAME,
-        "FUT": FUT_SEGMENT_NAME,
-        "FUTURE": FUT_SEGMENT_NAME,
-        "FUTURES": FUT_SEGMENT_NAME,
-        "FUT_TICK": FUT_SEGMENT_NAME,
-        "IDX": IDX_SEGMENT_NAME,
-        "INDEX": IDX_SEGMENT_NAME,
-        "INDICES": IDX_SEGMENT_NAME,
-        "IDX_TICK": IDX_SEGMENT_NAME,
-    }
-
-    try:
-        return mapping[normalized]
-    except KeyError as exc:
-        raise ValueError(
-            f"Unsupported segment: {segment!r}. Use OPT, FUT or IDX."
-        ) from exc
-
-
-# =========================================================
 # GENERAL SETTINGS
 # =========================================================
 
@@ -198,6 +55,26 @@ CANDLE_INTERVAL_MINUTES = int(
 
 WEEK_START = int(os.getenv("WEEK_START", "1"))
 WEEK_END = int(os.getenv("WEEK_END", "999"))
+
+# Historical-data directory layout.
+#
+# segment_date (recommended):
+#   <week>/OPT_TICK/<YYYYMMDD>/...
+#   <week>/FUT_TICK/<YYYYMMDD>/...
+#   <week>/IDX_TICK/<YYYYMMDD>/...
+#
+# date_segment (legacy):
+#   <week>/<YYYYMMDD>/OPT_TICK/...
+#
+# flat (legacy):
+#   <week>/OPT_TICK/...
+DATA_LAYOUT = os.getenv("DATA_LAYOUT", "segment_date").strip().lower()
+SUPPORTED_DATA_LAYOUTS = {"segment_date", "date_segment", "flat"}
+
+OPT_SEGMENT_NAME = os.getenv("OPT_SEGMENT_NAME", "OPT_TICK").strip() or "OPT_TICK"
+FUT_SEGMENT_NAME = os.getenv("FUT_SEGMENT_NAME", "FUT_TICK").strip() or "FUT_TICK"
+IDX_SEGMENT_NAME = os.getenv("IDX_SEGMENT_NAME", "IDX_TICK").strip() or "IDX_TICK"
+DATE_FOLDER_FORMAT = "%Y%m%d"
 
 
 # =========================================================
@@ -234,12 +111,6 @@ def validate_configuration(
     the VM data directories to exist.
     """
 
-    if DATA_LAYOUT not in SUPPORTED_DATA_LAYOUTS:
-        raise ValueError(
-            "Invalid DATA_LAYOUT configuration: "
-            f"{DATA_LAYOUT!r}"
-        )
-
     if CHUNK_SIZE <= 0:
         raise ValueError("CHUNK_SIZE must be greater than zero.")
 
@@ -254,6 +125,12 @@ def validate_configuration(
     if WEEK_END < WEEK_START:
         raise ValueError(
             "WEEK_END must be greater than or equal to WEEK_START."
+        )
+
+    if DATA_LAYOUT not in SUPPORTED_DATA_LAYOUTS:
+        raise ValueError(
+            "DATA_LAYOUT must be one of "
+            f"{sorted(SUPPORTED_DATA_LAYOUTS)}. Received: {DATA_LAYOUT!r}"
         )
 
     if SESSION_START >= SESSION_END:
@@ -656,12 +533,12 @@ def get_dataset_config(
         return {
             "instrument": "NIFTY",
             "symbol": "NIFTY",
-            "base_path": str(PARQUET_BASE_PATH),
-            "option_base_path": str(OPTION_PARQUET_BASE_PATH),
             "data_layout": DATA_LAYOUT,
             "opt_segment_name": OPT_SEGMENT_NAME,
             "fut_segment_name": FUT_SEGMENT_NAME,
             "idx_segment_name": IDX_SEGMENT_NAME,
+            "base_path": str(PARQUET_BASE_PATH),
+            "option_base_path": str(OPTION_PARQUET_BASE_PATH),
             "idx_zip_prefix": "NIFTY",
             "opt_zip_prefix": "NIFTY",
             "zip_member": "NIFTY.parquet",
@@ -676,12 +553,12 @@ def get_dataset_config(
         return {
             "instrument": "SENSEX",
             "symbol": "SENSEX",
-            "base_path": str(PARQUET_BASE_PATH),
-            "option_base_path": str(OPTION_PARQUET_BASE_PATH),
             "data_layout": DATA_LAYOUT,
             "opt_segment_name": OPT_SEGMENT_NAME,
             "fut_segment_name": FUT_SEGMENT_NAME,
             "idx_segment_name": IDX_SEGMENT_NAME,
+            "base_path": str(PARQUET_BASE_PATH),
+            "option_base_path": str(OPTION_PARQUET_BASE_PATH),
             "idx_zip_prefix": "SENSEX",
             "opt_zip_prefix": "SENSEX",
             "zip_member": "SENSEX.parquet",
@@ -700,12 +577,12 @@ def get_dataset_config(
         return {
             "instrument": "BANKNIFTY",
             "symbol": "BANKNIFTY",
-            "base_path": str(PARQUET_BASE_PATH),
-            "option_base_path": str(OPTION_PARQUET_BASE_PATH),
             "data_layout": DATA_LAYOUT,
             "opt_segment_name": OPT_SEGMENT_NAME,
             "fut_segment_name": FUT_SEGMENT_NAME,
             "idx_segment_name": IDX_SEGMENT_NAME,
+            "base_path": str(PARQUET_BASE_PATH),
+            "option_base_path": str(OPTION_PARQUET_BASE_PATH),
             "idx_zip_prefix": "BANKNIFTY",
             "opt_zip_prefix": "BANKNIFTY",
             "zip_member": "BANKNIFTY.parquet",
