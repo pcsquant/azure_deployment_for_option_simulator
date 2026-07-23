@@ -113,17 +113,37 @@ def _join_storage_path(*parts):
 
 def _get_idx_folder(week_folder, date_str=None):
     if STORAGE_MODE == "blob":
-        return _join_storage_path(week_folder, "IDX_TICK")
+        return _join_storage_path(week_folder, date_str, "IDX_TICK") if date_str else _join_storage_path(week_folder, "IDX_TICK")
 
+    if date_str:
+        candidate = os.path.join(week_folder, str(date_str), "IDX_TICK")
+        if os.path.isdir(candidate):
+            return candidate
     folder = os.path.join(week_folder, "IDX_TICK")
     return folder if os.path.isdir(folder) else week_folder
 
 
 def _get_opt_folder(week_folder, date_str=None):
     if STORAGE_MODE == "blob":
-        return _join_storage_path(week_folder, "OPT_TICK")
+        return _join_storage_path(week_folder, date_str, "OPT_TICK") if date_str else _join_storage_path(week_folder, "OPT_TICK")
 
+    if date_str:
+        candidate = os.path.join(week_folder, str(date_str), "OPT_TICK")
+        if os.path.isdir(candidate):
+            return candidate
     folder = os.path.join(week_folder, "OPT_TICK")
+    return folder if os.path.isdir(folder) else week_folder
+
+
+def _get_fut_folder(week_folder, date_str=None):
+    if STORAGE_MODE == "blob":
+        return _join_storage_path(week_folder, date_str, "FUT_TICK") if date_str else _join_storage_path(week_folder, "FUT_TICK")
+
+    if date_str:
+        candidate = os.path.join(week_folder, str(date_str), "FUT_TICK")
+        if os.path.isdir(candidate):
+            return candidate
+    folder = os.path.join(week_folder, "FUT_TICK")
     return folder if os.path.isdir(folder) else week_folder
 
 
@@ -540,8 +560,8 @@ CONSOLIDATED_SCHEMA_VERSION = 2
 
 
 def consolidated_chain_folder(week_folder, date_str):
-    return _resolve_option_week_folder(week_folder)
-
+    option_week_folder = _resolve_option_week_folder(week_folder)
+    return _get_opt_folder(option_week_folder, date_str)
 
 
 def consolidated_chain_path(
@@ -550,24 +570,14 @@ def consolidated_chain_path(
     expiry_str,
     instrument="NIFTY",
 ):
-    """Return the consolidated option-chain path or blob name."""
+    """Return <week>/<date>/OPT_TICK/<SYMBOL>.parquet."""
     cfg = get_dataset_config(instrument)
     symbol = str(cfg["symbol"]).upper()
-    option_week_folder = _resolve_option_week_folder(week_folder)
-    filename = f"{symbol}_{expiry_str}.parquet"
-
+    option_folder = consolidated_chain_folder(week_folder, date_str)
+    filename = f"{symbol}.parquet"
     if STORAGE_MODE == "blob":
-        return _join_storage_path(
-            option_week_folder,
-            "OPT_TICK",
-            filename,
-        )
-
-    return os.path.join(
-        option_week_folder,
-        "OPT_TICK",
-        filename,
-    )
+        return _join_storage_path(option_folder, filename)
+    return os.path.join(option_folder, filename)
 
 
 _OPTION_CHAIN_CACHE = {}
@@ -1694,7 +1704,6 @@ def load_future_data_for_date(
         )
 
 
-cat >> data_engine_for_simulation.py <<'PY'
 
 
 def get_option_chain_snapshot(
@@ -1831,4 +1840,33 @@ def get_option_chain_snapshot(
         :,
         ["timestamp", "strike", "ce", "pe"],
     ]
-PY
+
+
+def runtime_cache_stats():
+    return {
+        "storage_mode": STORAGE_MODE,
+        "raw_parquet_cache": len(RAW_PARQUET_CACHE),
+        "option_chain_cache": len(_OPTION_CHAIN_CACHE),
+        "path_cache": len(PARQUET_FILE_PATH_CACHE),
+        "contract_cache": len(OPTION_CONTRACT_CACHE),
+    }
+
+
+def clear_runtime_caches(clear_disk_option_cache=False):
+    RAW_PARQUET_CACHE.clear()
+    PARQUET_FILE_PATH_CACHE.clear()
+    OPTION_PARQUET_CACHE.clear()
+    OPTION_CONTRACT_CACHE.clear()
+    OPTION_WEEK_FOLDER_CACHE.clear()
+    with _OPTION_CHAIN_CACHE_LOCK:
+        _OPTION_CHAIN_CACHE.clear()
+    with _OPTION_CONTRACT_INDEX_CACHE_LOCK:
+        _OPTION_CONTRACT_INDEX_CACHE.clear()
+    with _WEEK_DATES_CACHE_LOCK:
+        _WEEK_DATES_CACHE.clear()
+    if clear_disk_option_cache and os.path.isdir(SHARED_OPTION_CACHE_DIR):
+        for item in Path(SHARED_OPTION_CACHE_DIR).glob("*.parquet"):
+            try:
+                item.unlink()
+            except OSError:
+                logger.warning("Unable to delete cache file %s", item)
