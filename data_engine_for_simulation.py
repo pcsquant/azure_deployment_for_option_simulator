@@ -1,6 +1,7 @@
 
 
 import hashlib
+import io
 import logging
 import os
 import re
@@ -30,7 +31,7 @@ try:
         IDX_SEGMENT_NAME,
     )
 except ImportError:
-    DATA_LAYOUT = "segment_date"
+    DATA_LAYOUT = "date_segment"
     OPT_SEGMENT_NAME = "OPT_TICK"
     FUT_SEGMENT_NAME = "FUT_TICK"
     IDX_SEGMENT_NAME = "IDX_TICK"
@@ -186,48 +187,17 @@ def _join_storage_path(*parts):
 
 
 def _segment_folder_candidates(week_folder, segment_name, date_str=None):
-    """Return production-first and backward-compatible folder candidates."""
-    week_value = str(week_folder)
-    date_value = str(date_str).strip() if date_str else None
-
+    """Return the strict week-166 date-first segment folder."""
+    if not date_str:
+        raise ValueError("date_str is required for date_segment layout")
+    date_value = str(date_str).strip()
+    if not re.fullmatch(r"\d{8}", date_value):
+        raise ValueError(f"date_str must be YYYYMMDD, got {date_str!r}")
     if STORAGE_MODE == "blob":
-        week_value = week_value.replace("\\", "/").strip("/")
-        candidates = []
-        if date_value:
-            preferred = (
-                _join_storage_path(week_value, date_value, segment_name)
-                if DATA_LAYOUT == "date_segment"
-                else _join_storage_path(week_value, segment_name, date_value)
-            )
-            candidates.extend([
-                preferred,
-                _join_storage_path(week_value, segment_name, date_value),
-                _join_storage_path(week_value, date_value, segment_name),
-            ])
-        candidates.extend([
-            _join_storage_path(week_value, segment_name),
-            week_value,
-        ])
-    else:
-        week_value = os.path.abspath(os.path.expanduser(week_value))
-        candidates = []
-        if date_value:
-            preferred = (
-                os.path.join(week_value, date_value, segment_name)
-                if DATA_LAYOUT == "date_segment"
-                else os.path.join(week_value, segment_name, date_value)
-            )
-            candidates.extend([
-                preferred,
-                os.path.join(week_value, segment_name, date_value),
-                os.path.join(week_value, date_value, segment_name),
-            ])
-        candidates.extend([
-            os.path.join(week_value, segment_name),
-            week_value,
-        ])
-
-    return list(dict.fromkeys(str(candidate) for candidate in candidates))
+        week_value = str(week_folder).replace("\\", "/").strip("/")
+        return [_join_storage_path(week_value, date_value, segment_name)]
+    week_value = os.path.abspath(os.path.expanduser(str(week_folder)))
+    return [os.path.join(week_value, date_value, segment_name)]
 
 
 def _resolve_segment_folder(week_folder, segment_name, date_str=None):
@@ -434,48 +404,72 @@ OPTION_WEEK_FOLDER_CACHE = {}
 
 
 def _resolve_option_week_folder(week_folder):
-    week_folder = str(week_folder).replace("\\", "/").strip("/")
+    if STORAGE_MODE == "blob":
+        return str(week_folder).replace("\\", "/").strip("/")
+    return os.path.abspath(os.path.expanduser(str(week_folder)))
+
+
+# =========================================================
+# MARKET FILE READER (PARQUET + CSV)
+# =========================================================
+
+def _read_market_file(path, columns=None):
+    """Read Parquet market data from Azure Blob or local storage."""
+    path = str(path)
+    if Path(path.split("?", 1)[0]).suffix.lower() != ".parquet":
+        raise ValueError(f"Only Parquet files are supported: {path}")
+    if STORAGE_MODE == "blob":
+        return read_parquet_blob(path, columns=columns)
+    return pd.read_parquet(os.path.abspath(path), columns=columns)
+
+
+def _find_market_file(folder, filenames):
+    """Find a Parquet file under a local folder or Blob prefix."""
+    if isinstance(filenames, str):
+        filenames = [filenames]
+
+    wanted = {
+        str(name).replace("\\", "/").rsplit("/", 1)[-1].lower()
+        for name in filenames
+        if name
+    }
+    if not wanted:
+        return None
+
+    normalized_folder = str(folder).replace("\\", "/").strip("/")
 
     if STORAGE_MODE == "blob":
-        return week_folder
+        try:
+            for blob_name in list_blob_names(normalized_folder):
+                filename = str(blob_name).replace("\\", "/").rsplit("/", 1)[-1]
+                if filename.lower() in wanted:
+                    return str(blob_name)
+        except Exception as exc:
+            logger.warning(
+                "Unable to search market files under %s: %s",
+                normalized_folder,
+                exc,
+            )
+        return None
 
-    week_folder_key = os.path.abspath(week_folder)
+    local_folder = os.path.abspath(os.path.expanduser(normalized_folder))
+    if not os.path.isdir(local_folder):
+        return None
 
-    cached = OPTION_WEEK_FOLDER_CACHE.get(week_folder_key)
-    if cached is not None:
-        return cached
+    for root, _, files in os.walk(local_folder):
+        for filename in files:
+            if filename.lower() in wanted:
+                return os.path.join(root, filename)
+    return None
 
-    week_name = os.path.basename(
-        os.path.normpath(week_folder)
+
+def _candidate_segment_folders(week_folder, segment_name, date_str=None):
+    """Return every supported week-166/legacy folder candidate."""
+    return _segment_folder_candidates(
+        week_folder=week_folder,
+        segment_name=segment_name,
+        date_str=date_str,
     )
-
-    candidates = [
-        week_name,
-        week_name.replace(" - PARQUET", " - TICK"),
-        week_name.replace("- PARQUET", "- TICK"),
-        week_name.replace("PARQUET", "TICK"),
-    ]
-
-    for name in candidates:
-        option_folder = os.path.join(
-            OPTION_PARQUET_BASE_PATH,
-            name,
-        )
-
-        if os.path.isdir(option_folder):
-            OPTION_WEEK_FOLDER_CACHE[
-                week_folder_key
-            ] = option_folder
-
-            return option_folder
-
-    fallback = week_folder
-
-    OPTION_WEEK_FOLDER_CACHE[
-        week_folder_key
-    ] = fallback
-
-    return fallback
 
 # =========================================================
 # PARQUET READER
@@ -493,11 +487,7 @@ def _read_parquet_normalized(path, mode="spot"):
         # columns as read-only; make a deep copy only before destructive mutation.
         return cached.copy(deep=False)
 
-    if STORAGE_MODE == "blob":
-        df = read_parquet_blob(path)
-    else:
-        path = os.path.abspath(path)
-        df = pd.read_parquet(path)
+    df = _read_market_file(path)
 
     lower_cols = {str(c).lower(): c for c in df.columns}
 
@@ -578,98 +568,40 @@ def _read_parquet_normalized(path, mode="spot"):
 # =========================================================
 
 def load_tick_data(folder_or_path, instrument="NIFTY"):
-    cfg = get_dataset_config(instrument)
-
+    """Load spot data from a direct Parquet file path."""
     if not is_path_allowed(folder_or_path, instrument):
         raise PermissionError(f"Access denied: {folder_or_path}")
-
-    if os.path.isfile(folder_or_path) and str(folder_or_path).lower().endswith(".parquet"):
-        return _read_parquet_normalized(folder_or_path, mode="spot")
-
     input_path = str(folder_or_path)
-
-    if input_path.lower().endswith(".zip"):
-        week_folder = os.path.dirname(input_path)
-    elif os.path.isfile(input_path):
-        week_folder = os.path.dirname(input_path)
-    else:
-        week_folder = input_path
-
-    date_str = _extract_date_from_text(input_path)
-
-    idx_folder = _get_idx_folder(week_folder, date_str)
-
-    if not date_str:
-        possible_names = [
-            cfg.get("zip_member", f"{cfg['symbol']}.parquet").replace(".csv", ".parquet"),
-            cfg["symbol"],
-            f"{cfg['symbol']}.parquet",
-        ]
-
-        for name in possible_names:
-            path = _find_parquet_file(idx_folder, name)
-            if path:
-                return _read_parquet_normalized(path, mode="spot")
-
-        if os.path.isdir(idx_folder):
-            for root, _, files in os.walk(idx_folder):
-                for f in files:
-                    if os.path.splitext(f)[0].upper() == cfg["symbol"]:
-                        return _read_parquet_normalized(os.path.join(root, f), mode="spot")
-
+    if not input_path.lower().endswith(".parquet"):
         return pd.DataFrame(columns=["datetime", "value"])
-
-    possible_names = [
-        f"{cfg['idx_zip_prefix']}{date_str}.parquet",
-        f"{cfg['symbol']}{date_str}.parquet",
-        f"{date_str}.parquet",
-        cfg.get("zip_member", f"{cfg['symbol']}.parquet").replace(".csv", ".parquet"),
-        cfg["symbol"],
-        f"{cfg['symbol']}.parquet",
-    ]
-
-    for name in possible_names:
-        path = _find_parquet_file(idx_folder, name)
-        if path:
-            return _read_parquet_normalized(path, mode="spot")
-
-    if os.path.isdir(idx_folder):
-        for root, _, files in os.walk(idx_folder):
-            for f in files:
-                if os.path.splitext(f)[0].upper() == cfg["symbol"]:
-                    return _read_parquet_normalized(os.path.join(root, f), mode="spot")
-
-    return pd.DataFrame(columns=["datetime", "value"])
+    if STORAGE_MODE == "local" and not os.path.isfile(input_path):
+        return pd.DataFrame(columns=["datetime", "value"])
+    return _read_parquet_normalized(input_path, mode="spot")
 
 
-def load_index_data_by_symbol(
-    folder,
-    date_str,
-    symbol_name="INDIAVIX",
-):
-    idx_folder = _get_idx_folder(folder, date_str)
+def load_index_data_by_symbol(folder, date_str, symbol_name="INDIAVIX"):
+    """Load <week>/<YYYYMMDD>/IDX_TICK/<SYMBOL>.parquet."""
     symbol_name = str(symbol_name).upper().strip()
-
-    possible_names = [
-        symbol_name,
-        f"{symbol_name}.parquet",
-    ]
-
-    for filename in possible_names:
-        path = _find_parquet_file(
-            idx_folder,
-            filename,
-        )
-
-        if path:
-            return _read_parquet_normalized(
-                path,
-                mode="spot",
-            )
-
-    return pd.DataFrame(
-        columns=["datetime", "value"]
-    )
+    date_value = str(date_str).strip()
+    idx_folder = _get_idx_folder(folder, date_value)
+    filename = f"{symbol_name}.parquet"
+    path = _join_storage_path(idx_folder, filename) if STORAGE_MODE == "blob" else os.path.join(idx_folder, filename)
+    try:
+        exists = blob_exists(path) if STORAGE_MODE == "blob" else os.path.isfile(path)
+    except Exception as exc:
+        logger.exception("Unable to check index file %s: %s", path, exc)
+        exists = False
+    if not exists:
+        logger.warning("Index Parquet not found: %s", path)
+        return pd.DataFrame(columns=["datetime", "value"])
+    try:
+        frame = _read_parquet_normalized(path, mode="spot")
+    except Exception as exc:
+        logger.exception("Unable to read index Parquet %s: %s", path, exc)
+        return pd.DataFrame(columns=["datetime", "value"])
+    if frame.empty:
+        return frame
+    return frame[frame["datetime"].dt.strftime("%Y%m%d") == date_value].reset_index(drop=True)
 
 
 # =========================================================
@@ -985,10 +917,7 @@ def load_required_option_data_for_date(
         # -----------------------------------------------------
 
         try:
-            if STORAGE_MODE == "blob":
-                df = read_parquet_blob(matched_path)
-            else:
-                df = pd.read_parquet(matched_path)
+            df = _read_market_file(matched_path)
 
         except Exception as exc:
             print(
@@ -1185,8 +1114,11 @@ def create_candles(tick_df, interval_minutes):
     """Create session-aligned OHLC candles without copying unrelated columns."""
     if tick_df is None or tick_df.empty:
         return pd.DataFrame(columns=["open", "high", "low", "close"])
-    if "datetime" not in tick_df.columns or "value" not in tick_df.columns:
-        raise ValueError("tick_df must contain 'datetime' and 'value' columns")
+    if "datetime" not in tick_df.columns:
+        raise ValueError("tick_df must contain a 'datetime' column")
+    value_column = "value" if "value" in tick_df.columns else "price" if "price" in tick_df.columns else None
+    if value_column is None:
+        raise ValueError("tick_df must contain either 'value' or 'price'")
 
     interval = int(interval_minutes)
     if interval <= 0 or interval > 1440:
@@ -1194,7 +1126,7 @@ def create_candles(tick_df, interval_minutes):
 
     df = pd.DataFrame({
         "datetime": pd.to_datetime(tick_df["datetime"], errors="coerce"),
-        "value": pd.to_numeric(tick_df["value"], errors="coerce"),
+        "value": pd.to_numeric(tick_df[value_column], errors="coerce"),
     }).dropna(subset=["datetime", "value"])
     if df.empty:
         return pd.DataFrame(columns=["open", "high", "low", "close"])
@@ -1310,187 +1242,38 @@ def _dates_from_frame(d: "pd.DataFrame | None") -> set:
     return dates
 
 
-def get_dates_for_week_folder(
-    week_number,
-    folder,
-    instrument="NIFTY",
-):
+def get_dates_for_week_folder(week_number, folder, instrument="NIFTY"):
+    """Discover YYYYMMDD folders directly under the week folder."""
+    del week_number, instrument
+    prefix = str(folder).replace("\\", "/").strip("/")
+    cache_key = (prefix, "date_segment")
+    with _WEEK_DATES_CACHE_LOCK:
+        cached = _WEEK_DATES_CACHE.get(cache_key)
+    if cached is not None:
+        return list(cached)
     dates = set()
-
     if STORAGE_MODE == "blob":
-        prefix = str(folder).replace("\\", "/").strip("/")
-        cache_key = (prefix, str(instrument).upper())
-
-        with _WEEK_DATES_CACHE_LOCK:
-            cached = _WEEK_DATES_CACHE.get(cache_key)
-
-        if cached is not None:
-            return list(cached)
-
-        cfg = get_dataset_config(instrument)
-
-        # -----------------------------------------------------
-        # 1. Read the trading dates from the index parquet
-        #    (IDX_TICK/<SYMBOL>.parquet). Blob names in this
-        #    layout carry no YYYYMMDD tokens, so the old
-        #    filename-regex approach matched garbage digits from
-        #    contract names (expiry+strike) instead of dates.
-        # -----------------------------------------------------
-
-        idx_prefix = _get_idx_folder(
-            prefix,
-            None,
-        )
-
-        idx_blob = None
-        for candidate in (
-            f"{cfg['symbol']}.parquet",
-            str(cfg["symbol"]),
-            cfg.get("zip_member", f"{cfg['symbol']}.parquet").replace(
-                ".csv", ".parquet"
-            ),
-        ):
-            try:
-                idx_blob = find_blob_by_filename(
-                    prefix=idx_prefix,
-                    filename=candidate,
-                )
-            except Exception:
-                idx_blob = None
-
-            if idx_blob:
-                break
-
-        if idx_blob:
-            # Try a cheap projected read of just the date column first.
-            try:
-                d = read_parquet_blob(idx_blob, columns=["date"])
-                dates.update(_dates_from_frame(d))
-            except Exception:
-                pass
-
-            # Fall back to a full read if the file has no plain
-            # `date` column (e.g. datetime-only schema).
-            if not dates:
-                try:
-                    d = read_parquet_blob(idx_blob)
-                    dates.update(_dates_from_frame(d))
-                except Exception as exc:
-                    logger.warning(
-                        "Unable to read index blob %s for dates: %s",
-                        idx_blob,
-                        exc,
-                    )
-
-        # -----------------------------------------------------
-        # 2. Fallback: date-stamped folder names in blob paths
-        #    (e.g. NSE_OPT_TICK_20260702/...). Only accept
-        #    8-digit runs that parse as real calendar dates so
-        #    contract digits like 26063043000 are rejected.
-        # -----------------------------------------------------
-
-        if not dates:
-            try:
-                for blob_name in list_blob_names(prefix):
-                    for token in re.findall(r"(?<!\d)(\d{8})(?!\d)", str(blob_name)):
-                        parsed = pd.to_datetime(
-                            token, format="%Y%m%d", errors="coerce"
-                        )
-                        if pd.notna(parsed) and 2000 <= parsed.year <= 2100:
-                            dates.add(token)
-            except Exception as exc:
-                logger.warning(
-                    "Blob-name date fallback failed for %s: %s",
-                    prefix,
-                    exc,
-                )
-
-        result = sorted(dates)
-
-        with _WEEK_DATES_CACHE_LOCK:
-            _WEEK_DATES_CACHE[cache_key] = list(result)
-
-        return result
-
-
-    # 1. Old structure: folders with date in name
-    for name in os.listdir(folder):
-        path = os.path.join(folder, name)
-
-        if os.path.isdir(path):
-            date_str = _extract_date_from_text(name)
-            if date_str:
-                dates.add(date_str)
-
-    if dates:
-        return sorted(dates)
-
-    # 2. New structure:
-    # week_folder/
-    #   OPT_TICK/
-    #   IDX_TICK/
-    opt_folder = _get_opt_folder(folder, None)
-
-    if os.path.isdir(opt_folder):
-        for root, _, files in os.walk(opt_folder):
-            for file in files:
-                path = os.path.join(root, file)
-
-                try:
-                    d = pd.read_parquet(path, columns=["date"])
-
-                    if not d.empty:
-                        dates.update(
-                            d["date"]
-                            .dropna()
-                            .astype("int64")
-                            .astype(str)
-                            .unique()
-                            .tolist()
-                        )
-
-                        # Once dates found, enough for this week
-                        if dates:
-                            return sorted(dates)
-
-                except Exception:
-                    continue
-
-    # 3. Fallback: read IDX_TICK/NIFTY
-    idx_folder = _get_idx_folder(folder, None)
-
-    if os.path.isdir(idx_folder):
-        cfg = get_dataset_config(instrument)
-
-        possible_names = [
-            cfg["symbol"],
-            f"{cfg['symbol']}.parquet",
-            cfg.get("zip_member", f"{cfg['symbol']}.parquet").replace(".csv", ".parquet"),
-        ]
-
-        for name in possible_names:
-            path = _find_parquet_file(idx_folder, name)
-
-            if path:
-                try:
-                    d = pd.read_parquet(path, columns=["date"])
-
-                    if not d.empty:
-                        dates.update(
-                            d["date"]
-                            .dropna()
-                            .astype("int64")
-                            .astype(str)
-                            .unique()
-                            .tolist()
-                        )
-                        return sorted(dates)
-
-                except Exception:
-                    continue
-
-    return sorted(dates)
-
+        try:
+            for blob_name in list_blob_names(prefix):
+                relative = str(blob_name).replace("\\", "/")
+                if relative.startswith(prefix + "/"):
+                    relative = relative[len(prefix)+1:]
+                first = relative.split("/",1)[0]
+                if re.fullmatch(r"\d{8}", first) and pd.notna(pd.to_datetime(first, format="%Y%m%d", errors="coerce")):
+                    dates.add(first)
+        except Exception as exc:
+            logger.exception("Unable to discover date folders under %s: %s", prefix, exc)
+    else:
+        local = os.path.abspath(os.path.expanduser(str(folder)))
+        if os.path.isdir(local):
+            for name in os.listdir(local):
+                if re.fullmatch(r"\d{8}", name) and os.path.isdir(os.path.join(local,name)):
+                    if pd.notna(pd.to_datetime(name, format="%Y%m%d", errors="coerce")):
+                        dates.add(name)
+    result = sorted(dates)
+    with _WEEK_DATES_CACHE_LOCK:
+        _WEEK_DATES_CACHE[cache_key] = list(result)
+    return result
 
 
 def get_option_chain_snapshot(
@@ -1615,6 +1398,7 @@ def runtime_cache_stats() -> dict:
         week_date_entries = len(_WEEK_DATES_CACHE)
     return {
         "storage_mode": STORAGE_MODE,
+        "data_layout": DATA_LAYOUT,
         "raw_parquet": RAW_PARQUET_CACHE.stats(),
         "option_chain": _OPTION_CHAIN_CACHE.stats(),
         "path_cache_entries": len(PARQUET_FILE_PATH_CACHE),
@@ -1675,170 +1459,45 @@ def _export_dataframe(df, output_path, output_format="parquet"):
 # =========================================================
 
 
-def load_future_data_for_date(
-    folder,
-    date_str,
-    month="current",
-    instrument="NIFTY",
-):
-    """Load the selected futures contract from local or Azure Blob storage."""
+def load_future_data_for_date(folder, date_str, month="current", instrument="NIFTY"):
+    """Load <week>/<YYYYMMDD>/FUT_TICK/<CONTRACT>.parquet."""
     cfg = get_dataset_config(instrument)
-
     if not is_path_allowed(folder, instrument):
         raise PermissionError(f"Access denied: {folder}")
-
     symbol = str(cfg["symbol"]).upper()
-    month = str(month or "current").strip().lower()
-    month = month.replace("-", "_").replace(" ", "_")
-
-    primary_future_folder = _get_fut_folder(folder, date_str)
-
+    date_value = str(date_str).strip()
+    month_value = str(month or "current").strip().lower().replace("-", "_").replace(" ", "_")
+    future_folder = _get_fut_folder(folder, date_value)
     if STORAGE_MODE == "blob":
-        candidate_folders = [
-            primary_future_folder,
-            _join_storage_path(folder, FUT_SEGMENT_NAME, date_str),
-            _join_storage_path(folder, date_str, FUT_SEGMENT_NAME),
-            _join_storage_path(
-                folder,
-                f"NSE_FUT_TICK_{date_str}",
-                "Contract Futures",
-            ),
-            _join_storage_path(folder, f"NSE_FUT_TICK_{date_str}"),
-            str(folder).replace("\\", "/").strip("/"),
-        ]
+        try:
+            paths = list_blob_names(str(future_folder).replace("\\", "/").strip("/"))
+        except Exception as exc:
+            logger.exception("Unable to list futures under %s: %s", future_folder, exc)
+            paths = []
     else:
-        candidate_folders = [
-            primary_future_folder,
-            os.path.join(folder, FUT_SEGMENT_NAME, date_str),
-            os.path.join(folder, date_str, FUT_SEGMENT_NAME),
-            os.path.join(
-                folder,
-                f"NSE_FUT_TICK_{date_str}",
-                "Contract Futures",
-            ),
-            os.path.join(folder, f"NSE_FUT_TICK_{date_str}"),
-            folder,
-        ]
-
-    candidate_folders = list(dict.fromkeys(str(x) for x in candidate_folders))
-
-    pattern = re.compile(
-        rf"^{re.escape(symbol)}\d{{2}}"
-        r"(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)"
-        r"FUT$",
-        re.IGNORECASE,
-    )
-
-    future_files = []
-    seen_paths = set()
-
-    for search_folder in candidate_folders:
-        if STORAGE_MODE == "blob":
-            paths = list_blob_names(search_folder)
-        else:
-            if not os.path.isdir(search_folder):
-                continue
-
-            paths = (
-                os.path.join(root, filename)
-                for root, _, files in os.walk(search_folder)
-                for filename in files
-            )
-
-        for file_path in paths:
-            file_path = str(file_path)
-
-            if file_path in seen_paths:
-                continue
-            seen_paths.add(file_path)
-
-            filename = (
-                file_path
-                .replace("\\", "/")
-                .rsplit("/", 1)[-1]
-            )
-
-            if not filename.lower().endswith(".parquet"):
-                continue
-
-            base_name = os.path.splitext(filename)[0].upper()
-
-            if pattern.match(base_name):
-                future_files.append((base_name, file_path))
-
-    if not future_files:
-        print(
-            f"No future files found for {symbol} in {folder}",
-            flush=True,
-        )
-        return pd.DataFrame(
-            columns=["datetime", "price", "volume"]
-        )
-
-    month_order = {
-        "JAN": 1,
-        "FEB": 2,
-        "MAR": 3,
-        "APR": 4,
-        "MAY": 5,
-        "JUN": 6,
-        "JUL": 7,
-        "AUG": 8,
-        "SEP": 9,
-        "OCT": 10,
-        "NOV": 11,
-        "DEC": 12,
-    }
-
-    def get_month_rank(file_name):
-        file_name = str(file_name).upper()
-
-        for mon, rank in month_order.items():
-            if f"{mon}FUT" in file_name:
-                return rank
-
-        return 999
-
-    future_files.sort(key=lambda item: get_month_rank(item[0]))
-
-    if month in {
-        "current",
-        "this_month",
-        "current_month",
-        "near",
-        "nearby",
-    }:
-        selected_index = 0
-    elif month in {"next", "next_month"}:
-        selected_index = 1
-    elif month in {
-        "far",
-        "far_month",
-        "next_to_next",
-        "next_to_next_month",
-    }:
-        selected_index = 2
-    else:
-        selected_index = 0
-
-    selected_index = min(
-        selected_index,
-        len(future_files) - 1,
-    )
-    selected = future_files[selected_index][1]
-
-    logger.info("Using future file: %s", selected)
-
+        paths = [] if not os.path.isdir(future_folder) else (os.path.join(root,f) for root,_,files in os.walk(future_folder) for f in files)
+    pattern = re.compile(rf"^{re.escape(symbol)}\d{{2}}(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)FUT$", re.I)
+    files=[]
+    for p in paths:
+        p=str(p); name=p.replace("\\", "/").rsplit("/",1)[-1]
+        if not name.lower().endswith(".parquet"):
+            continue
+        base=os.path.splitext(name)[0].upper()
+        if pattern.fullmatch(base):
+            files.append((base,p))
+    if not files:
+        return pd.DataFrame(columns=["datetime","price","volume"])
+    order={m:i+1 for i,m in enumerate(["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"])}
+    def rank(name):
+        return next((v for m,v in order.items() if f"{m}FUT" in name),999)
+    files.sort(key=lambda x: rank(x[0]))
+    idx=0 if month_value in {"current","this_month","current_month","near","nearby"} else 1 if month_value in {"next","next_month"} else 2 if month_value in {"far","far_month","next_to_next","next_to_next_month"} else 0
+    selected=files[min(idx,len(files)-1)][1]
     try:
-        return _read_parquet_normalized(
-            selected,
-            mode="option",
-        )
+        frame=_read_parquet_normalized(selected, mode="option")
     except Exception as exc:
-        print(
-            f"Unable to read future file {selected}: {exc}",
-            flush=True,
-        )
-        return pd.DataFrame(
-            columns=["datetime", "price", "volume"]
-        )
+        logger.exception("Unable to read futures Parquet %s: %s", selected, exc)
+        return pd.DataFrame(columns=["datetime","price","volume"])
+    if frame.empty:
+        return frame
+    return frame[frame["datetime"].dt.strftime("%Y%m%d") == date_value].reset_index(drop=True)
