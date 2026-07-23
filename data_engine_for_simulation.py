@@ -1493,3 +1493,117 @@ def clear_runtime_caches(clear_disk_option_cache=False):
                 item.unlink()
             except OSError:
                 logger.warning("Unable to delete cache file %s", item)
+
+def load_raw_option_contract_ticks(
+    folder: str,
+    date_str: str,
+    expiry_str: str,
+    strike: int,
+    option_type: str,
+    instrument: str = "NIFTY",
+) -> pd.DataFrame:
+    instrument = str(instrument).upper().strip()
+    option_type = str(option_type).upper().strip()
+    date_str = str(date_str).replace("-", "").strip()
+    expiry_str = str(expiry_str).strip()
+    strike = int(strike)
+
+    if option_type not in {"CE", "PE"}:
+        raise ValueError("option_type must be CE or PE")
+
+    # This must return the complete raw NIFTY.parquet DataFrame,
+    # not the normalized or pivoted option chain.
+    source = _load_consolidated_option_source(
+        folder=folder,
+        date_str=date_str,
+        instrument=instrument,
+    )
+
+    if source is None or source.empty:
+        return pd.DataFrame(
+            columns=[
+                "datetime",
+                "price",
+                "volume",
+                "oi",
+                "contract_name",
+            ]
+        )
+
+    contract_name = (
+        f"{instrument}"
+        f"{expiry_str}"
+        f"{strike}"
+        f"{option_type}"
+    )
+
+    contract_series = (
+        source["contract_name"]
+        .astype(str)
+        .str.upper()
+        .str.strip()
+    )
+
+    frame = source.loc[
+        contract_series == contract_name
+    ].copy()
+
+    if frame.empty:
+        return pd.DataFrame(
+            columns=[
+                "datetime",
+                "price",
+                "volume",
+                "oi",
+                "contract_name",
+            ]
+        )
+
+    date_part = (
+        frame["date"]
+        .astype(str)
+        .str.replace(r"\D", "", regex=True)
+    )
+
+    time_part = (
+        frame["time"]
+        .astype(str)
+        .str.strip()
+    )
+
+    frame["datetime"] = pd.to_datetime(
+        date_part + " " + time_part,
+        errors="coerce",
+    )
+
+    frame["price"] = pd.to_numeric(
+        frame["price"],
+        errors="coerce",
+    )
+
+    frame["volume"] = pd.to_numeric(
+        frame.get("qty", 0),
+        errors="coerce",
+    ).fillna(0)
+
+    frame["oi"] = pd.to_numeric(
+        frame.get("oi", 0),
+        errors="coerce",
+    ).fillna(0)
+
+    frame = (
+        frame
+        .dropna(subset=["datetime", "price"])
+        .sort_values("datetime")
+        .reset_index(drop=True)
+    )
+
+    return frame[
+        [
+            "datetime",
+            "price",
+            "volume",
+            "oi",
+            "contract_name",
+        ]
+    ]
