@@ -2224,94 +2224,362 @@ def api_option_metric_chart():
 @app.route("/api/option-ltp-candle-chart")
 def api_option_ltp_candle_chart():
     try:
-        dataset = _normalize_dataset(request.args.get("dataset") or request.args.get("underlying"))
-        query_date = request.args.get("date") or request.args.get("query_date")
-        query_date = _normalize_date(query_date) if query_date else None
+        dataset = _normalize_dataset(
+            request.args.get("dataset")
+            or request.args.get("underlying")
+        )
+
+        query_date = (
+            request.args.get("date")
+            or request.args.get("query_date")
+        )
+
+        query_date = (
+            _normalize_date(query_date)
+            if query_date
+            else None
+        )
 
         strike = int(request.args.get("strike"))
-        side = str(request.args.get("side") or "CE").upper()
-        interval = int(request.args.get("interval", CANDLE_INTERVAL_MINUTES))
+        side = str(
+            request.args.get("side") or "CE"
+        ).upper()
+
+        interval = int(
+            request.args.get(
+                "interval",
+                CANDLE_INTERVAL_MINUTES,
+            )
+        )
+
         selected_expiry = request.args.get("expiry")
 
         if side not in {"CE", "PE"}:
             raise ValueError("side must be CE or PE")
 
+        if interval <= 0:
+            raise ValueError(
+                "interval must be greater than zero"
+            )
+
+        # -------------------------------------------------
+        # Resolve selected date and week folder
+        # -------------------------------------------------
+
         if query_date:
-            resolved_week, folder, date_str = _resolve_week_folder_for_date(
-                query_date=query_date,
-                dataset=dataset,
-                week_number=None,
+            resolved_week, folder, date_str = (
+                _resolve_week_folder_for_date(
+                    query_date=query_date,
+                    dataset=dataset,
+                    week_number=None,
+                )
             )
         else:
-            resolved_week, folder, date_str, query_date = _resolve_default_week_date(dataset)
+            (
+                resolved_week,
+                folder,
+                date_str,
+                query_date,
+            ) = _resolve_default_week_date(dataset)
 
-        expiry_str = selected_expiry or get_upcoming_expiry_np(
-            datetime.strptime(date_str, "%Y%m%d").date(),
+        # -------------------------------------------------
+        # Resolve expiry
+        # -------------------------------------------------
+
+        expiry_str = (
+            selected_expiry
+            or get_upcoming_expiry_np(
+                datetime.strptime(
+                    date_str,
+                    "%Y%m%d",
+                ).date(),
+                instrument=dataset,
+            )
+        )
+
+        if not expiry_str:
+            raise ValueError(
+                "No expiry found for selected date."
+            )
+
+        expiry_str = str(expiry_str).strip()
+
+        # -------------------------------------------------
+        # Load complete consolidated option chain once
+        # -------------------------------------------------
+
+        consolidated_chain = load_consolidated_option_chain(
+            folder=folder,
+            date_str=date_str,
+            expiry_str=expiry_str,
             instrument=dataset,
         )
 
-        opt = _load_option_data_fast(
+        option_data = _load_option_data_fast(
             folder=folder,
             date_str=date_str,
             expiry_str=expiry_str,
             strike=strike,
             dataset=dataset,
+            chain=consolidated_chain,
         )
 
-        raw_df = opt.get(side)
+        raw_df = option_data.get(side)
 
         if raw_df is None or raw_df.empty:
-            return jsonify({
-                "ok": True,
-                "dataset": dataset,
-                "query_date": query_date,
-                "date_str": date_str,
-                "strike": strike,
-                "side": side,
-                "rows": [],
-            })
+            return jsonify(
+                {
+                    "ok": True,
+                    "dataset": dataset,
+                    "query_date": query_date,
+                    "date_str": date_str,
+                    "expiry": expiry_str,
+                    "strike": strike,
+                    "side": side,
+                    "interval": interval,
+                    "rows": [],
+                }
+            )
+
+        # -------------------------------------------------
+        # Prepare raw option ticks
+        # -------------------------------------------------
 
         raw_df = raw_df.copy()
-        raw_df["value"] = raw_df["price"]
 
-        end_date = _normalize_date(request.args.get("end_date") or query_date)
+        if "datetime" not in raw_df.columns:
+            raise ValueError(
+                "Option data does not contain datetime column."
+            )
+
+        if "price" not in raw_df.columns:
+            raise ValueError(
+                "Option data does not contain price column."
+            )
+
+        raw_df["datetime"] = pd.to_datetime(
+            raw_df["datetime"],
+            errors="coerce",
+        )
+
+        raw_df["price"] = pd.to_numeric(
+            raw_df["price"],
+            errors="coerce",
+        )
+
+        raw_df = (
+            raw_df
+            .dropna(subset=["datetime", "price"])
+            .sort_values("datetime")
+        )
+
+        if raw_df.empty:
+            raise ValueError(
+                "No valid option ticks found."
+            )
+
+        # Ensure IST timezone
+        if getattr(
+            raw_df["datetime"].dt,
+            "tz",
+            None,
+        ) is None:
+            raw_df["datetime"] = (
+                raw_df["datetime"]
+                .dt.tz_localize(
+                    IST,
+                    ambiguous="NaT",
+                    nonexistent="NaT",
+                )
+            )
+        else:
+            raw_df["datetime"] = (
+                raw_df["datetime"]
+                .dt.tz_convert(IST)
+            )
+
+        raw_df = raw_df.dropna(
+            subset=["datetime"]
+        )
+
+        # -------------------------------------------------
+        # Requested chart range
+        # -------------------------------------------------
+
+        start_time = _normalize_time(
+            request.args.get("start_time")
+            or request.args.get("from_time")
+            or "09:15"
+        )
+
+        end_date = _normalize_date(
+            request.args.get("end_date")
+            or query_date
+        )
+
         end_time = _normalize_time(
-            request.args.get("time") or request.args.get("end_time") or "15:30"
+            request.args.get("time")
+            or request.args.get("end_time")
+            or "15:30"
         )
 
         start_dt = IST.localize(
-            datetime.strptime(f"{query_date} 09:15", "%Y-%m-%d %H:%M")
+            datetime.strptime(
+                f"{query_date} {start_time}",
+                "%Y-%m-%d %H:%M",
+            )
         )
 
         end_dt = IST.localize(
-            datetime.strptime(f"{end_date} {end_time}", "%Y-%m-%d %H:%M")
+            datetime.strptime(
+                f"{end_date} {end_time}",
+                "%Y-%m-%d %H:%M",
+            )
         )
 
-        payload = build_chart_payload(
-            raw_df,
-            interval=interval,
-            start=start_dt,
-            end=end_dt,
-            previous_candles=100,
-            sma=(20, 50),
-            ema=(9, 20),
-            price_col="value",
+        if end_dt < start_dt:
+            raise ValueError(
+                "End date/time cannot be before start date/time."
+            )
+
+        raw_df = raw_df[
+            (raw_df["datetime"] >= start_dt)
+            & (raw_df["datetime"] <= end_dt)
+        ]
+
+        if raw_df.empty:
+            return jsonify(
+                {
+                    "ok": True,
+                    "dataset": dataset,
+                    "query_date": query_date,
+                    "date_str": date_str,
+                    "expiry": expiry_str,
+                    "strike": strike,
+                    "side": side,
+                    "interval": interval,
+                    "rows": [],
+                }
+            )
+
+        # -------------------------------------------------
+        # Build real OHLC candles from option ticks
+        # -------------------------------------------------
+
+        candle_df = (
+            raw_df
+            .set_index("datetime")["price"]
+            .resample(
+                f"{interval}min",
+                origin="start_day",
+                offset=pd.Timedelta(
+                    hours=9,
+                    minutes=15,
+                ),
+                label="left",
+                closed="left",
+            )
+            .ohlc()
+            .dropna(
+                subset=[
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                ]
+            )
         )
 
-        return jsonify({
-            "ok": True,
-            "dataset": dataset,
-            "query_date": query_date,
-            "date_str": date_str,
-            "strike": strike,
-            "side": side,
-            "interval": interval,
-            "rows": payload["candles"],
-            "indicators": payload["indicators"],
-        })
+        if candle_df.empty:
+            return jsonify(
+                {
+                    "ok": True,
+                    "dataset": dataset,
+                    "query_date": query_date,
+                    "date_str": date_str,
+                    "expiry": expiry_str,
+                    "strike": strike,
+                    "side": side,
+                    "interval": interval,
+                    "rows": [],
+                }
+            )
+
+        # -------------------------------------------------
+        # Convert candles for Lightweight Charts
+        # -------------------------------------------------
+
+        rows = []
+
+        for timestamp, candle in candle_df.iterrows():
+            timestamp = pd.Timestamp(timestamp)
+
+            # Convert to naive IST wall-clock time
+            if timestamp.tzinfo is not None:
+                timestamp = (
+                    timestamp
+                    .tz_convert(IST)
+                    .tz_localize(None)
+                )
+
+            rows.append(
+                {
+                    "time": int(timestamp.timestamp()),
+                    "open": round(
+                        float(candle["open"]),
+                        2,
+                    ),
+                    "high": round(
+                        float(candle["high"]),
+                        2,
+                    ),
+                    "low": round(
+                        float(candle["low"]),
+                        2,
+                    ),
+                    "close": round(
+                        float(candle["close"]),
+                        2,
+                    ),
+                }
+            )
+
+        return jsonify(
+            {
+                "ok": True,
+                "dataset": dataset,
+                "query_date": query_date,
+                "end_date": end_date,
+                "start_time": start_time,
+                "end_time": end_time,
+                "date_str": date_str,
+                "resolved_week_number": resolved_week,
+                "expiry": expiry_str,
+                "strike": strike,
+                "side": side,
+                "interval": interval,
+                "tick_count": int(len(raw_df)),
+                "candle_count": int(len(rows)),
+                "rows": rows,
+            }
+        )
+
+    except ValueError as exc:
+        return _json_error(
+            str(exc),
+            400,
+        )
 
     except Exception as exc:
-        return _json_error(str(exc), 400)
+        logger.exception(
+            "Option LTP candle-chart error"
+        )
+
+        return _json_error(
+            "Unable to build option candle chart.",
+            500,
+            detail=str(exc),
+        )
 @app.route("/api/india-vix-chart")
 def api_india_vix_chart():
     try:
