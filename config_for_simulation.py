@@ -55,7 +55,7 @@ if STORAGE_MODE not in {"local", "blob"}:
 #   flat         -> <week>/<segment>/
 DATA_LAYOUT = os.getenv(
     "DATA_LAYOUT",
-    "segment_date",
+    "date_segment",
 ).strip().lower()
 
 SUPPORTED_DATA_LAYOUTS = {
