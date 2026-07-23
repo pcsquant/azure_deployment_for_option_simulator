@@ -113,37 +113,17 @@ def _join_storage_path(*parts):
 
 def _get_idx_folder(week_folder, date_str=None):
     if STORAGE_MODE == "blob":
-        return _join_storage_path(week_folder, date_str, "IDX_TICK") if date_str else _join_storage_path(week_folder, "IDX_TICK")
+        return _join_storage_path(week_folder, "IDX_TICK")
 
-    if date_str:
-        candidate = os.path.join(week_folder, str(date_str), "IDX_TICK")
-        if os.path.isdir(candidate):
-            return candidate
     folder = os.path.join(week_folder, "IDX_TICK")
     return folder if os.path.isdir(folder) else week_folder
 
 
 def _get_opt_folder(week_folder, date_str=None):
     if STORAGE_MODE == "blob":
-        return _join_storage_path(week_folder, date_str, "OPT_TICK") if date_str else _join_storage_path(week_folder, "OPT_TICK")
+        return _join_storage_path(week_folder, "OPT_TICK")
 
-    if date_str:
-        candidate = os.path.join(week_folder, str(date_str), "OPT_TICK")
-        if os.path.isdir(candidate):
-            return candidate
     folder = os.path.join(week_folder, "OPT_TICK")
-    return folder if os.path.isdir(folder) else week_folder
-
-
-def _get_fut_folder(week_folder, date_str=None):
-    if STORAGE_MODE == "blob":
-        return _join_storage_path(week_folder, date_str, "FUT_TICK") if date_str else _join_storage_path(week_folder, "FUT_TICK")
-
-    if date_str:
-        candidate = os.path.join(week_folder, str(date_str), "FUT_TICK")
-        if os.path.isdir(candidate):
-            return candidate
-    folder = os.path.join(week_folder, "FUT_TICK")
     return folder if os.path.isdir(folder) else week_folder
 
 
@@ -560,8 +540,8 @@ CONSOLIDATED_SCHEMA_VERSION = 2
 
 
 def consolidated_chain_folder(week_folder, date_str):
-    option_week_folder = _resolve_option_week_folder(week_folder)
-    return _get_opt_folder(option_week_folder, date_str)
+    return _resolve_option_week_folder(week_folder)
+
 
 
 def consolidated_chain_path(
@@ -570,14 +550,24 @@ def consolidated_chain_path(
     expiry_str,
     instrument="NIFTY",
 ):
-    """Return <week>/<date>/OPT_TICK/<SYMBOL>.parquet."""
+    """Return the consolidated option-chain path or blob name."""
     cfg = get_dataset_config(instrument)
     symbol = str(cfg["symbol"]).upper()
-    option_folder = consolidated_chain_folder(week_folder, date_str)
-    filename = f"{symbol}.parquet"
+    option_week_folder = _resolve_option_week_folder(week_folder)
+    filename = f"{symbol}_{expiry_str}.parquet"
+
     if STORAGE_MODE == "blob":
-        return _join_storage_path(option_folder, filename)
-    return os.path.join(option_folder, filename)
+        return _join_storage_path(
+            option_week_folder,
+            "OPT_TICK",
+            filename,
+        )
+
+    return os.path.join(
+        option_week_folder,
+        "OPT_TICK",
+        filename,
+    )
 
 
 _OPTION_CHAIN_CACHE = {}
@@ -620,26 +610,13 @@ def load_consolidated_option_chain(
     instrument="NIFTY",
 ):
     """
-    Load the underlying-level consolidated option file.
+    Load consolidated option-chain data from either:
 
-    Expected Azure structure:
+    1. Azure Blob Storage when STORAGE_MODE == "blob"
+    2. Local filesystem when STORAGE_MODE == "local"
 
-        <week>/<YYYYMMDD>/OPT_TICK/NIFTY.parquet
-        <week>/<YYYYMMDD>/OPT_TICK/BANKNIFTY.parquet
-
-    Supported source schema:
-
-        date
-        time
-        price
-        qty
-        oi
-        contract_name
-
-    Example contract_name:
-
-        NIFTY26072124200CE
-        NIFTY26072124200PE
+    The processed option chain is still cached locally in
+    SHARED_OPTION_CACHE_DIR.
     """
 
     path = consolidated_chain_path(
@@ -649,17 +626,13 @@ def load_consolidated_option_chain(
         instrument=instrument,
     )
 
-    cache_key = (
-        f"contract-name-v1|{STORAGE_MODE}|{path}|"
-        f"{date_str}|{expiry_str}|{instrument}"
-    )
-
-    disk_cache_path = _option_chain_disk_cache_path(
-        cache_key
-    )
+    # Do not use os.path.abspath() here because an Azure blob name
+    # is not a local Linux filesystem path.
+    cache_key = f"{path}|{date_str}|{instrument}"
+    disk_cache_path = _option_chain_disk_cache_path(cache_key)
 
     # ---------------------------------------------------------
-    # 1. In-memory cache
+    # 1. Check in-memory cache
     # ---------------------------------------------------------
 
     with _OPTION_CHAIN_CACHE_LOCK:
@@ -669,417 +642,251 @@ def load_consolidated_option_chain(
         return cached.copy()
 
     # ---------------------------------------------------------
-    # 2. Local processed cache
+    # 2. Check local processed cache
     # ---------------------------------------------------------
 
+    # This cache remains on the VM even when the original data
+    # comes from Azure Blob Storage.
     if os.path.isfile(disk_cache_path):
         try:
-            cached_df = pd.read_parquet(
-                disk_cache_path
-            )
+            out = pd.read_parquet(disk_cache_path)
 
-            required_cached = {
-                "timestamp",
-                "strike",
-                "ce",
-                "pe",
-            }
+            with _OPTION_CHAIN_CACHE_LOCK:
+                _OPTION_CHAIN_CACHE[cache_key] = out.copy()
 
-            if (
-                not cached_df.empty
-                and required_cached.issubset(
-                    cached_df.columns
-                )
-            ):
-                with _OPTION_CHAIN_CACHE_LOCK:
-                    _OPTION_CHAIN_CACHE[
-                        cache_key
-                    ] = cached_df.copy()
+            return out.copy()
 
-                return cached_df.copy()
-
-        except Exception as exc:
-            logger.warning(
-                "Removing invalid option cache %s: %s",
-                disk_cache_path,
-                exc,
-            )
-
-        try:
-            os.remove(disk_cache_path)
-        except OSError:
-            pass
+        except Exception:
+            # Remove an invalid or corrupted cache file.
+            try:
+                os.remove(disk_cache_path)
+            except OSError:
+                pass
 
     # ---------------------------------------------------------
-    # 3. Check source file
+    # 3. Check whether the original Parquet file exists
     # ---------------------------------------------------------
 
     if STORAGE_MODE == "blob":
         try:
             if not blob_exists(path):
-                logger.warning(
-                    "Option Parquet not found: %s",
-                    path,
-                )
                 return None
-
         except Exception as exc:
-            logger.exception(
-                "Unable to check option blob %s: %s",
-                path,
-                exc,
+            print(
+                f"Unable to check Azure blob existence: {path}. "
+                f"Error: {exc}",
+                flush=True,
             )
             return None
 
-    elif not os.path.isfile(path):
-        logger.warning(
-            "Option Parquet not found: %s",
-            path,
-        )
-        return None
+    else:
+        if not os.path.isfile(path):
+            return None
 
     # ---------------------------------------------------------
-    # 4. Read only required columns where supported
+    # 4. Read the consolidated Parquet file
     # ---------------------------------------------------------
 
-    requested_columns = [
+    required_columns = [
         "date",
         "time",
+        "strike",
+        "option_type",
         "price",
-        "qty",
-        "oi",
-        "contract_name",
     ]
 
     try:
         if STORAGE_MODE == "blob":
             df = read_parquet_blob(
                 path,
-                columns=requested_columns,
+                columns=required_columns,
             )
         else:
             df = pd.read_parquet(
                 path,
-                columns=requested_columns,
+                columns=required_columns,
             )
 
-    except Exception as projected_error:
-        logger.warning(
-            "Projected option read failed for %s: %s. "
-            "Retrying full read.",
-            path,
-            projected_error,
-        )
-
+    except Exception as projected_read_error:
+        # Some Parquet files may not support projected column reads,
+        # so retry by reading the complete file.
         try:
             if STORAGE_MODE == "blob":
                 df = read_parquet_blob(path)
             else:
                 df = pd.read_parquet(path)
 
-        except Exception as full_error:
-            logger.exception(
-                "Unable to read option file %s: %s",
-                path,
-                full_error,
+        except Exception as full_read_error:
+            print(
+                f"Unable to read consolidated option chain: {path}. "
+                f"Projected read error: {projected_read_error}. "
+                f"Full read error: {full_read_error}",
+                flush=True,
             )
             return None
 
+    # ---------------------------------------------------------
+    # 5. Validate the DataFrame
+    # ---------------------------------------------------------
+
+    required = {
+        "date",
+        "time",
+        "strike",
+        "option_type",
+        "price",
+    }
+
     if df is None or df.empty:
-        logger.warning(
-            "Option file is empty: %s",
-            path,
+        return None
+
+    if not required.issubset(df.columns):
+        print(
+            f"Consolidated file has missing columns: {path}. "
+            f"Available columns: {list(df.columns)}",
+            flush=True,
         )
         return None
 
-    # Normalize column names without mutating source labels.
-    lower_columns = {
-        str(column).strip().lower(): column
-        for column in df.columns
-    }
-
-    required_source = {
-        "date",
-        "time",
-        "price",
-        "contract_name",
-    }
-
-    if not required_source.issubset(
-        lower_columns
-    ):
-        logger.error(
-            "Unsupported option schema in %s. "
-            "Required=%s Available=%s",
-            path,
-            sorted(required_source),
-            list(df.columns),
-        )
-        return None
-
-    date_column = lower_columns["date"]
-    time_column = lower_columns["time"]
-    price_column = lower_columns["price"]
-    contract_column = lower_columns[
-        "contract_name"
-    ]
-
-    work = df[
-        [
-            date_column,
-            time_column,
-            price_column,
-            contract_column,
-        ]
-    ].copy()
-
-    work.columns = [
-        "date",
-        "time",
-        "price",
-        "contract_name",
-    ]
+    df = df.copy()
 
     # ---------------------------------------------------------
-    # 5. Filter selected trading date
+    # 6. Filter for the requested date
     # ---------------------------------------------------------
 
-    work["date"] = pd.to_numeric(
-        work["date"],
+    df["date"] = pd.to_numeric(
+        df["date"],
         errors="coerce",
     )
 
     requested_date = pd.to_numeric(
-        str(date_str),
+        date_str,
         errors="coerce",
     )
 
     if pd.isna(requested_date):
-        logger.warning(
-            "Invalid trading date: %r",
-            date_str,
-        )
         return None
 
-    work = work[
-        work["date"] == int(requested_date)
-    ]
+    df = df[df["date"] == int(requested_date)]
 
-    if work.empty:
-        logger.warning(
-            "No option rows for date=%s in %s",
-            date_str,
-            path,
-        )
+    if df.empty:
         return None
 
     # ---------------------------------------------------------
-    # 6. Parse contract_name
+    # 7. Create and normalize timestamp
     # ---------------------------------------------------------
 
-    cfg = get_dataset_config(instrument)
-    expected_symbol = str(
-        cfg["symbol"]
-    ).upper()
-
-    contract_pattern = re.compile(
-        r"^(?P<symbol>[A-Z]+)"
-        r"(?P<expiry>\d{6})"
-        r"(?P<strike>\d+(?:\.\d+)?)"
-        r"(?P<option_type>CE|PE)$",
-        re.IGNORECASE,
-    )
-
-    contract_text = (
-        work["contract_name"]
-        .astype(str)
-        .str.strip()
-        .str.upper()
-        .str.replace(".PARQUET", "", regex=False)
-        .str.replace(".CSV", "", regex=False)
-    )
-
-    extracted = contract_text.str.extract(
-        contract_pattern
-    )
-
-    work["symbol"] = (
-        extracted["symbol"]
-        .astype(str)
-        .str.upper()
-    )
-
-    work["expiry"] = (
-        extracted["expiry"]
-        .astype(str)
-        .str.strip()
-    )
-
-    work["strike"] = pd.to_numeric(
-        extracted["strike"],
+    df["timestamp"] = pd.to_datetime(
+        df["date"].astype("int64").astype(str)
+        + " "
+        + df["time"].astype(str),
         errors="coerce",
     )
 
-    work["option_type"] = (
-        extracted["option_type"]
+    df["price"] = pd.to_numeric(
+        df["price"],
+        errors="coerce",
+    )
+
+    df["strike"] = pd.to_numeric(
+        df["strike"],
+        errors="coerce",
+    )
+
+    df["option_type"] = (
+        df["option_type"]
         .astype(str)
         .str.upper()
         .str.strip()
     )
 
-    work["price"] = pd.to_numeric(
-        work["price"],
-        errors="coerce",
-    )
-
-    work = work.dropna(
+    df = df.dropna(
         subset=[
-            "strike",
+            "timestamp",
             "price",
+            "strike",
         ]
     )
 
-    work = work[
-        (work["symbol"] == expected_symbol)
-        & (
-            work["expiry"]
-            == str(expiry_str).strip()
-        )
-        & (
-            work["option_type"].isin(
-                ["CE", "PE"]
-            )
-        )
-    ]
-
-    if work.empty:
-        logger.warning(
-            "No option contracts matched "
-            "instrument=%s date=%s expiry=%s "
-            "in %s",
-            expected_symbol,
-            date_str,
-            expiry_str,
-            path,
-        )
+    if df.empty:
         return None
 
+    df["strike"] = df["strike"].astype(int)
+
     # ---------------------------------------------------------
-    # 7. Build timestamps
+    # 8. Convert timestamps to IST
     # ---------------------------------------------------------
 
-    work["timestamp"] = pd.to_datetime(
-        work["date"]
-        .astype("Int64")
-        .astype(str)
-        + " "
-        + work["time"].astype(str),
-        errors="coerce",
-    )
-
-    work = work.dropna(
-        subset=["timestamp"]
-    )
-
-    if work.empty:
-        return None
-
-    if getattr(
-        work["timestamp"].dt,
-        "tz",
-        None,
-    ) is None:
-        work["timestamp"] = (
-            work["timestamp"]
-            .dt.tz_localize(
-                IST,
-                ambiguous="NaT",
-                nonexistent="NaT",
-            )
+    if df["timestamp"].dt.tz is None:
+        df["timestamp"] = df["timestamp"].dt.tz_localize(
+            IST,
+            ambiguous="NaT",
+            nonexistent="NaT",
         )
     else:
-        work["timestamp"] = (
-            work["timestamp"]
-            .dt.tz_convert(IST)
+        df["timestamp"] = df["timestamp"].dt.tz_convert(
+            IST
         )
 
-    work = work.dropna(
-        subset=["timestamp"]
-    )
+    df = df.dropna(subset=["timestamp"])
 
-    work = work[
-        (
-            work["timestamp"].dt.time
-            >= SESSION_START
-        )
-        & (
-            work["timestamp"].dt.time
-            <= SESSION_END
-        )
+    # Keep only normal trading-session records.
+    df = df[
+        (df["timestamp"].dt.time >= SESSION_START)
+        & (df["timestamp"].dt.time <= SESSION_END)
     ]
 
-    if work.empty:
+    if df.empty:
         return None
 
-    work["strike"] = (
-        work["strike"]
-        .round()
-        .astype("int32")
-    )
-
-    # Last available tick in each minute.
-    work["timestamp"] = (
-        work["timestamp"]
-        .dt.floor("min")
-    )
-
-    work = (
-        work
-        .sort_values(
-            "timestamp",
-            kind="mergesort",
-        )
-        .drop_duplicates(
-            subset=[
-                "timestamp",
-                "strike",
-                "option_type",
-            ],
-            keep="last",
-        )
-    )
-
     # ---------------------------------------------------------
-    # 8. Convert long rows into CE/PE columns
+    # 9. Separate CE and PE records
     # ---------------------------------------------------------
 
-    out = (
-        work
-        .pivot_table(
-            index=[
-                "timestamp",
-                "strike",
-            ],
-            columns="option_type",
-            values="price",
-            aggfunc="last",
-        )
+    ce_raw = df[df["option_type"] == "CE"]
+    pe_raw = df[df["option_type"] == "PE"]
+
+    ce = (
+        ce_raw
+        .set_index("timestamp")
+        .groupby("strike")["price"]
+        .resample("1min")
+        .last()
+        .dropna()
         .reset_index()
-        .rename(
-            columns={
-                "CE": "ce",
-                "PE": "pe",
-            }
-        )
+        .rename(columns={"price": "ce"})
     )
 
-    out.columns.name = None
+    pe = (
+        pe_raw
+        .set_index("timestamp")
+        .groupby("strike")["price"]
+        .resample("1min")
+        .last()
+        .dropna()
+        .reset_index()
+        .rename(columns={"price": "pe"})
+    )
 
-    if "ce" not in out.columns:
-        out["ce"] = np.nan
+    if ce.empty and pe.empty:
+        return None
 
-    if "pe" not in out.columns:
-        out["pe"] = np.nan
+    # ---------------------------------------------------------
+    # 10. Merge CE and PE prices
+    # ---------------------------------------------------------
+
+    out = pd.merge(
+        ce,
+        pe,
+        on=[
+            "strike",
+            "timestamp",
+        ],
+        how="outer",
+    )
+
+    if out.empty:
+        return None
 
     out = (
         out[
@@ -1094,64 +901,47 @@ def load_consolidated_option_chain(
             [
                 "timestamp",
                 "strike",
-            ],
-            kind="mergesort",
+            ]
         )
         .reset_index(drop=True)
     )
 
-    if out.empty:
-        return None
-
     # ---------------------------------------------------------
-    # 9. Save caches
+    # 11. Save to in-memory cache
     # ---------------------------------------------------------
 
     with _OPTION_CHAIN_CACHE_LOCK:
-        _OPTION_CHAIN_CACHE[
-            cache_key
-        ] = out.copy()
+        _OPTION_CHAIN_CACHE[cache_key] = out.copy()
+
+    # ---------------------------------------------------------
+    # 12. Save processed result to local VM cache
+    # ---------------------------------------------------------
 
     try:
         os.makedirs(
-            os.path.dirname(
-                disk_cache_path
-            ),
+            os.path.dirname(disk_cache_path),
             exist_ok=True,
         )
 
-        temporary_path = (
-            f"{disk_cache_path}."
-            f"{os.getpid()}.tmp"
-        )
+        tmp_path = f"{disk_cache_path}.tmp"
 
         out.to_parquet(
-            temporary_path,
+            tmp_path,
             index=False,
         )
 
         os.replace(
-            temporary_path,
+            tmp_path,
             disk_cache_path,
         )
 
     except Exception as exc:
-        logger.warning(
-            "Unable to save option-chain cache: %s",
-            exc,
+        # A cache-writing error should not prevent the API from
+        # returning the successfully processed data.
+        print(
+            f"Warning: unable to save option-chain cache: {exc}",
+            flush=True,
         )
-
-    logger.info(
-        "Loaded option chain: "
-        "instrument=%s date=%s expiry=%s "
-        "rows=%d strikes=%d source=%s",
-        expected_symbol,
-        date_str,
-        expiry_str,
-        len(out),
-        out["strike"].nunique(),
-        path,
-    )
 
     return out.copy()
 
@@ -1902,171 +1692,3 @@ def load_future_data_for_date(
         return pd.DataFrame(
             columns=["datetime", "price", "volume"]
         )
-
-
-
-
-def get_option_chain_snapshot(
-    folder,
-    date_str,
-    expiry_str,
-    target_timestamp,
-    instrument="NIFTY",
-):
-    """
-    Return the latest available CE and PE prices for each strike
-    at or before the requested timestamp.
-    """
-
-    empty = pd.DataFrame(
-        columns=["timestamp", "strike", "ce", "pe"]
-    )
-
-    chain = load_consolidated_option_chain(
-        folder=folder,
-        date_str=date_str,
-        expiry_str=expiry_str,
-        instrument=instrument,
-    )
-
-    if chain is None or chain.empty:
-        logger.warning(
-            "No consolidated option-chain data found: "
-            "instrument=%s date=%s expiry=%s",
-            instrument,
-            date_str,
-            expiry_str,
-        )
-        return empty
-
-    required_columns = {
-        "timestamp",
-        "strike",
-        "ce",
-        "pe",
-    }
-
-    if not required_columns.issubset(chain.columns):
-        logger.error(
-            "Option-chain columns are invalid. "
-            "Required=%s Available=%s",
-            sorted(required_columns),
-            list(chain.columns),
-        )
-        return empty
-
-    frame = chain.loc[
-        :,
-        ["timestamp", "strike", "ce", "pe"],
-    ].copy()
-
-    frame["timestamp"] = pd.to_datetime(
-        frame["timestamp"],
-        errors="coerce",
-    )
-
-    frame["strike"] = pd.to_numeric(
-        frame["strike"],
-        errors="coerce",
-    )
-
-    frame["ce"] = pd.to_numeric(
-        frame["ce"],
-        errors="coerce",
-    )
-
-    frame["pe"] = pd.to_numeric(
-        frame["pe"],
-        errors="coerce",
-    )
-
-    frame = frame.dropna(
-        subset=["timestamp", "strike"]
-    )
-
-    if frame.empty:
-        return empty
-
-    if getattr(frame["timestamp"].dt, "tz", None) is None:
-        frame["timestamp"] = frame["timestamp"].dt.tz_localize(
-            IST,
-            ambiguous="NaT",
-            nonexistent="NaT",
-        )
-    else:
-        frame["timestamp"] = frame["timestamp"].dt.tz_convert(
-            IST
-        )
-
-    frame = frame.dropna(subset=["timestamp"])
-
-    if frame.empty:
-        return empty
-
-    target = pd.Timestamp(target_timestamp)
-
-    if target.tzinfo is None:
-        target = target.tz_localize(IST)
-    else:
-        target = target.tz_convert(IST)
-
-    frame = frame.loc[
-        frame["timestamp"] <= target
-    ]
-
-    if frame.empty:
-        return empty
-
-    frame["strike"] = frame["strike"].astype("int32")
-
-    snapshot = (
-        frame
-        .sort_values(
-            ["strike", "timestamp"],
-            kind="mergesort",
-        )
-        .drop_duplicates(
-            subset=["strike"],
-            keep="last",
-        )
-        .sort_values(
-            "strike",
-            kind="mergesort",
-        )
-        .reset_index(drop=True)
-    )
-
-    return snapshot.loc[
-        :,
-        ["timestamp", "strike", "ce", "pe"],
-    ]
-
-
-def runtime_cache_stats():
-    return {
-        "storage_mode": STORAGE_MODE,
-        "raw_parquet_cache": len(RAW_PARQUET_CACHE),
-        "option_chain_cache": len(_OPTION_CHAIN_CACHE),
-        "path_cache": len(PARQUET_FILE_PATH_CACHE),
-        "contract_cache": len(OPTION_CONTRACT_CACHE),
-    }
-
-
-def clear_runtime_caches(clear_disk_option_cache=False):
-    RAW_PARQUET_CACHE.clear()
-    PARQUET_FILE_PATH_CACHE.clear()
-    OPTION_PARQUET_CACHE.clear()
-    OPTION_CONTRACT_CACHE.clear()
-    OPTION_WEEK_FOLDER_CACHE.clear()
-    with _OPTION_CHAIN_CACHE_LOCK:
-        _OPTION_CHAIN_CACHE.clear()
-    with _OPTION_CONTRACT_INDEX_CACHE_LOCK:
-        _OPTION_CONTRACT_INDEX_CACHE.clear()
-    with _WEEK_DATES_CACHE_LOCK:
-        _WEEK_DATES_CACHE.clear()
-    if clear_disk_option_cache and os.path.isdir(SHARED_OPTION_CACHE_DIR):
-        for item in Path(SHARED_OPTION_CACHE_DIR).glob("*.parquet"):
-            try:
-                item.unlink()
-            except OSError:
-                logger.warning("Unable to delete cache file %s", item)
