@@ -42,16 +42,12 @@ if STORAGE_MODE not in {"local", "blob"}:
 # DATA LAYOUT SETTINGS
 # =========================================================
 
-# Active production layout:
+# Recommended production layout:
 #
 # <week_folder>/
-# ├── <YYYYMMDD>/
-# │   ├── OPT_TICK/
-# │   ├── FUT_TICK/
-# │   └── IDX_TICK/
-#
-# Example:
-# <week>/20260717/IDX_TICK/NIFTY.parquet
+# ├── OPT_TICK/<YYYYMMDD>/
+# ├── FUT_TICK/<YYYYMMDD>/
+# └── IDX_TICK/<YYYYMMDD>/
 #
 # Supported values:
 #   segment_date -> <week>/<segment>/<date>/
@@ -59,7 +55,7 @@ if STORAGE_MODE not in {"local", "blob"}:
 #   flat         -> <week>/<segment>/
 DATA_LAYOUT = os.getenv(
     "DATA_LAYOUT",
-    "date_segment",
+    "segment_date",
 ).strip().lower()
 
 SUPPORTED_DATA_LAYOUTS = {
@@ -99,14 +95,7 @@ def build_segment_path(
     """
     Build a local filesystem path for the configured historical-data layout.
 
-    Examples:
-
-    DATA_LAYOUT="flat":
-        <week>/OPT_TICK
-        <week>/FUT_TICK
-        <week>/IDX_TICK
-
-    DATA_LAYOUT="segment_date":
+    Examples for DATA_LAYOUT="segment_date":
         <week>/OPT_TICK/20260330
         <week>/FUT_TICK/20260330
         <week>/IDX_TICK/20260330
@@ -163,17 +152,6 @@ def build_blob_prefix(
         parts.append(segment_value)
 
     return "/".join(part for part in parts if part)
-
-
-def describe_data_layout() -> str:
-    """Return a human-readable description of the active data layout."""
-
-    descriptions = {
-        "flat": "<week>/<segment>/",
-        "segment_date": "<week>/<segment>/<YYYYMMDD>/",
-        "date_segment": "<week>/<YYYYMMDD>/<segment>/",
-    }
-    return descriptions[DATA_LAYOUT]
 
 
 def get_segment_name(segment: str) -> str:
@@ -757,14 +735,13 @@ def log_configuration() -> None:
         "STORAGE_MODE=%s, "
         "PARQUET_BASE_PATH=%s, "
         "OPTION_PARQUET_BASE_PATH=%s, "
-        "DATA_LAYOUT=%s (%s), "
+        "DATA_LAYOUT=%s, "
         "CANDLE_INTERVAL_MINUTES=%s, "
         "SESSION=%s-%s",
         STORAGE_MODE,
         PARQUET_BASE_PATH,
         OPTION_PARQUET_BASE_PATH,
         DATA_LAYOUT,
-        describe_data_layout(),
         CANDLE_INTERVAL_MINUTES,
         SESSION_START.strftime("%H:%M"),
         SESSION_END.strftime("%H:%M"),
