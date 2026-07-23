@@ -38,6 +38,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from data_engine_for_simulation import (
+    load_raw_option_contract_ticks,
+)
 from flask import Flask, g, jsonify, render_template, request
 from flask.json.provider import JSONProvider
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -2241,6 +2244,7 @@ def api_option_ltp_candle_chart():
         )
 
         strike = int(request.args.get("strike"))
+
         side = str(
             request.args.get("side") or "CE"
         ).upper()
@@ -2305,26 +2309,17 @@ def api_option_ltp_candle_chart():
         expiry_str = str(expiry_str).strip()
 
         # -------------------------------------------------
-        # Load complete consolidated option chain once
+        # Load every raw tick for the selected contract
         # -------------------------------------------------
 
-        consolidated_chain = load_consolidated_option_chain(
-            folder=folder,
-            date_str=date_str,
-            expiry_str=expiry_str,
-            instrument=dataset,
-        )
-
-        option_data = _load_option_data_fast(
+        raw_df = load_raw_option_contract_ticks(
             folder=folder,
             date_str=date_str,
             expiry_str=expiry_str,
             strike=strike,
-            dataset=dataset,
-            chain=consolidated_chain,
+            option_type=side,
+            instrument=dataset,
         )
-
-        raw_df = option_data.get(side)
 
         if raw_df is None or raw_df.empty:
             return jsonify(
@@ -2337,6 +2332,8 @@ def api_option_ltp_candle_chart():
                     "strike": strike,
                     "side": side,
                     "interval": interval,
+                    "tick_count": 0,
+                    "candle_count": 0,
                     "rows": [],
                 }
             )
@@ -2371,14 +2368,18 @@ def api_option_ltp_candle_chart():
             raw_df
             .dropna(subset=["datetime", "price"])
             .sort_values("datetime")
+            .reset_index(drop=True)
         )
 
         if raw_df.empty:
             raise ValueError(
-                "No valid option ticks found."
+                "No valid raw option ticks found."
             )
 
-        # Ensure IST timezone
+        # -------------------------------------------------
+        # Ensure timestamps are in IST
+        # -------------------------------------------------
+
         if getattr(
             raw_df["datetime"].dt,
             "tz",
@@ -2445,7 +2446,7 @@ def api_option_ltp_candle_chart():
         raw_df = raw_df[
             (raw_df["datetime"] >= start_dt)
             & (raw_df["datetime"] <= end_dt)
-        ]
+        ].copy()
 
         if raw_df.empty:
             return jsonify(
@@ -2453,22 +2454,60 @@ def api_option_ltp_candle_chart():
                     "ok": True,
                     "dataset": dataset,
                     "query_date": query_date,
+                    "end_date": end_date,
+                    "start_time": start_time,
+                    "end_time": end_time,
                     "date_str": date_str,
                     "expiry": expiry_str,
                     "strike": strike,
                     "side": side,
                     "interval": interval,
+                    "tick_count": 0,
+                    "candle_count": 0,
                     "rows": [],
                 }
             )
 
         # -------------------------------------------------
-        # Build real OHLC candles from option ticks
+        # Optional diagnostics
+        # -------------------------------------------------
+
+        ticks_per_minute = (
+            raw_df
+            .set_index("datetime")
+            .resample("1min")["price"]
+            .count()
+        )
+
+        logger.info(
+            "Option raw-tick chart dataset=%s date=%s expiry=%s "
+            "strike=%s side=%s ticks=%s min_ticks_per_min=%s "
+            "max_ticks_per_min=%s avg_ticks_per_min=%.2f",
+            dataset,
+            date_str,
+            expiry_str,
+            strike,
+            side,
+            len(raw_df),
+            int(ticks_per_minute.min())
+            if not ticks_per_minute.empty
+            else 0,
+            int(ticks_per_minute.max())
+            if not ticks_per_minute.empty
+            else 0,
+            float(ticks_per_minute.mean())
+            if not ticks_per_minute.empty
+            else 0.0,
+        )
+
+        # -------------------------------------------------
+        # Build OHLC candles from all raw ticks
         # -------------------------------------------------
 
         candle_df = (
             raw_df
             .set_index("datetime")["price"]
+            .sort_index()
             .resample(
                 f"{interval}min",
                 origin="start_day",
@@ -2496,11 +2535,16 @@ def api_option_ltp_candle_chart():
                     "ok": True,
                     "dataset": dataset,
                     "query_date": query_date,
+                    "end_date": end_date,
+                    "start_time": start_time,
+                    "end_time": end_time,
                     "date_str": date_str,
                     "expiry": expiry_str,
                     "strike": strike,
                     "side": side,
                     "interval": interval,
+                    "tick_count": int(len(raw_df)),
+                    "candle_count": 0,
                     "rows": [],
                 }
             )
@@ -2514,7 +2558,6 @@ def api_option_ltp_candle_chart():
         for timestamp, candle in candle_df.iterrows():
             timestamp = pd.Timestamp(timestamp)
 
-            # Convert to naive IST wall-clock time
             if timestamp.tzinfo is not None:
                 timestamp = (
                     timestamp
@@ -2580,6 +2623,8 @@ def api_option_ltp_candle_chart():
             500,
             detail=str(exc),
         )
+
+
 @app.route("/api/india-vix-chart")
 def api_india_vix_chart():
     try:
