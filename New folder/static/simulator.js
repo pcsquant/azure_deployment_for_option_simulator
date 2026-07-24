@@ -1,60 +1,1145 @@
-let chain=[];let snapshot=null;let exposureChart=null;let activeView='gex';let playbackTimer=null;let playbackRunning=false;let chainLoading=false;const PLAYBACK_DELAY_MS=1200;
-const $=id=>document.getElementById(id);
-const num=v=>Number.isFinite(Number(v))?Number(v):0;
-const fmt=v=>v===null||v===undefined||!Number.isFinite(Number(v))?'-':Number(v).toLocaleString('en-IN',{maximumFractionDigits:2});
-const oiL=v=>v===null||v===undefined?'-':(Number(v)/100000).toFixed(2);
-const signed=v=>{if(v===null||v===undefined)return'-';const n=Number(v);return `${n>0?'+':''}${(n/100000).toFixed(2)}`};
-function metricValue(row,side){const m=$('greekMetric').value;const key=`${side}_${m}`;const v=row[key];if(v===null||v===undefined)return'-';return m==='gamma'?Number(v).toFixed(6):Number(v).toFixed(4)}
-async function fetchJson(url){const r=await fetch(url);const d=await r.json();if(!r.ok||d.ok===false)throw new Error(d.error||'Request failed');return d}
-async function loadDefaults(){const d=await fetchJson(`/api/defaults?dataset=${$('symbol').value}`);if(!$('queryDate').value)$('queryDate').value=d.query_date;if(!$('queryTime').value)$('queryTime').value=d.query_time||'09:30'}
-async function loadChain(){if(chainLoading)return;chainLoading=true;try{$('refreshBtn').disabled=true;setPlaybackButtonsDisabled(true);const q=new URLSearchParams({dataset:$('symbol').value,date:$('queryDate').value,time:$('queryTime').value,interval:$('interval').value,strike_count:$('strikeCount').value,expiry:$('expirySelect').value||'',_:Date.now()});snapshot=await fetchJson(`/api/chain?${q}`);chain=snapshot.rows||[];renderHeader();renderExpiry();renderChain();renderLevels();renderExposure()}catch(e){stopPlayback();alert(e.message)}finally{$('refreshBtn').disabled=false;chainLoading=false;setPlaybackButtonsDisabled(false)}}
-function setPlaybackButtonsDisabled(disabled){
-  ['prevIntervalBtn','nextIntervalBtn'].forEach(id=>{const el=$(id);if(el)el.disabled=disabled});
+"use strict";
+
+/* =========================================================
+   APPLICATION STATE
+   ========================================================= */
+
+let chain = [];
+let snapshot = null;
+let exposureChart = null;
+
+let activeView = "gex";
+
+let playbackTimer = null;
+let playbackRunning = false;
+let chainLoading = false;
+
+const PLAYBACK_DELAY_MS = 1200;
+const MARKET_OPEN_MINUTES = 9 * 60 + 15;
+const MARKET_CLOSE_MINUTES = 15 * 60 + 30;
+
+
+/* =========================================================
+   DOM AND VALUE HELPERS
+   ========================================================= */
+
+const $ = (id) => document.getElementById(id);
+
+const num = (value) => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : 0;
+};
+
+const nullableNumber = (value) => {
+    if (
+        value === null ||
+        value === undefined ||
+        value === ""
+    ) {
+        return null;
+    }
+
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+};
+
+const numbersEqual = (left, right) => {
+    const leftNumber = nullableNumber(left);
+    const rightNumber = nullableNumber(right);
+
+    return (
+        leftNumber !== null &&
+        rightNumber !== null &&
+        leftNumber === rightNumber
+    );
+};
+
+const fmt = (value) => {
+    const parsed = nullableNumber(value);
+
+    if (parsed === null) {
+        return "-";
+    }
+
+    return parsed.toLocaleString("en-IN", {
+        maximumFractionDigits: 2,
+    });
+};
+
+const oiL = (value) => {
+    const parsed = nullableNumber(value);
+
+    if (parsed === null) {
+        return "-";
+    }
+
+    return (parsed / 100000).toFixed(2);
+};
+
+const signed = (value) => {
+    const parsed = nullableNumber(value);
+
+    if (parsed === null) {
+        return "-";
+    }
+
+    const prefix = parsed > 0 ? "+" : "";
+
+    return `${prefix}${(parsed / 100000).toFixed(2)}`;
+};
+
+const setText = (id, value) => {
+    const element = $(id);
+
+    if (element) {
+        element.textContent = value;
+    }
+};
+
+const setDisplay = (id, displayValue) => {
+    const element = $(id);
+
+    if (element) {
+        element.style.display = displayValue;
+    }
+};
+
+
+/* =========================================================
+   GREEK FORMATTER
+   ========================================================= */
+
+function metricValue(row, side) {
+    const metricSelect = $("greekMetric");
+
+    if (!metricSelect) {
+        return "-";
+    }
+
+    const metric = metricSelect.value;
+    const key = `${side}_${metric}`;
+    const value = nullableNumber(row?.[key]);
+
+    if (value === null) {
+        return "-";
+    }
+
+    if (metric === "gamma") {
+        return value.toFixed(8);
+    }
+
+    return value.toFixed(4);
 }
-function timeToMinutes(value){const [h,m]=String(value||'09:15').split(':').map(Number);return (Number.isFinite(h)?h:9)*60+(Number.isFinite(m)?m:15)}
-function minutesToTime(total){const safe=Math.max(0,Math.min(23*60+59,total));return `${String(Math.floor(safe/60)).padStart(2,'0')}:${String(safe%60).padStart(2,'0')}`}
-async function moveInterval(direction){
-  if(chainLoading)return false;
-  const input=$('queryTime');
-  const step=Math.max(1,num($('interval').value));
-  const current=timeToMinutes(input.value);
-  const marketOpen=9*60+15;
-  const marketClose=15*60+30;
-  const target=current+(direction*step);
-  if(target<marketOpen){input.value=minutesToTime(marketOpen);return false}
-  if(target>marketClose){input.value=minutesToTime(marketClose);stopPlayback();return false}
-  input.value=minutesToTime(target);
-  await loadChain();
-  return target<marketClose;
+
+
+/* =========================================================
+   API HELPER
+   ========================================================= */
+
+async function fetchJson(url, options = {}) {
+    const response = await fetch(url, {
+        cache: "no-store",
+        ...options,
+    });
+
+    const contentType =
+        response.headers.get("content-type") || "";
+
+    let data;
+
+    if (contentType.includes("application/json")) {
+        data = await response.json();
+    } else {
+        const responseText = await response.text();
+
+        throw new Error(
+            responseText ||
+            `Server returned HTTP ${response.status}`
+        );
+    }
+
+    if (!response.ok || data?.ok === false) {
+        throw new Error(
+            data?.error ||
+            data?.message ||
+            `Request failed with HTTP ${response.status}`
+        );
+    }
+
+    return data;
 }
-function updatePlayButton(){
-  const btn=$('playPauseBtn');if(!btn)return;
-  btn.textContent=playbackRunning?'❚❚':'▶';
-  btn.classList.toggle('playing',playbackRunning);
-  btn.title=playbackRunning?'Pause simulation':'Play simulation';
-  btn.setAttribute('aria-label',btn.title);
+
+
+/* =========================================================
+   DEFAULT VALUES
+   ========================================================= */
+
+async function loadDefaults() {
+    const symbolElement = $("symbol");
+
+    if (!symbolElement) {
+        return;
+    }
+
+    const query = new URLSearchParams({
+        dataset: symbolElement.value,
+        _: String(Date.now()),
+    });
+
+    const data = await fetchJson(`/api/defaults?${query}`);
+
+    const dateInput = $("queryDate");
+    const timeInput = $("queryTime");
+
+    if (dateInput && !dateInput.value) {
+        dateInput.value = data.query_date || "";
+    }
+
+    if (timeInput && !timeInput.value) {
+        timeInput.value = data.query_time || "09:30";
+    }
 }
-function stopPlayback(){
-  playbackRunning=false;
-  if(playbackTimer){clearTimeout(playbackTimer);playbackTimer=null}
-  updatePlayButton();
+
+
+/* =========================================================
+   OPTION CHAIN LOADING
+   ========================================================= */
+
+function getChainRequestParameters() {
+    return new URLSearchParams({
+        dataset: $("symbol")?.value || "NIFTY",
+        date: $("queryDate")?.value || "",
+        time: $("queryTime")?.value || "09:30",
+        interval: $("interval")?.value || "5",
+        strike_count: $("strikeCount")?.value || "14",
+        expiry: $("expirySelect")?.value || "",
+        compute_greeks: "true",
+        _: String(Date.now()),
+    });
 }
-async function playbackTick(){
-  if(!playbackRunning)return;
-  const canContinue=await moveInterval(1);
-  if(playbackRunning&&canContinue)playbackTimer=setTimeout(playbackTick,PLAYBACK_DELAY_MS);
-  else stopPlayback();
+
+async function loadChain() {
+    if (chainLoading) {
+        return;
+    }
+
+    chainLoading = true;
+
+    const refreshButton = $("refreshBtn");
+
+    try {
+        if (refreshButton) {
+            refreshButton.disabled = true;
+        }
+
+        setPlaybackButtonsDisabled(true);
+
+        const query = getChainRequestParameters();
+
+        snapshot = await fetchJson(`/api/chain?${query}`);
+
+        chain = Array.isArray(snapshot?.rows)
+            ? snapshot.rows
+            : [];
+
+        renderHeader();
+        renderExpiry();
+        renderChain();
+        renderLevels();
+        renderExposure();
+    } catch (error) {
+        console.error("Unable to load option chain:", error);
+
+        stopPlayback();
+
+        alert(
+            error instanceof Error
+                ? error.message
+                : "Unable to load option chain."
+        );
+    } finally {
+        if (refreshButton) {
+            refreshButton.disabled = false;
+        }
+
+        chainLoading = false;
+        setPlaybackButtonsDisabled(false);
+    }
 }
-function togglePlayback(){
-  if(playbackRunning){stopPlayback();return}
-  playbackRunning=true;updatePlayButton();
-  playbackTimer=setTimeout(playbackTick,150);
+
+
+/* =========================================================
+   PLAYBACK CONTROLS
+   ========================================================= */
+
+function setPlaybackButtonsDisabled(disabled) {
+    [
+        "prevIntervalBtn",
+        "nextIntervalBtn",
+    ].forEach((id) => {
+        const element = $(id);
+
+        if (element) {
+            element.disabled = disabled;
+        }
+    });
 }
-function renderHeader(){$('spotValue').textContent=fmt(snapshot.spot);$('vixValue').textContent=fmt(snapshot.india_vix);$('dteValue').textContent=fmt(snapshot.dte)}
-function renderExpiry(){const s=$('expirySelect');const old=s.value;s.innerHTML='';(snapshot.available_expiries||[]).forEach(x=>{const o=document.createElement('option');o.value=x.value;o.textContent=x.label;if(x.value===(old||snapshot.expiry))o.selected=true;s.appendChild(o)})}
-function renderChain(){const body=$('chainBody');body.innerHTML='';const metric=$('greekMetric').value;$('ceGreekHead').textContent=metric.toUpperCase();$('peGreekHead').textContent=metric.toUpperCase();let call=0,put=0;chain.forEach(r=>{call+=num(r.ce_oi);put+=num(r.pe_oi);const tr=document.createElement('tr');if(r.atm)tr.className='atm';tr.innerHTML=`<td>${oiL(r.ce_oi)}</td><td class="${num(r.ce_change_oi)>=0?'positive':'negative'}">${signed(r.ce_change_oi)}</td><td>${fmt(r.ce_ltp)}</td><td>${fmt(num(r.ce_iv)*100)}</td><td class="positive">${metricValue(r,'ce')}</td><td class="strike-cell">${fmt(r.strike)}${r.atm?'<span class="atm-badge">ATM</span>':''}</td><td class="negative">${metricValue(r,'pe')}</td><td>${fmt(num(r.pe_iv)*100)}</td><td>${fmt(r.pe_ltp)}</td><td class="${num(r.pe_change_oi)>=0?'positive':'negative'}">${signed(r.pe_change_oi)}</td><td>${oiL(r.pe_oi)}</td>`;body.appendChild(tr)});$('callTotals').textContent=`Total Call OI: ${oiL(call)} L`;$('putTotals').textContent=`Total Put OI: ${oiL(put)} L`}
-function renderLevels(){const l=snapshot.levels||{};const strikes=chain.map(r=>num(r.strike));const min=Math.min(...strikes),max=Math.max(...strikes);const y=v=>max===min?50:((num(v)-min)/(max-min))*100;[['r2Marker','R2',l.r2],['r1Marker','R1',l.r1],['spotMarker','Spot',snapshot.spot],['s1Marker','S1',l.s1],['s2Marker','S2',l.s2]].forEach(([id,label,v])=>{const el=$(id);el.style.top=`${100-y(v)}%`;el.innerHTML=`${label}<span>${fmt(v)}</span>`});[['r2Value',l.r2],['r1Value',l.r1],['spotLevel',snapshot.spot],['s1Value',l.s1],['s2Value',l.s2],['gammaFlip',l.gamma_flip],['zeroGamma',l.zero_gamma],['maxPositive',l.max_positive_gex],['maxNegative',l.max_negative_gex],['callWall',l.call_wall],['putWall',l.put_wall]].forEach(([id,v])=>$(id).textContent=fmt(v));$('totalGex').textContent=fmt(l.total_gex);$('marketBias').textContent=num(l.total_gex)>=0?'Bullish / stabilising':'Bearish / unstable'}
-function exposures(){return chain.map(r=>{let value=0;if(activeView==='gex')value=num(r.net_gex);if(activeView==='dex')value=(num(r.ce_delta)*num(r.ce_oi)+num(r.pe_delta)*num(r.pe_oi))*num(snapshot.lot_size)*num(snapshot.spot);if(activeView==='vex')value=(num(r.ce_vega)*num(r.ce_oi)+num(r.pe_vega)*num(r.pe_oi))*num(snapshot.lot_size);if(activeView==='tex')value=(num(r.ce_theta)*num(r.ce_oi)+num(r.pe_theta)*num(r.pe_oi))*num(snapshot.lot_size);return{strike:r.strike,value}})}
-function renderExposure(){const titles={gex:'Gamma Exposure (GEX)',dex:'Delta Exposure (DEX)',vex:'Vega Exposure (VEX)',tex:'Theta Exposure (TEX)'};$('chartTitle').textContent=titles[activeView];const rows=exposures();if(exposureChart)exposureChart.destroy();exposureChart=new Chart($('exposureChart'),{type:'bar',data:{labels:rows.map(x=>x.strike),datasets:[{label:titles[activeView],data:rows.map(x=>x.value),backgroundColor:rows.map(x=>x.value>=0?'rgba(13,160,77,.9)':'rgba(240,40,60,.9)'),borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>`${titles[activeView]}: ${fmt(c.raw)}`}}},scales:{x:{title:{display:true,text:'Strike Price'},grid:{display:false}},y:{title:{display:true,text:'Exposure'},grid:{color:'#e8edf3'}}}}})}
-$('refreshBtn').addEventListener('click',()=>{stopPlayback();loadChain()});$('prevIntervalBtn').addEventListener('click',()=>{stopPlayback();moveInterval(-1)});$('nextIntervalBtn').addEventListener('click',()=>{stopPlayback();moveInterval(1)});$('playPauseBtn').addEventListener('click',togglePlayback);$('queryTime').addEventListener('change',stopPlayback);$('interval').addEventListener('change',stopPlayback);$('greekMetric').addEventListener('change',renderChain);$('expirySelect').addEventListener('change',loadChain);$('symbol').addEventListener('change',async()=>{await loadDefaults();await loadChain()});document.querySelectorAll('.exposure-tabs button').forEach(b=>b.addEventListener('click',()=>{document.querySelectorAll('.exposure-tabs button').forEach(x=>x.classList.remove('active'));b.classList.add('active');activeView=b.dataset.view;renderExposure()}));
-(async()=>{await loadDefaults();await loadChain()})();
+
+function timeToMinutes(value) {
+    const [hoursText, minutesText] =
+        String(value || "09:15").split(":");
+
+    const hours = Number(hoursText);
+    const minutes = Number(minutesText);
+
+    return (
+        (Number.isFinite(hours) ? hours : 9) * 60 +
+        (Number.isFinite(minutes) ? minutes : 15)
+    );
+}
+
+function minutesToTime(totalMinutes) {
+    const safeMinutes = Math.max(
+        0,
+        Math.min(23 * 60 + 59, totalMinutes)
+    );
+
+    const hours = Math.floor(safeMinutes / 60);
+    const minutes = safeMinutes % 60;
+
+    return (
+        `${String(hours).padStart(2, "0")}:` +
+        `${String(minutes).padStart(2, "0")}`
+    );
+}
+
+async function moveInterval(direction) {
+    if (chainLoading) {
+        return false;
+    }
+
+    const timeInput = $("queryTime");
+
+    if (!timeInput) {
+        return false;
+    }
+
+    const intervalValue = num($("interval")?.value);
+    const step = Math.max(1, intervalValue);
+
+    const currentMinutes =
+        timeToMinutes(timeInput.value);
+
+    const targetMinutes =
+        currentMinutes + direction * step;
+
+    if (targetMinutes < MARKET_OPEN_MINUTES) {
+        timeInput.value =
+            minutesToTime(MARKET_OPEN_MINUTES);
+
+        return false;
+    }
+
+    if (targetMinutes > MARKET_CLOSE_MINUTES) {
+        timeInput.value =
+            minutesToTime(MARKET_CLOSE_MINUTES);
+
+        stopPlayback();
+        return false;
+    }
+
+    timeInput.value =
+        minutesToTime(targetMinutes);
+
+    await loadChain();
+
+    return targetMinutes < MARKET_CLOSE_MINUTES;
+}
+
+function updatePlayButton() {
+    const button = $("playPauseBtn");
+
+    if (!button) {
+        return;
+    }
+
+    button.textContent =
+        playbackRunning ? "❚❚" : "▶";
+
+    button.classList.toggle(
+        "playing",
+        playbackRunning
+    );
+
+    button.title = playbackRunning
+        ? "Pause simulation"
+        : "Play simulation";
+
+    button.setAttribute(
+        "aria-label",
+        button.title
+    );
+}
+
+function stopPlayback() {
+    playbackRunning = false;
+
+    if (playbackTimer) {
+        clearTimeout(playbackTimer);
+        playbackTimer = null;
+    }
+
+    updatePlayButton();
+}
+
+async function playbackTick() {
+    if (!playbackRunning) {
+        return;
+    }
+
+    try {
+        const canContinue = await moveInterval(1);
+
+        if (playbackRunning && canContinue) {
+            playbackTimer = setTimeout(
+                playbackTick,
+                PLAYBACK_DELAY_MS
+            );
+        } else {
+            stopPlayback();
+        }
+    } catch (error) {
+        console.error("Playback failed:", error);
+        stopPlayback();
+    }
+}
+
+function togglePlayback() {
+    if (playbackRunning) {
+        stopPlayback();
+        return;
+    }
+
+    playbackRunning = true;
+    updatePlayButton();
+
+    playbackTimer = setTimeout(
+        playbackTick,
+        150
+    );
+}
+
+
+/* =========================================================
+   HEADER
+   ========================================================= */
+
+function renderHeader() {
+    if (!snapshot) {
+        return;
+    }
+
+    setText("spotValue", fmt(snapshot.spot));
+    setText("vixValue", fmt(snapshot.india_vix));
+    setText("dteValue", fmt(snapshot.dte));
+}
+
+
+/* =========================================================
+   EXPIRY DROPDOWN
+   ========================================================= */
+
+function renderExpiry() {
+    const select = $("expirySelect");
+
+    if (!select || !snapshot) {
+        return;
+    }
+
+    const previousValue = select.value;
+    const expiryList = Array.isArray(
+        snapshot.available_expiries
+    )
+        ? snapshot.available_expiries
+        : [];
+
+    select.innerHTML = "";
+
+    expiryList.forEach((expiryItem) => {
+        const option =
+            document.createElement("option");
+
+        option.value = expiryItem.value;
+        option.textContent = expiryItem.label;
+
+        if (
+            expiryItem.value ===
+            (previousValue || snapshot.expiry)
+        ) {
+            option.selected = true;
+        }
+
+        select.appendChild(option);
+    });
+
+    if (
+        !select.value &&
+        snapshot.expiry
+    ) {
+        select.value = snapshot.expiry;
+    }
+}
+
+
+/* =========================================================
+   STRIKE LEVEL HELPERS
+   ========================================================= */
+
+function getStrikeLevel(row) {
+    const levels = snapshot?.levels || {};
+    const strike = nullableNumber(row?.strike);
+
+    if (strike === null) {
+        return {
+            label: "",
+            cellClass: "",
+            badgeClass: "",
+        };
+    }
+
+    if (numbersEqual(strike, levels.r2)) {
+        return {
+            label: "R2",
+            cellClass: "resistance-level",
+            badgeClass: "resistance-level",
+        };
+    }
+
+    if (numbersEqual(strike, levels.r1)) {
+        return {
+            label: "R1",
+            cellClass: "resistance-level",
+            badgeClass: "resistance-level",
+        };
+    }
+
+    if (
+        row?.atm === true ||
+        numbersEqual(strike, snapshot?.atm)
+    ) {
+        return {
+            label: "ATM",
+            cellClass: "atm-level",
+            badgeClass: "atm-level",
+        };
+    }
+
+    if (numbersEqual(strike, levels.s1)) {
+        return {
+            label: "S1",
+            cellClass: "support-level",
+            badgeClass: "support-level",
+        };
+    }
+
+    if (numbersEqual(strike, levels.s2)) {
+        return {
+            label: "S2",
+            cellClass: "support-level",
+            badgeClass: "support-level",
+        };
+    }
+
+    return {
+        label: "",
+        cellClass: "",
+        badgeClass: "",
+    };
+}
+
+function buildStrikeCell(row) {
+    const level = getStrikeLevel(row);
+
+    const badgeHtml = level.label
+        ? `
+            <span class="strike-level-badge ${level.badgeClass}">
+                ${level.label}
+            </span>
+        `
+        : `
+            <span class="strike-level-placeholder"></span>
+        `;
+
+    return `
+        <td class="strike-cell ${level.cellClass}">
+            <div class="strike-cell-content">
+                ${badgeHtml}
+
+                <span class="strike-price">
+                    ${fmt(row.strike)}
+                </span>
+            </div>
+        </td>
+    `;
+}
+
+
+/* =========================================================
+   OPTION CHAIN TABLE
+   ========================================================= */
+
+function renderChain() {
+    const body = $("chainBody");
+
+    if (!body) {
+        return;
+    }
+
+    body.innerHTML = "";
+
+    const metric =
+        $("greekMetric")?.value || "delta";
+
+    setText(
+        "ceGreekHead",
+        metric.toUpperCase()
+    );
+
+    setText(
+        "peGreekHead",
+        metric.toUpperCase()
+    );
+
+    let totalCallOi = 0;
+    let totalPutOi = 0;
+
+    const fragment =
+        document.createDocumentFragment();
+
+    chain.forEach((row) => {
+        totalCallOi += num(row.ce_oi);
+        totalPutOi += num(row.pe_oi);
+
+        const tableRow =
+            document.createElement("tr");
+
+        const isAtm =
+            row.atm === true ||
+            numbersEqual(
+                row.strike,
+                snapshot?.atm
+            );
+
+        if (isAtm) {
+            tableRow.classList.add("atm");
+        }
+
+        const callChangeClass =
+            num(row.ce_change_oi) >= 0
+                ? "positive"
+                : "negative";
+
+        const putChangeClass =
+            num(row.pe_change_oi) >= 0
+                ? "positive"
+                : "negative";
+
+        tableRow.innerHTML = `
+            <td>
+                ${oiL(row.ce_oi)}
+            </td>
+
+            <td class="${callChangeClass}">
+                ${signed(row.ce_change_oi)}
+            </td>
+
+            <td>
+                ${fmt(row.ce_ltp)}
+            </td>
+
+            <td>
+                ${
+                    nullableNumber(row.ce_iv) === null
+                        ? "-"
+                        : fmt(num(row.ce_iv) * 100)
+                }
+            </td>
+
+            <td class="positive">
+                ${metricValue(row, "ce")}
+            </td>
+
+            ${buildStrikeCell(row)}
+
+            <td class="negative">
+                ${metricValue(row, "pe")}
+            </td>
+
+            <td>
+                ${
+                    nullableNumber(row.pe_iv) === null
+                        ? "-"
+                        : fmt(num(row.pe_iv) * 100)
+                }
+            </td>
+
+            <td>
+                ${fmt(row.pe_ltp)}
+            </td>
+
+            <td class="${putChangeClass}">
+                ${signed(row.pe_change_oi)}
+            </td>
+
+            <td>
+                ${oiL(row.pe_oi)}
+            </td>
+        `;
+
+        fragment.appendChild(tableRow);
+    });
+
+    body.appendChild(fragment);
+
+    setText(
+        "callTotals",
+        `Total Call OI: ${oiL(totalCallOi)} L`
+    );
+
+    setText(
+        "putTotals",
+        `Total Put OI: ${oiL(totalPutOi)} L`
+    );
+}
+
+
+/* =========================================================
+   LEVELS AND GEX SUMMARY
+
+   R1, R2, ATM, S1 and S2 are now displayed inside the
+   strike column. The external Spot marker is hidden.
+   ========================================================= */
+
+function renderLevels() {
+    if (!snapshot) {
+        return;
+    }
+
+    const levels = snapshot.levels || {};
+
+    /*
+     * Hide the separate right-side Spot marker.
+     * Spot remains available in snapshot.spot for calculations.
+     */
+    setDisplay("spotMarker", "none");
+
+    /*
+     * Hide the separate Spot value in the levels summary,
+     * when that element exists.
+     */
+    setDisplay("spotLevel", "none");
+
+    /*
+     * Hide the old external R/S markers as the labels are now
+     * rendered directly inside the Strike column.
+     *
+     * Remove these four lines if you still want external
+     * R1/R2/S1/S2 markers in addition to the strike labels.
+     */
+    setDisplay("r2Marker", "none");
+    setDisplay("r1Marker", "none");
+    setDisplay("s1Marker", "none");
+    setDisplay("s2Marker", "none");
+
+    setText("r2Value", fmt(levels.r2));
+    setText("r1Value", fmt(levels.r1));
+    setText("s1Value", fmt(levels.s1));
+    setText("s2Value", fmt(levels.s2));
+
+    setText(
+        "gammaFlip",
+        fmt(levels.gamma_flip)
+    );
+
+    setText(
+        "zeroGamma",
+        fmt(levels.zero_gamma)
+    );
+
+    setText(
+        "maxPositive",
+        fmt(levels.max_positive_gex)
+    );
+
+    setText(
+        "maxNegative",
+        fmt(levels.max_negative_gex)
+    );
+
+    setText(
+        "callWall",
+        fmt(
+            levels.call_wall ??
+            snapshot.call_wall
+        )
+    );
+
+    setText(
+        "putWall",
+        fmt(
+            levels.put_wall ??
+            snapshot.put_wall
+        )
+    );
+
+    const totalGex =
+        levels.total_gex ??
+        snapshot.total_net_gex ??
+        snapshot.total_gex;
+
+    setText("totalGex", fmt(totalGex));
+
+    setText(
+        "marketBias",
+        num(totalGex) >= 0
+            ? "Bullish / stabilising"
+            : "Bearish / unstable"
+    );
+}
+
+
+/* =========================================================
+   EXPOSURE CALCULATIONS
+   ========================================================= */
+
+function exposures() {
+    if (!snapshot) {
+        return [];
+    }
+
+    const lotSize = num(snapshot.lot_size);
+    const spot = num(snapshot.spot);
+
+    return chain.map((row) => {
+        let value = 0;
+
+        if (activeView === "gex") {
+            value = num(row.net_gex);
+        }
+
+        if (activeView === "dex") {
+            value = (
+                num(row.ce_delta) *
+                num(row.ce_oi) +
+                num(row.pe_delta) *
+                num(row.pe_oi)
+            ) * lotSize * spot;
+        }
+
+        if (activeView === "vex") {
+            value = (
+                num(row.ce_vega) *
+                num(row.ce_oi) +
+                num(row.pe_vega) *
+                num(row.pe_oi)
+            ) * lotSize;
+        }
+
+        if (activeView === "tex") {
+            value = (
+                num(row.ce_theta) *
+                num(row.ce_oi) +
+                num(row.pe_theta) *
+                num(row.pe_oi)
+            ) * lotSize;
+        }
+
+        return {
+            strike: row.strike,
+            value,
+        };
+    });
+}
+
+
+/* =========================================================
+   EXPOSURE CHART
+   ========================================================= */
+
+function renderExposure() {
+    const canvas = $("exposureChart");
+
+    if (!canvas || typeof Chart === "undefined") {
+        return;
+    }
+
+    const titles = {
+        gex: "Gamma Exposure (GEX)",
+        dex: "Delta Exposure (DEX)",
+        vex: "Vega Exposure (VEX)",
+        tex: "Theta Exposure (TEX)",
+    };
+
+    const currentTitle =
+        titles[activeView] || titles.gex;
+
+    setText("chartTitle", currentTitle);
+
+    const rows = exposures();
+
+    if (exposureChart) {
+        exposureChart.destroy();
+        exposureChart = null;
+    }
+
+    exposureChart = new Chart(canvas, {
+        type: "bar",
+
+        data: {
+            labels: rows.map(
+                (row) => row.strike
+            ),
+
+            datasets: [
+                {
+                    label: currentTitle,
+
+                    data: rows.map(
+                        (row) => row.value
+                    ),
+
+                    backgroundColor: rows.map(
+                        (row) =>
+                            row.value >= 0
+                                ? "rgba(13,160,77,.9)"
+                                : "rgba(240,40,60,.9)"
+                    ),
+
+                    borderWidth: 0,
+                },
+            ],
+        },
+
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+
+            animation: {
+                duration: 250,
+            },
+
+            plugins: {
+                legend: {
+                    display: false,
+                },
+
+                tooltip: {
+                    callbacks: {
+                        label: (context) =>
+                            `${currentTitle}: ${fmt(context.raw)}`,
+                    },
+                },
+            },
+
+            scales: {
+                x: {
+                    title: {
+                        display: true,
+                        text: "Strike Price",
+                    },
+
+                    grid: {
+                        display: false,
+                    },
+
+                    ticks: {
+                        autoSkip: true,
+                        maxRotation: 45,
+                        minRotation: 0,
+                    },
+                },
+
+                y: {
+                    title: {
+                        display: true,
+                        text: "Exposure",
+                    },
+
+                    grid: {
+                        color: "#e8edf3",
+                    },
+                },
+            },
+        },
+    });
+}
+
+
+/* =========================================================
+   EVENT LISTENERS
+   ========================================================= */
+
+function registerEventListeners() {
+    $("refreshBtn")?.addEventListener(
+        "click",
+        () => {
+            stopPlayback();
+            loadChain();
+        }
+    );
+
+    $("prevIntervalBtn")?.addEventListener(
+        "click",
+        () => {
+            stopPlayback();
+            moveInterval(-1);
+        }
+    );
+
+    $("nextIntervalBtn")?.addEventListener(
+        "click",
+        () => {
+            stopPlayback();
+            moveInterval(1);
+        }
+    );
+
+    $("playPauseBtn")?.addEventListener(
+        "click",
+        togglePlayback
+    );
+
+    $("queryTime")?.addEventListener(
+        "change",
+        () => {
+            stopPlayback();
+            loadChain();
+        }
+    );
+
+    $("queryDate")?.addEventListener(
+        "change",
+        () => {
+            stopPlayback();
+            loadChain();
+        }
+    );
+
+    $("interval")?.addEventListener(
+        "change",
+        () => {
+            stopPlayback();
+            loadChain();
+        }
+    );
+
+    $("strikeCount")?.addEventListener(
+        "change",
+        () => {
+            stopPlayback();
+            loadChain();
+        }
+    );
+
+    $("greekMetric")?.addEventListener(
+        "change",
+        renderChain
+    );
+
+    $("expirySelect")?.addEventListener(
+        "change",
+        () => {
+            stopPlayback();
+            loadChain();
+        }
+    );
+
+    $("symbol")?.addEventListener(
+        "change",
+        async () => {
+            stopPlayback();
+
+            try {
+                const expirySelect =
+                    $("expirySelect");
+
+                if (expirySelect) {
+                    expirySelect.value = "";
+                }
+
+                await loadDefaults();
+                await loadChain();
+            } catch (error) {
+                console.error(
+                    "Symbol change failed:",
+                    error
+                );
+
+                alert(
+                    error instanceof Error
+                        ? error.message
+                        : "Unable to change instrument."
+                );
+            }
+        }
+    );
+
+    document
+        .querySelectorAll(
+            ".exposure-tabs button"
+        )
+        .forEach((button) => {
+            button.addEventListener(
+                "click",
+                () => {
+                    document
+                        .querySelectorAll(
+                            ".exposure-tabs button"
+                        )
+                        .forEach((item) => {
+                            item.classList.remove(
+                                "active"
+                            );
+                        });
+
+                    button.classList.add("active");
+
+                    activeView =
+                        button.dataset.view || "gex";
+
+                    renderExposure();
+                }
+            );
+        });
+}
+
+
+/* =========================================================
+   APPLICATION INITIALIZATION
+   ========================================================= */
+
+async function initializeApplication() {
+    registerEventListeners();
+    updatePlayButton();
+
+    try {
+        await loadDefaults();
+        await loadChain();
+    } catch (error) {
+        console.error(
+            "Application initialization failed:",
+            error
+        );
+
+        alert(
+            error instanceof Error
+                ? error.message
+                : "Unable to initialize the simulator."
+        );
+    }
+}
+
+document.addEventListener(
+    "DOMContentLoaded",
+    initializeApplication
+);
