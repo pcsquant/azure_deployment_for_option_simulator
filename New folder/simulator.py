@@ -1290,6 +1290,7 @@ def build_option_chain_snapshot(
     expiry_str = str(expiry_str).strip()
 
     cache_key = (
+        "chain-gex-v1",
         dataset,
         date_str,
         expiry_str,
@@ -1523,7 +1524,74 @@ def build_option_chain_snapshot(
     ):
         if column not in chain_df.columns:
             chain_df[column] = np.nan
+
     timings["iv_greeks_ms"] = round((time.perf_counter() - stage) * 1000, 3)
+
+    # =========================================================
+    # GAMMA EXPOSURE (GEX)
+    # =========================================================
+    # Exposure is expressed for an approximately 1% move in the underlying:
+    #     gamma * open_interest * lot_size * spot^2 * 0.01
+    # Calls are positive and puts are negative by the frontend's convention.
+    stage = time.perf_counter()
+    lot_size = int(LOT_SIZE_BY_INSTRUMENT.get(dataset, 65))
+
+    for column in ("ce_oi", "pe_oi", "ce_gamma", "pe_gamma"):
+        chain_df[column] = pd.to_numeric(chain_df[column], errors="coerce")
+
+    gex_scale = float(lot_size) * (float(spot) ** 2) * 0.01
+
+    chain_df["ce_gex"] = chain_df["ce_gamma"] * chain_df["ce_oi"] * gex_scale
+    chain_df["pe_gex"] = -chain_df["pe_gamma"] * chain_df["pe_oi"] * gex_scale
+    chain_df["net_gex"] = (
+        chain_df["ce_gex"].fillna(0.0)
+        + chain_df["pe_gex"].fillna(0.0)
+    )
+
+    # Compatibility aliases used by some frontend implementations.
+    chain_df["call_gex"] = chain_df["ce_gex"]
+    chain_df["put_gex"] = chain_df["pe_gex"]
+
+    total_call_gex = _safe_float(chain_df["ce_gex"].sum(min_count=1))
+    total_put_gex = _safe_float(chain_df["pe_gex"].sum(min_count=1))
+    total_net_gex = _safe_float(chain_df["net_gex"].sum(min_count=1), 0.0)
+
+    call_wall = None
+    valid_call_wall = chain_df.dropna(subset=["strike", "ce_gex"])
+    if not valid_call_wall.empty:
+        call_wall = _safe_int(
+            valid_call_wall.loc[valid_call_wall["ce_gex"].idxmax(), "strike"]
+        )
+
+    put_wall = None
+    valid_put_wall = chain_df.dropna(subset=["strike", "pe_gex"])
+    if not valid_put_wall.empty:
+        # Put GEX is negative, so the minimum is the largest absolute put exposure.
+        put_wall = _safe_int(
+            valid_put_wall.loc[valid_put_wall["pe_gex"].idxmin(), "strike"]
+        )
+
+    absolute_gex_wall = None
+    if not chain_df.empty:
+        absolute_net = pd.to_numeric(chain_df["net_gex"], errors="coerce").abs()
+        if absolute_net.notna().any():
+            absolute_gex_wall = _safe_int(
+                chain_df.loc[absolute_net.idxmax(), "strike"]
+            )
+
+    logger.info(
+        "GEX calculated dataset=%s date=%s time=%s valid_ce=%d valid_pe=%d "
+        "total_call_gex=%s total_put_gex=%s total_net_gex=%s",
+        dataset,
+        date_str,
+        query_time,
+        int(chain_df["ce_gex"].notna().sum()),
+        int(chain_df["pe_gex"].notna().sum()),
+        total_call_gex,
+        total_put_gex,
+        total_net_gex,
+    )
+    timings["gex_ms"] = round((time.perf_counter() - stage) * 1000, 3)
 
     stage = time.perf_counter()
     chain_rows = [
@@ -1546,8 +1614,13 @@ def build_option_chain_snapshot(
             "pe_iv": _round_or_none(row.pe_iv, 4),
             "ce_delta": _round_or_none(row.ce_delta, 4),
             "pe_delta": _round_or_none(row.pe_delta, 4),
-            "ce_gamma": _round_or_none(row.ce_gamma, 6),
-            "pe_gamma": _round_or_none(row.pe_gamma, 6),
+            "ce_gamma": _round_or_none(row.ce_gamma, 8),
+            "pe_gamma": _round_or_none(row.pe_gamma, 8),
+            "ce_gex": _round_or_none(row.ce_gex, 2),
+            "pe_gex": _round_or_none(row.pe_gex, 2),
+            "net_gex": _round_or_none(row.net_gex, 2),
+            "call_gex": _round_or_none(row.call_gex, 2),
+            "put_gex": _round_or_none(row.put_gex, 2),
             "ce_vega": _round_or_none(row.ce_vega, 4),
             "pe_vega": _round_or_none(row.pe_vega, 4),
             "ce_theta": _round_or_none(row.ce_theta, 4),
@@ -1588,7 +1661,18 @@ def build_option_chain_snapshot(
         "day_open": round(float(day_open), 2),
         "atm": int(atm),
         "strike_step": strike_step,
-        "lot_size": int(LOT_SIZE_BY_INSTRUMENT.get(dataset, 65)),
+        "lot_size": lot_size,
+        "gex_unit": "currency exposure for an approximately 1% underlying move",
+        "total_call_gex": _round_or_none(total_call_gex, 2),
+        "total_put_gex": _round_or_none(total_put_gex, 2),
+        "total_net_gex": _round_or_none(total_net_gex, 2),
+        "call_wall": call_wall,
+        "put_wall": put_wall,
+        "absolute_gex_wall": absolute_gex_wall,
+        # Additional aliases for frontend compatibility.
+        "call_gamma_wall": call_wall,
+        "put_gamma_wall": put_wall,
+        "gamma_wall": absolute_gex_wall,
         "interval": candle_interval_minutes,
         "max_allowed_query_date": MAX_ALLOWED_QUERY_DATE.strftime("%Y-%m-%d"),
         "window_candles_before": WINDOW_CANDLES_BEFORE,
