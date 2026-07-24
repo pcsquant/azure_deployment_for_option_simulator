@@ -1,20 +1,9 @@
-"""
-Production data engine for the historical Options Simulator.
-
-Azure/local layout:
-    <week-folder>/<YYYYMMDD>/IDX_TICK/<SYMBOL>.parquet
-    <week-folder>/<YYYYMMDD>/OPT_TICK/<SYMBOL>.parquet
-    <week-folder>/<YYYYMMDD>/FUT_TICK/<SYMBOL>.parquet
-
-All caches are process-local RAM caches. This module does not create a
-shared disk-cache directory. Index loading supports both the production
-type-first layout and legacy date-first uploads.
-"""
-
+import hashlib
 import logging
 import os
 import re
 import time
+from pathlib import Path
 from threading import Lock
 
 import numpy as np
@@ -130,88 +119,52 @@ def _join_storage_path(*parts):
     return "/".join(cleaned)
 
 
-def _resolve_data_folder(week_folder, data_type, date_str=None):
-    """
-    Resolve the actual production storage layout:
-
-        <week-folder>/<YYYYMMDD>/<DATA_TYPE>/
-
-    A type-first layout is retained as a local fallback:
-
-        <week-folder>/<DATA_TYPE>/<YYYYMMDD>/
-    """
-    week_folder = str(week_folder)
-    data_type = str(data_type).upper().strip()
-    normalized_date = (
-        str(date_str).replace("-", "").replace("/", "").strip()
-        if date_str is not None
-        else ""
-    )
-
+def _get_idx_folder(week_folder, date_str=None):
+    """Resolve <week>/<YYYYMMDD>/IDX_TICK with legacy fallback."""
     if STORAGE_MODE == "blob":
-        if normalized_date:
-            return _join_storage_path(
-                week_folder,
-                normalized_date,
-                data_type,
-            )
+        if date_str:
+            return _join_storage_path(week_folder, date_str, "IDX_TICK")
+        return _join_storage_path(week_folder, "IDX_TICK")
 
-        return _join_storage_path(week_folder, data_type)
-
-    candidates = []
-
-    if normalized_date:
-        candidates.extend(
-            [
-                os.path.join(
-                    week_folder,
-                    normalized_date,
-                    data_type,
-                ),
-                os.path.join(
-                    week_folder,
-                    data_type,
-                    normalized_date,
-                ),
-            ]
-        )
-
-    candidates.extend(
-        [
-            os.path.join(week_folder, data_type),
-            week_folder,
-        ]
-    )
-
-    for candidate in candidates:
+    if date_str:
+        candidate = os.path.join(week_folder, str(date_str), "IDX_TICK")
         if os.path.isdir(candidate):
             return candidate
 
-    return candidates[0] if candidates else week_folder
-
-
-def _get_idx_folder(week_folder, date_str=None):
-    return _resolve_data_folder(
-        week_folder,
-        "IDX_TICK",
-        date_str,
-    )
+    legacy = os.path.join(week_folder, "IDX_TICK")
+    return legacy if os.path.isdir(legacy) else week_folder
 
 
 def _get_opt_folder(week_folder, date_str=None):
-    return _resolve_data_folder(
-        week_folder,
-        "OPT_TICK",
-        date_str,
-    )
+    """Resolve <week>/<YYYYMMDD>/OPT_TICK with legacy fallback."""
+    if STORAGE_MODE == "blob":
+        if date_str:
+            return _join_storage_path(week_folder, date_str, "OPT_TICK")
+        return _join_storage_path(week_folder, "OPT_TICK")
+
+    if date_str:
+        candidate = os.path.join(week_folder, str(date_str), "OPT_TICK")
+        if os.path.isdir(candidate):
+            return candidate
+
+    legacy = os.path.join(week_folder, "OPT_TICK")
+    return legacy if os.path.isdir(legacy) else week_folder
 
 
 def _get_fut_folder(week_folder, date_str=None):
-    return _resolve_data_folder(
-        week_folder,
-        "FUT_TICK",
-        date_str,
-    )
+    """Resolve <week>/<YYYYMMDD>/FUT_TICK with legacy fallback."""
+    if STORAGE_MODE == "blob":
+        if date_str:
+            return _join_storage_path(week_folder, date_str, "FUT_TICK")
+        return _join_storage_path(week_folder, "FUT_TICK")
+
+    if date_str:
+        candidate = os.path.join(week_folder, str(date_str), "FUT_TICK")
+        if os.path.isdir(candidate):
+            return candidate
+
+    legacy = os.path.join(week_folder, "FUT_TICK")
+    return legacy if os.path.isdir(legacy) else week_folder
 
 
 def _normalize_storage_folder(folder):
@@ -589,338 +542,41 @@ def load_tick_data(folder_or_path, instrument="NIFTY"):
     return pd.DataFrame(columns=["datetime", "value"])
 
 
-def _index_prefix_candidates(
-    folder,
-    date_str,
-):
-    """
-    Return possible index prefixes in priority order.
-
-    Actual production layout:
-        <week>/<YYYYMMDD>/IDX_TICK/
-
-    Supported fallback layouts:
-        <week>/IDX_TICK/<YYYYMMDD>/
-        <week>/IDX_TICK/
-        <week>/
-    """
-    normalized_folder = (
-        str(folder)
-        .replace("\\", "/")
-        .strip("/")
-    )
-
-    normalized_date = (
-        str(date_str)
-        .replace("-", "")
-        .replace("/", "")
-        .strip()
-    )
-
-    candidates = [
-        _join_storage_path(
-            normalized_folder,
-            normalized_date,
-            "IDX_TICK",
-        ),
-        _join_storage_path(
-            normalized_folder,
-            "IDX_TICK",
-            normalized_date,
-        ),
-        _join_storage_path(
-            normalized_folder,
-            "IDX_TICK",
-        ),
-        normalized_folder,
-    ]
-
-    result = []
-
-    for candidate in candidates:
-        if candidate and candidate not in result:
-            result.append(candidate)
-
-    return result
-
-
-def _match_index_blob_name(
-    blob_name,
-    symbol_name,
-    date_str,
-):
-    """
-    Return True when a blob name looks like the requested index file.
-    """
-    normalized_blob = (
-        str(blob_name)
-        .replace("\\", "/")
-        .strip("/")
-    )
-
-    filename = normalized_blob.rsplit("/", 1)[-1]
-    stem = os.path.splitext(filename)[0].upper()
-
-    symbol = str(symbol_name).upper().strip()
-    normalized_date = str(date_str).replace("-", "").strip()
-
-    accepted_stems = {
-        symbol,
-        f"{symbol}_{normalized_date}",
-        f"{symbol}{normalized_date}",
-        normalized_date,
-    }
-
-    if stem not in accepted_stems:
-        return False
-
-    # Prefer files whose full path contains the requested trading date.
-    # Files without a date token are still accepted for legacy weekly files.
-    path_tokens = normalized_blob.split("/")
-
-    return (
-        normalized_date in path_tokens
-        or normalized_date in stem
-        or stem == symbol
-    )
-
-
 def load_index_data_by_symbol(
     folder,
     date_str,
     symbol_name="INDIAVIX",
 ):
-    """
-    Load index ticks for a selected trading day.
+    idx_folder = _get_idx_folder(folder, date_str)
+    symbol_name = str(symbol_name).upper().strip()
 
-    Preferred Azure/local layout:
-        <week>/<YYYYMMDD>/IDX_TICK/<SYMBOL>.parquet
-
-    The loader also supports legacy layouts and performs a final recursive
-    lookup under the week folder so a small upload-layout difference does not
-    make the API fail immediately.
-    """
-    normalized_date = (
-        str(date_str)
-        .replace("-", "")
-        .replace("/", "")
-        .strip()
-    )
-
-    symbol_name = (
-        str(symbol_name)
-        .upper()
-        .strip()
-    )
-
-    empty = pd.DataFrame(
-        columns=["datetime", "value"]
-    )
-
-    if not re.fullmatch(r"\d{8}", normalized_date):
-        logger.warning(
-            "Invalid index date: %r",
-            date_str,
-        )
-        return empty
-
-    if not symbol_name:
-        logger.warning(
-            "Index symbol cannot be empty."
-        )
-        return empty
-
-    candidate_names = [
-        f"{symbol_name}.parquet",
+    possible_names = [
         symbol_name,
-        f"{symbol_name}_{normalized_date}.parquet",
-        f"{symbol_name}{normalized_date}.parquet",
-        f"{normalized_date}.parquet",
+        f"{symbol_name}.parquet",
     ]
 
-    prefixes = _index_prefix_candidates(
-        folder,
-        normalized_date,
-    )
-
-    logger.info(
-        "Searching index data symbol=%s date=%s prefixes=%s",
-        symbol_name,
-        normalized_date,
-        prefixes,
-    )
-
-    # ---------------------------------------------------------
-    # 1. Fast exact-name search under all supported prefixes
-    # ---------------------------------------------------------
-    for prefix in prefixes:
-        for filename in candidate_names:
-            try:
-                path = _find_parquet_file(
-                    prefix,
-                    filename,
-                )
-            except Exception as exc:
-                logger.exception(
-                    "Index search failed prefix=%s filename=%s error=%s",
-                    prefix,
-                    filename,
-                    exc,
-                )
-                continue
-
-            if not path:
-                continue
-
-            logger.info(
-                "Using index source path=%s",
-                path,
-            )
-
-            try:
-                result = _read_parquet_normalized(
-                    path,
-                    mode="spot",
-                )
-            except Exception as exc:
-                logger.exception(
-                    "Index read failed path=%s error=%s",
-                    path,
-                    exc,
-                )
-                continue
-
-            if result is None or result.empty:
-                continue
-
-            requested = result[
-                result["datetime"].dt.strftime("%Y%m%d")
-                == normalized_date
-            ]
-
-            if not requested.empty:
-                return (
-                    requested
-                    .sort_values("datetime")
-                    .reset_index(drop=True)
-                )
-
-            logger.warning(
-                "Index source has no rows for date=%s path=%s",
-                normalized_date,
-                path,
-            )
-
-    # ---------------------------------------------------------
-    # 2. Recursive fallback under the complete week folder
-    # ---------------------------------------------------------
-    normalized_folder = (
-        str(folder)
-        .replace("\\", "/")
-        .strip("/")
-    )
-
-    try:
-        if STORAGE_MODE == "blob":
-            candidate_paths = list_blob_names(
-                normalized_folder
-            )
-        else:
-            if not os.path.isdir(normalized_folder):
-                candidate_paths = []
-            else:
-                candidate_paths = [
-                    os.path.join(root, filename)
-                    for root, _, files in os.walk(
-                        normalized_folder
-                    )
-                    for filename in files
-                ]
-    except Exception as exc:
-        logger.exception(
-            "Unable to recursively list index files under %s: %s",
-            normalized_folder,
-            exc,
-        )
-        candidate_paths = []
-
-    matched_paths = []
-
-    for candidate_path in candidate_paths:
-        candidate_path = str(candidate_path)
-
-        if not candidate_path.lower().endswith(
-            ".parquet"
-        ):
-            continue
-
-        if _match_index_blob_name(
-            candidate_path,
-            symbol_name,
-            normalized_date,
-        ):
-            matched_paths.append(candidate_path)
-
-    # Prefer paths explicitly containing the date folder.
-    matched_paths.sort(
-        key=lambda value: (
-            normalized_date not in str(value),
-            len(str(value)),
-            str(value),
-        )
-    )
-
-    for path in matched_paths:
-        logger.info(
-            "Using recursive index fallback path=%s",
-            path,
+    for filename in possible_names:
+        path = _find_parquet_file(
+            idx_folder,
+            filename,
         )
 
-        try:
-            result = _read_parquet_normalized(
+        if path:
+            return _read_parquet_normalized(
                 path,
                 mode="spot",
             )
-        except Exception as exc:
-            logger.exception(
-                "Recursive index read failed path=%s error=%s",
-                path,
-                exc,
-            )
-            continue
 
-        if result is None or result.empty:
-            continue
-
-        requested = result[
-            result["datetime"].dt.strftime("%Y%m%d")
-            == normalized_date
-        ]
-
-        if not requested.empty:
-            return (
-                requested
-                .sort_values("datetime")
-                .reset_index(drop=True)
-            )
-
-    logger.warning(
-        "Index source not found symbol=%s date=%s "
-        "week_folder=%s checked_prefixes=%s",
-        symbol_name,
-        normalized_date,
-        normalized_folder,
-        prefixes,
+    return pd.DataFrame(
+        columns=["datetime", "value"]
     )
-
-    return empty
 
 
 # =========================================================
 # OPTIONS - NEW OPTION PATH ONLY
 # =========================================================
 
-CONSOLIDATED_SCHEMA_VERSION = 3
+CONSOLIDATED_SCHEMA_VERSION = 4
 
 
 def consolidated_chain_folder(week_folder, date_str):
@@ -949,6 +605,23 @@ def consolidated_chain_path(
 _OPTION_CHAIN_CACHE = {}
 _OPTION_CHAIN_CACHE_LOCK = Lock()
 
+_DEFAULT_CACHE_DIR = (
+    Path.home() / ".cache" / "option-simulator" / "option_chain"
+)
+SHARED_OPTION_CACHE_DIR = os.path.abspath(
+    os.path.expanduser(
+        os.getenv("SHARED_OPTION_CACHE_DIR", str(_DEFAULT_CACHE_DIR))
+    )
+)
+os.makedirs(SHARED_OPTION_CACHE_DIR, exist_ok=True)
+
+
+def _option_chain_disk_cache_path(cache_key):
+    key_hash = hashlib.md5(
+        cache_key.encode("utf-8"), usedforsecurity=False
+    ).hexdigest()
+    return os.path.join(SHARED_OPTION_CACHE_DIR, f"{key_hash}.parquet")
+
 
 def _load_consolidated_option_source(
     path=None,
@@ -966,7 +639,7 @@ def _load_consolidated_option_source(
     1. Direct path:
 
         _load_consolidated_option_source(
-            "166 13 Jul to 17 Jul (NSE FO) - TICK/"
+            "166 13 Jul to 17 Jul (NSE FO) - TICK - CSV/"
             "20260717/OPT_TICK/NIFTY.parquet"
         )
 
@@ -1038,11 +711,11 @@ def _load_consolidated_option_source(
         #         OPT_TICK/
         #             NIFTY.parquet
         #
-        path = _join_storage_path(
-            normalized_folder,
-            normalized_date,
-            "OPT_TICK",
-            f"{instrument}.parquet",
+        path = (
+            f"{normalized_folder}/"
+            f"{normalized_date}/"
+            f"OPT_TICK/"
+            f"{instrument}.parquet"
         )
 
     normalized_path = (
@@ -1269,83 +942,79 @@ def load_consolidated_option_chain(
     instrument="NIFTY",
 ):
     """
-    Load and normalize consolidated option data.
+    Normalize one consolidated daily option Parquet file.
 
-    Returns:
-        timestamp
-        strike
-        ce
-        pe
-        ce_oi
-        pe_oi
+    Azure production layout:
+        <week>/<YYYYMMDD>/OPT_TICK/<SYMBOL>.parquet
+
+    Output columns:
+        timestamp, strike, ce, pe, ce_oi, pe_oi
     """
-    path = consolidated_chain_path(
-        folder,
-        date_str,
-        expiry_str,
-        instrument,
-    )
-
+    path = consolidated_chain_path(folder, date_str, expiry_str, instrument)
     cache_key = (
-        f"schema-oi-v1|{STORAGE_MODE}|{path}|"
+        f"schema-{CONSOLIDATED_SCHEMA_VERSION}|{STORAGE_MODE}|{path}|"
         f"{date_str}|{expiry_str}|{str(instrument).upper()}"
     )
+    disk_cache_path = _option_chain_disk_cache_path(cache_key)
+    expected_columns = {
+        "timestamp", "strike", "ce", "pe", "ce_oi", "pe_oi"
+    }
 
     with _OPTION_CHAIN_CACHE_LOCK:
         cached = _OPTION_CHAIN_CACHE.get(cache_key)
-
-    if cached is not None:
+    if cached is not None and expected_columns.issubset(cached.columns):
         return cached.copy()
+
+    if os.path.isfile(disk_cache_path):
+        try:
+            cached_df = pd.read_parquet(disk_cache_path)
+            if expected_columns.issubset(cached_df.columns):
+                with _OPTION_CHAIN_CACHE_LOCK:
+                    _OPTION_CHAIN_CACHE[cache_key] = cached_df.copy()
+                return cached_df.copy()
+        except Exception:
+            try:
+                os.remove(disk_cache_path)
+            except OSError:
+                pass
 
     if STORAGE_MODE == "blob":
         try:
             if not blob_exists(path):
-                logger.warning(
-                    "Option Parquet not found: %s",
-                    path,
-                )
+                logger.warning("Option Parquet not found: %s", path)
                 return None
         except Exception as exc:
-            logger.exception(
-                "Unable to check option blob %s: %s",
-                path,
-                exc,
-            )
+            logger.exception("Unable to check option blob %s: %s", path, exc)
             return None
-
     elif not os.path.isfile(path):
-        logger.warning(
-            "Option Parquet not found: %s",
-            path,
-        )
+        logger.warning("Option Parquet not found: %s", path)
         return None
 
     source = _load_consolidated_option_source(path)
-
     if source is None or source.empty:
         return None
 
-    lower = {
-        str(column).strip().lower(): column
-        for column in source.columns
-    }
-
-    required = {
-        "date",
-        "time",
-        "price",
-        "contract_name",
-    }
-
+    lower = {str(c).strip().lower(): c for c in source.columns}
+    required = {"date", "time", "price", "contract_name"}
     if not required.issubset(lower):
         logger.error(
-            "Unsupported option schema in %s. "
-            "Required=%s Available=%s",
-            path,
-            sorted(required),
-            list(source.columns),
+            "Unsupported option schema in %s. Required=%s Available=%s",
+            path, sorted(required), list(source.columns),
         )
         return None
+
+    # Support the common OI column names used by tick vendors.
+    oi_source_column = (
+        lower.get("oi")
+        or lower.get("open_interest")
+        or lower.get("openinterest")
+    )
+    if oi_source_column is None:
+        logger.warning(
+            "Option source has no OI column: path=%s available=%s",
+            path,
+            list(source.columns),
+        )
 
     selected_columns = [
         lower["date"],
@@ -1353,113 +1022,53 @@ def load_consolidated_option_chain(
         lower["price"],
         lower["contract_name"],
     ]
-
-    has_oi = "oi" in lower
-
-    if has_oi:
-        selected_columns.append(lower["oi"])
+    if oi_source_column is not None:
+        selected_columns.append(oi_source_column)
 
     work = source[selected_columns].copy()
-
-    if has_oi:
-        work.columns = [
-            "date",
-            "time",
-            "price",
-            "contract_name",
-            "oi",
-        ]
+    if oi_source_column is not None:
+        work.columns = ["date", "time", "price", "contract_name", "oi"]
     else:
-        work.columns = [
-            "date",
-            "time",
-            "price",
-            "contract_name",
-        ]
+        work.columns = ["date", "time", "price", "contract_name"]
         work["oi"] = np.nan
 
-    requested_date = pd.to_numeric(
-        str(date_str),
-        errors="coerce",
-    )
-
+    requested_date = pd.to_numeric(str(date_str), errors="coerce")
     if pd.isna(requested_date):
         return None
 
-    work["date"] = pd.to_numeric(
-        work["date"],
-        errors="coerce",
-    )
-
-    work = work[
-        work["date"] == int(requested_date)
-    ]
-
+    work["date"] = pd.to_numeric(work["date"], errors="coerce")
+    work = work[work["date"] == int(requested_date)]
     if work.empty:
-        logger.warning(
-            "No option rows for date=%s in %s",
-            date_str,
-            path,
-        )
+        logger.warning("No option rows for date=%s in %s", date_str, path)
         return None
 
     contract = (
-        work["contract_name"]
-        .astype(str)
-        .str.strip()
-        .str.upper()
+        work["contract_name"].astype(str).str.strip().str.upper()
         .str.replace(".PARQUET", "", regex=False)
         .str.replace(".CSV", "", regex=False)
+        .str.replace(r"\s+", "", regex=True)
     )
-
     extracted = contract.str.extract(
-        r"^(?P<symbol>[A-Z]+)"
-        r"(?P<expiry>\d{6})"
-        r"(?P<strike>\d+(?:\.\d+)?)"
-        r"(?P<option_type>CE|PE)$"
+        r"^(?P<symbol>[A-Z]+)(?P<expiry>\d{6})"
+        r"(?P<strike>\d+(?:\.\d+)?)(?P<option_type>CE|PE)$"
     )
-
     work = work.join(extracted)
 
     cfg = get_dataset_config(instrument)
     symbol = str(cfg["symbol"]).upper()
-
-    work["price"] = pd.to_numeric(
-        work["price"],
-        errors="coerce",
-    )
-
-    work["oi"] = pd.to_numeric(
-        work["oi"],
-        errors="coerce",
-    )
-
-    work["strike"] = pd.to_numeric(
-        work["strike"],
-        errors="coerce",
-    )
-
-    work = work.dropna(
-        subset=[
-            "price",
-            "strike",
-        ]
-    )
-
+    work["price"] = pd.to_numeric(work["price"], errors="coerce")
+    work["oi"] = pd.to_numeric(work["oi"], errors="coerce")
+    work["strike"] = pd.to_numeric(work["strike"], errors="coerce")
+    work = work.dropna(subset=["price", "strike"])
     work = work[
         work["symbol"].eq(symbol)
         & work["expiry"].eq(str(expiry_str).strip())
         & work["option_type"].isin(["CE", "PE"])
     ]
-
     if work.empty:
         logger.warning(
-            "No option contracts matched "
-            "instrument=%s date=%s expiry=%s path=%s",
-            symbol,
-            date_str,
-            expiry_str,
-            path,
+            "No option contracts matched instrument=%s date=%s expiry=%s in %s",
+            symbol, date_str, expiry_str, path,
         )
         return None
 
@@ -1469,157 +1078,98 @@ def load_consolidated_option_chain(
         + work["time"].astype(str),
         errors="coerce",
     )
-
     work = work.dropna(subset=["timestamp"])
-
-    if work["timestamp"].dt.tz is None:
-        work["timestamp"] = (
-            work["timestamp"]
-            .dt.tz_localize(
-                IST,
-                ambiguous="NaT",
-                nonexistent="NaT",
-            )
+    if getattr(work["timestamp"].dt, "tz", None) is None:
+        work["timestamp"] = work["timestamp"].dt.tz_localize(
+            IST, ambiguous="NaT", nonexistent="NaT"
         )
     else:
-        work["timestamp"] = (
-            work["timestamp"]
-            .dt.tz_convert(IST)
-        )
+        work["timestamp"] = work["timestamp"].dt.tz_convert(IST)
 
     work = work.dropna(subset=["timestamp"])
-
     work = work[
         (work["timestamp"].dt.time >= SESSION_START)
         & (work["timestamp"].dt.time <= SESSION_END)
     ]
-
     if work.empty:
         return None
 
-    work["strike"] = (
-        work["strike"]
-        .round()
-        .astype("int32")
-    )
+    work["strike"] = work["strike"].round().astype("int32")
+    work["timestamp"] = work["timestamp"].dt.floor("min")
 
-    work["timestamp"] = (
-        work["timestamp"]
-        .dt.floor("min")
-    )
-
+    # Keep the final tick for each minute/strike/side. OI is a stock value,
+    # therefore the last observation is the correct minute snapshot.
     work = (
-        work
-        .sort_values("timestamp", kind="mergesort")
+        work.sort_values("timestamp", kind="mergesort")
         .drop_duplicates(
-            [
-                "timestamp",
-                "strike",
-                "option_type",
-            ],
+            ["timestamp", "strike", "option_type"],
             keep="last",
         )
     )
 
     price_pivot = (
         work.pivot_table(
-            index=[
-                "timestamp",
-                "strike",
-            ],
+            index=["timestamp", "strike"],
             columns="option_type",
             values="price",
             aggfunc="last",
         )
         .reset_index()
-        .rename(
-            columns={
-                "CE": "ce",
-                "PE": "pe",
-            }
-        )
+        .rename(columns={"CE": "ce", "PE": "pe"})
     )
+    price_pivot.columns.name = None
 
     oi_pivot = (
         work.pivot_table(
-            index=[
-                "timestamp",
-                "strike",
-            ],
+            index=["timestamp", "strike"],
             columns="option_type",
             values="oi",
             aggfunc="last",
+            dropna=False,
         )
         .reset_index()
-        .rename(
-            columns={
-                "CE": "ce_oi",
-                "PE": "pe_oi",
-            }
-        )
+        .rename(columns={"CE": "ce_oi", "PE": "pe_oi"})
     )
-
-    price_pivot.columns.name = None
     oi_pivot.columns.name = None
 
     out = price_pivot.merge(
         oi_pivot,
-        on=[
-            "timestamp",
-            "strike",
-        ],
+        on=["timestamp", "strike"],
         how="left",
     )
-
-    for column in [
-        "ce",
-        "pe",
-        "ce_oi",
-        "pe_oi",
-    ]:
+    for column in ("ce", "pe", "ce_oi", "pe_oi"):
         if column not in out.columns:
             out[column] = np.nan
 
     out = (
-        out[
-            [
-                "timestamp",
-                "strike",
-                "ce",
-                "pe",
-                "ce_oi",
-                "pe_oi",
-            ]
-        ]
-        .sort_values(
-            [
-                "timestamp",
-                "strike",
-            ],
-            kind="mergesort",
-        )
+        out[["timestamp", "strike", "ce", "pe", "ce_oi", "pe_oi"]]
+        .sort_values(["timestamp", "strike"], kind="mergesort")
         .reset_index(drop=True)
     )
-
     if out.empty:
         return None
 
     with _OPTION_CHAIN_CACHE_LOCK:
         _OPTION_CHAIN_CACHE[cache_key] = out.copy()
 
+    try:
+        tmp = f"{disk_cache_path}.{os.getpid()}.tmp"
+        out.to_parquet(tmp, index=False)
+        os.replace(tmp, disk_cache_path)
+    except Exception as exc:
+        logger.warning("Unable to save option-chain cache %s: %s", disk_cache_path, exc)
+
     logger.info(
-        "Loaded option chain with OI "
-        "instrument=%s date=%s expiry=%s "
-        "rows=%d strikes=%d",
+        "Loaded option chain with OI instrument=%s date=%s expiry=%s "
+        "rows=%d strikes=%d oi_non_null=%d",
         symbol,
         date_str,
         expiry_str,
         len(out),
         out["strike"].nunique(),
+        int(out[["ce_oi", "pe_oi"]].notna().sum().sum()),
     )
-
     return out.copy()
-
 
 def load_required_option_data_for_date(
     folder,
@@ -1628,9 +1178,12 @@ def load_required_option_data_for_date(
     strike,
     instrument="NIFTY",
 ):
-    """Return CE and PE time-series for one strike from the consolidated chain."""
-    empty_frame = pd.DataFrame(columns=["datetime", "price", "volume"])
+    """Return CE and PE time-series with price, volume and OI."""
+    empty_frame = pd.DataFrame(
+        columns=["datetime", "price", "volume", "oi"]
+    )
     empty = {"CE": empty_frame.copy(), "PE": empty_frame.copy()}
+
     try:
         strike_value = int(float(strike))
     except (TypeError, ValueError, OverflowError):
@@ -1641,20 +1194,30 @@ def load_required_option_data_for_date(
     )
     if chain is None or chain.empty:
         return empty
-    selected = chain[pd.to_numeric(chain["strike"], errors="coerce") == strike_value]
+
+    selected = chain[
+        pd.to_numeric(chain["strike"], errors="coerce") == strike_value
+    ]
     if selected.empty:
         return empty
 
     result = {}
-    for side, column in (("CE", "ce"), ("PE", "pe")):
+    for side, price_column, oi_column in (
+        ("CE", "ce", "ce_oi"),
+        ("PE", "pe", "pe_oi"),
+    ):
         frame = pd.DataFrame({
             "datetime": pd.to_datetime(selected["timestamp"], errors="coerce"),
-            "price": pd.to_numeric(selected[column], errors="coerce"),
+            "price": pd.to_numeric(selected[price_column], errors="coerce"),
             "volume": 0,
+            "oi": pd.to_numeric(selected[oi_column], errors="coerce"),
         }).dropna(subset=["datetime", "price"])
         result[side] = frame.sort_values("datetime").reset_index(drop=True)
-    return result
 
+    return {
+        "CE": result.get("CE", empty["CE"]),
+        "PE": result.get("PE", empty["PE"]),
+    }
 
 def load_single_option_file_from_zip(folder, member_name):
     member_name = str(member_name).replace(".csv", ".parquet").replace(".zip", ".parquet")
@@ -1827,54 +1390,7 @@ def get_dates_for_week_folder(
         #    contract names (expiry+strike) instead of dates.
         # -----------------------------------------------------
 
-        # Actual Azure layout:
-        # <week>/<YYYYMMDD>/IDX_TICK/NIFTY.parquet
-        try:
-            week_prefix_with_slash = prefix.rstrip("/") + "/"
-
-            for blob_name in list_blob_names(prefix):
-                normalized_blob = str(blob_name).replace("\\", "/")
-
-                if not normalized_blob.startswith(week_prefix_with_slash):
-                    continue
-
-                remainder = normalized_blob[len(week_prefix_with_slash):]
-                parts = remainder.split("/")
-
-                if len(parts) < 3:
-                    continue
-
-                date_segment = parts[0]
-                data_type = parts[1].upper()
-
-                if data_type not in {"IDX_TICK", "OPT_TICK", "FUT_TICK"}:
-                    continue
-
-                if re.fullmatch(r"\d{8}", date_segment):
-                    parsed = pd.to_datetime(
-                        date_segment,
-                        format="%Y%m%d",
-                        errors="coerce",
-                    )
-
-                    if pd.notna(parsed):
-                        dates.add(date_segment)
-        except Exception as exc:
-            logger.warning(
-                "Date-folder discovery failed prefix=%s error=%s",
-                prefix,
-                exc,
-            )
-
         idx_prefix = _join_storage_path(prefix, "IDX_TICK")
-
-        if dates:
-            result = sorted(dates)
-
-            with _WEEK_DATES_CACHE_LOCK:
-                _WEEK_DATES_CACHE[cache_key] = list(result)
-
-            return result
 
         idx_blob = None
         for candidate in (
@@ -2219,11 +1735,11 @@ def load_future_data_for_date(
         .strip("/")
     )
 
-    future_path = _join_storage_path(
-        normalized_folder,
-        date_str,
-        "FUT_TICK",
-        f"{instrument}.parquet",
+    future_path = (
+        f"{normalized_folder}/"
+        f"{date_str}/"
+        f"FUT_TICK/"
+        f"{instrument}.parquet"
     )
 
     logger.info(
@@ -2360,20 +1876,39 @@ def get_option_chain_snapshot(
     expiry_str,
     target_timestamp,
     instrument="NIFTY",
+    interval_minutes=1,
 ):
-    """Return latest CE/PE values by strike at or before target_timestamp."""
-    empty = pd.DataFrame(columns=["timestamp", "strike", "ce", "pe"])
+    """
+    Return the latest price/OI snapshot by strike at or before the target.
+
+    OI change is current OI minus the latest OI available at or before
+    ``target_timestamp - interval_minutes``.
+    """
+    output_columns = [
+        "timestamp", "strike", "ce", "pe",
+        "ce_oi", "pe_oi", "ce_change_oi", "pe_change_oi",
+    ]
+    empty = pd.DataFrame(columns=output_columns)
+
     chain = load_consolidated_option_chain(
         folder, date_str, expiry_str, instrument
     )
     if chain is None or chain.empty:
         return empty
 
-    frame = chain[["timestamp", "strike", "ce", "pe"]].copy()
+    needed = {"timestamp", "strike", "ce", "pe", "ce_oi", "pe_oi"}
+    if not needed.issubset(chain.columns):
+        logger.warning(
+            "Option chain is missing OI snapshot columns: missing=%s",
+            sorted(needed - set(chain.columns)),
+        )
+        return empty
+
+    frame = chain[list(needed)].copy()
     frame["timestamp"] = pd.to_datetime(frame["timestamp"], errors="coerce")
     frame["strike"] = pd.to_numeric(frame["strike"], errors="coerce")
-    frame["ce"] = pd.to_numeric(frame["ce"], errors="coerce")
-    frame["pe"] = pd.to_numeric(frame["pe"], errors="coerce")
+    for column in ("ce", "pe", "ce_oi", "pe_oi"):
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
     frame = frame.dropna(subset=["timestamp", "strike"])
     if frame.empty:
         return empty
@@ -2384,101 +1919,52 @@ def get_option_chain_snapshot(
         )
     else:
         frame["timestamp"] = frame["timestamp"].dt.tz_convert(IST)
+    frame = frame.dropna(subset=["timestamp"])
 
     target = pd.Timestamp(target_timestamp)
     target = target.tz_localize(IST) if target.tzinfo is None else target.tz_convert(IST)
-    frame = frame[frame["timestamp"] <= target]
-    if frame.empty:
-        return empty
+    interval = max(1, int(interval_minutes))
+    previous_target = target - pd.Timedelta(minutes=interval)
 
-    frame["strike"] = frame["strike"].astype("int32")
-    return (
-        frame.sort_values(["strike", "timestamp"], kind="mergesort")
+    current = frame[frame["timestamp"] <= target]
+    if current.empty:
+        return empty
+    current = (
+        current.sort_values(["strike", "timestamp"], kind="mergesort")
         .drop_duplicates("strike", keep="last")
         .sort_values("strike", kind="mergesort")
-        .reset_index(drop=True)
-    )[["timestamp", "strike", "ce", "pe"]]
-
-
-def diagnose_index_source(
-    folder,
-    date_str,
-    symbol_name="NIFTY",
-):
-    """
-    Return index-search diagnostics without raising an exception.
-
-    Useful from the VM shell:
-
-        from data_engine_for_simulation import diagnose_index_source
-        print(diagnose_index_source(folder, "20260717", "NIFTY"))
-    """
-    normalized_date = (
-        str(date_str)
-        .replace("-", "")
-        .replace("/", "")
-        .strip()
     )
 
-    symbol_name = (
-        str(symbol_name)
-        .upper()
-        .strip()
+    previous = frame[frame["timestamp"] <= previous_target]
+    if not previous.empty:
+        previous = (
+            previous.sort_values(["strike", "timestamp"], kind="mergesort")
+            .drop_duplicates("strike", keep="last")
+            [["strike", "ce_oi", "pe_oi"]]
+            .rename(columns={
+                "ce_oi": "previous_ce_oi",
+                "pe_oi": "previous_pe_oi",
+            })
+        )
+        current = current.merge(previous, on="strike", how="left")
+    else:
+        current["previous_ce_oi"] = np.nan
+        current["previous_pe_oi"] = np.nan
+
+    current["ce_change_oi"] = current["ce_oi"] - current["previous_ce_oi"]
+    current["pe_change_oi"] = current["pe_oi"] - current["previous_pe_oi"]
+
+    # At the beginning of the session there may be no previous interval.
+    # Report a zero change rather than treating the current OI as newly added.
+    current["ce_change_oi"] = current["ce_change_oi"].where(
+        current["previous_ce_oi"].notna(), 0.0
     )
-
-    prefixes = _index_prefix_candidates(
-        folder,
-        normalized_date,
+    current["pe_change_oi"] = current["pe_change_oi"].where(
+        current["previous_pe_oi"].notna(), 0.0
     )
+    current["strike"] = current["strike"].astype("int32")
 
-    result = {
-        "storage_mode": STORAGE_MODE,
-        "folder": str(folder),
-        "date": normalized_date,
-        "symbol": symbol_name,
-        "prefixes": prefixes,
-        "matches": [],
-    }
-
-    try:
-        if STORAGE_MODE == "blob":
-            paths = list_blob_names(
-                str(folder)
-                .replace("\\", "/")
-                .strip("/")
-            )
-        else:
-            root_folder = os.path.abspath(
-                str(folder)
-            )
-
-            paths = (
-                [
-                    os.path.join(root, filename)
-                    for root, _, files in os.walk(
-                        root_folder
-                    )
-                    for filename in files
-                ]
-                if os.path.isdir(root_folder)
-                else []
-            )
-
-        result["matches"] = [
-            str(path)
-            for path in paths
-            if str(path).lower().endswith(".parquet")
-            and _match_index_blob_name(
-                path,
-                symbol_name,
-                normalized_date,
-            )
-        ]
-    except Exception as exc:
-        result["error"] = str(exc)
-
-    return result
-
+    return current[output_columns].reset_index(drop=True)
 
 def runtime_cache_stats():
     with _OPTION_SOURCE_CACHE_LOCK:
@@ -2500,26 +1986,27 @@ def runtime_cache_stats():
     }
 
 
-def clear_runtime_caches():
-    """Clear all process-local caches. No disk cache is used."""
+def clear_runtime_caches(clear_disk_option_cache=False):
     PARQUET_FILE_PATH_CACHE.clear()
     RAW_PARQUET_CACHE.clear()
     OPTION_PARQUET_CACHE.clear()
     OPTION_CONTRACT_CACHE.clear()
     OPTION_WEEK_FOLDER_CACHE.clear()
-
     with _OPTION_SOURCE_CACHE_LOCK:
         _OPTION_SOURCE_CACHE.clear()
-
     with _OPTION_CHAIN_CACHE_LOCK:
         _OPTION_CHAIN_CACHE.clear()
-
     with _OPTION_CONTRACT_INDEX_CACHE_LOCK:
         _OPTION_CONTRACT_INDEX_CACHE.clear()
-
     with _WEEK_DATES_CACHE_LOCK:
         _WEEK_DATES_CACHE.clear()
 
+    if clear_disk_option_cache and os.path.isdir(SHARED_OPTION_CACHE_DIR):
+        for item in Path(SHARED_OPTION_CACHE_DIR).glob("*.parquet"):
+            try:
+                item.unlink()
+            except OSError:
+                logger.warning("Unable to delete cache file %s", item)
 
 def load_raw_option_contract_ticks(
     folder: str,
