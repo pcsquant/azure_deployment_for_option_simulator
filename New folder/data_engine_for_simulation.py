@@ -2,9 +2,9 @@
 Production data engine for the historical Options Simulator.
 
 Azure/local layout:
-    <week-folder>/IDX_TICK/<YYYYMMDD>/<SYMBOL>.parquet
-    <week-folder>/OPT_TICK/<YYYYMMDD>/<SYMBOL>.parquet
-    <week-folder>/FUT_TICK/<YYYYMMDD>/<SYMBOL>.parquet
+    <week-folder>/<YYYYMMDD>/IDX_TICK/<SYMBOL>.parquet
+    <week-folder>/<YYYYMMDD>/OPT_TICK/<SYMBOL>.parquet
+    <week-folder>/<YYYYMMDD>/FUT_TICK/<SYMBOL>.parquet
 
 All caches are process-local RAM caches. This module does not create a
 shared disk-cache directory. Index loading supports both the production
@@ -132,16 +132,18 @@ def _join_storage_path(*parts):
 
 def _resolve_data_folder(week_folder, data_type, date_str=None):
     """
-    Resolve the production storage layout:
+    Resolve the actual production storage layout:
+
+        <week-folder>/<YYYYMMDD>/<DATA_TYPE>/
+
+    A type-first layout is retained as a local fallback:
 
         <week-folder>/<DATA_TYPE>/<YYYYMMDD>/
-
-    A legacy date-first local layout is kept as a fallback.
     """
     week_folder = str(week_folder)
     data_type = str(data_type).upper().strip()
     normalized_date = (
-        str(date_str).replace("-", "").strip()
+        str(date_str).replace("-", "").replace("/", "").strip()
         if date_str is not None
         else ""
     )
@@ -150,8 +152,8 @@ def _resolve_data_folder(week_folder, data_type, date_str=None):
         if normalized_date:
             return _join_storage_path(
                 week_folder,
-                data_type,
                 normalized_date,
+                data_type,
             )
 
         return _join_storage_path(week_folder, data_type)
@@ -163,13 +165,13 @@ def _resolve_data_folder(week_folder, data_type, date_str=None):
             [
                 os.path.join(
                     week_folder,
-                    data_type,
                     normalized_date,
+                    data_type,
                 ),
                 os.path.join(
                     week_folder,
-                    normalized_date,
                     data_type,
+                    normalized_date,
                 ),
             ]
         )
@@ -594,11 +596,11 @@ def _index_prefix_candidates(
     """
     Return possible index prefixes in priority order.
 
-    Preferred production layout:
-        <week>/IDX_TICK/<YYYYMMDD>/
-
-    Supported legacy layouts:
+    Actual production layout:
         <week>/<YYYYMMDD>/IDX_TICK/
+
+    Supported fallback layouts:
+        <week>/IDX_TICK/<YYYYMMDD>/
         <week>/IDX_TICK/
         <week>/
     """
@@ -618,13 +620,13 @@ def _index_prefix_candidates(
     candidates = [
         _join_storage_path(
             normalized_folder,
-            "IDX_TICK",
             normalized_date,
+            "IDX_TICK",
         ),
         _join_storage_path(
             normalized_folder,
-            normalized_date,
             "IDX_TICK",
+            normalized_date,
         ),
         _join_storage_path(
             normalized_folder,
@@ -692,7 +694,7 @@ def load_index_data_by_symbol(
     Load index ticks for a selected trading day.
 
     Preferred Azure/local layout:
-        <week>/IDX_TICK/<YYYYMMDD>/<SYMBOL>.parquet
+        <week>/<YYYYMMDD>/IDX_TICK/<SYMBOL>.parquet
 
     The loader also supports legacy layouts and performs a final recursive
     lookup under the week folder so a small upload-layout difference does not
@@ -932,7 +934,7 @@ def consolidated_chain_path(
     expiry_str,
     instrument="NIFTY",
 ):
-    """Return <week>/OPT_TICK/<YYYYMMDD>/<SYMBOL>.parquet."""
+    """Return <week>/<YYYYMMDD>/OPT_TICK/<SYMBOL>.parquet."""
     cfg = get_dataset_config(instrument)
     symbol = str(cfg["symbol"]).upper()
     return _join_storage_path(
@@ -964,7 +966,7 @@ def _load_consolidated_option_source(
     1. Direct path:
 
         _load_consolidated_option_source(
-            "166 13 Jul to 17 Jul (NSE FO) - TICK - CSV/"
+            "166 13 Jul to 17 Jul (NSE FO) - TICK/"
             "20260717/OPT_TICK/NIFTY.parquet"
         )
 
@@ -1032,14 +1034,14 @@ def _load_consolidated_option_source(
         # Production Azure layout:
         #
         # <week-folder>/
-        #     OPT_TICK/
-        #         <YYYYMMDD>/
+        #     <YYYYMMDD>/
+        #         OPT_TICK/
         #             NIFTY.parquet
         #
         path = _join_storage_path(
             normalized_folder,
-            "OPT_TICK",
             normalized_date,
+            "OPT_TICK",
             f"{instrument}.parquet",
         )
 
@@ -1607,19 +1609,28 @@ def get_dates_for_week_folder(
         #    contract names (expiry+strike) instead of dates.
         # -----------------------------------------------------
 
-        idx_prefix = _join_storage_path(prefix, "IDX_TICK")
-
+        # Actual Azure layout:
+        # <week>/<YYYYMMDD>/IDX_TICK/NIFTY.parquet
         try:
-            prefix_with_slash = idx_prefix.rstrip("/") + "/"
+            week_prefix_with_slash = prefix.rstrip("/") + "/"
 
-            for blob_name in list_blob_names(idx_prefix):
+            for blob_name in list_blob_names(prefix):
                 normalized_blob = str(blob_name).replace("\\", "/")
 
-                if not normalized_blob.startswith(prefix_with_slash):
+                if not normalized_blob.startswith(week_prefix_with_slash):
                     continue
 
-                remainder = normalized_blob[len(prefix_with_slash):]
-                date_segment = remainder.split("/", 1)[0]
+                remainder = normalized_blob[len(week_prefix_with_slash):]
+                parts = remainder.split("/")
+
+                if len(parts) < 3:
+                    continue
+
+                date_segment = parts[0]
+                data_type = parts[1].upper()
+
+                if data_type not in {"IDX_TICK", "OPT_TICK", "FUT_TICK"}:
+                    continue
 
                 if re.fullmatch(r"\d{8}", date_segment):
                     parsed = pd.to_datetime(
@@ -1633,9 +1644,11 @@ def get_dates_for_week_folder(
         except Exception as exc:
             logger.warning(
                 "Date-folder discovery failed prefix=%s error=%s",
-                idx_prefix,
+                prefix,
                 exc,
             )
+
+        idx_prefix = _join_storage_path(prefix, "IDX_TICK")
 
         if dates:
             result = sorted(dates)
@@ -1976,7 +1989,7 @@ def load_future_data_for_date(
     """
     Load futures ticks from:
 
-        <week-folder>/FUT_TICK/<YYYYMMDD>/<INSTRUMENT>.parquet
+        <week-folder>/<YYYYMMDD>/FUT_TICK/<INSTRUMENT>.parquet
     """
 
     instrument = str(instrument).upper().strip()
@@ -1990,8 +2003,8 @@ def load_future_data_for_date(
 
     future_path = _join_storage_path(
         normalized_folder,
-        "FUT_TICK",
         date_str,
+        "FUT_TICK",
         f"{instrument}.parquet",
     )
 
