@@ -1,9 +1,22 @@
+"""Production data-access layer for the historical option simulator.
+
+Supports local Parquet and Azure Blob Storage, bounded in-process LRU caches,
+contract manifests, normalized consolidated option-chain reads, and session-aligned
+candle creation. Cached DataFrames are treated as read-only master objects.
+"""
+
+import hashlib
+import logging
 import os
 import re
+import time
+from collections import OrderedDict
+from pathlib import Path
+from threading import Lock, RLock
+from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
-import hashlib
 
 from config_for_simulation import (
     IST,
@@ -14,14 +27,107 @@ from config_for_simulation import (
     get_dataset_config,
 )
 
-DEBUG_MODE = False
+from azure_blob_storage import (
+    blob_exists,
+    find_blob_by_filename,
+    list_blob_names,
+    read_parquet_blob,
+)
 
-PARQUET_FILE_PATH_CACHE = {}
-RAW_PARQUET_CACHE = {}
-MAX_RAW_PARQUET_CACHE_SIZE = int(os.getenv("MAX_RAW_PARQUET_CACHE_SIZE", "1000"))
+logger = logging.getLogger(__name__)
 
-OPTION_PARQUET_CACHE = {}
-OPTION_CONTRACT_CACHE = {}
+STORAGE_MODE = os.getenv("STORAGE_MODE", "local").strip().lower()
+if STORAGE_MODE not in {"local", "blob"}:
+    raise ValueError(
+        "STORAGE_MODE must be either 'local' or 'blob'. "
+        f"Received: {STORAGE_MODE!r}"
+    )
+
+DEBUG_MODE = os.getenv("DEBUG_MODE", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+MAX_RAW_PARQUET_CACHE_SIZE = max(1, int(os.getenv("MAX_RAW_PARQUET_CACHE_SIZE", "128")))
+MAX_OPTION_CHAIN_CACHE_SIZE = max(1, int(os.getenv("MAX_OPTION_CHAIN_CACHE_SIZE", "16")))
+
+
+class _ThreadSafeLRU:
+    """Small process-local LRU used for metadata and DataFrame caches.
+
+    The cache is intentionally bounded. Values are returned by reference; callers that
+    mutate a cached DataFrame must first make a copy. The data engine treats cached
+    frames as read-only master objects and only mutates timestamp-specific slices.
+    """
+
+    def __init__(self, max_entries: int):
+        self.max_entries = max(1, int(max_entries))
+        self._items: "OrderedDict[Any, Any]" = OrderedDict()
+        self._lock = RLock()
+
+    def get(self, key, default=None):
+        with self._lock:
+            if key not in self._items:
+                return default
+            value = self._items.pop(key)
+            self._items[key] = value
+            return value
+
+    def put(self, key, value):
+        with self._lock:
+            if key in self._items:
+                self._items.pop(key)
+            self._items[key] = value
+            while len(self._items) > self.max_entries:
+                self._items.popitem(last=False)
+
+    def pop(self, key, default=None):
+        with self._lock:
+            return self._items.pop(key, default)
+
+    def clear(self):
+        with self._lock:
+            self._items.clear()
+
+    def __len__(self):
+        with self._lock:
+            return len(self._items)
+
+    def stats(self) -> dict:
+        with self._lock:
+            approx_bytes = 0
+            for value in self._items.values():
+                if isinstance(value, pd.DataFrame):
+                    approx_bytes += int(value.memory_usage(index=True, deep=True).sum())
+            return {
+                "entries": len(self._items),
+                "max_entries": self.max_entries,
+                "approx_bytes": approx_bytes,
+            }
+
+
+PARQUET_FILE_PATH_CACHE: dict[tuple[str, str], Optional[str]] = {}
+RAW_PARQUET_CACHE = _ThreadSafeLRU(MAX_RAW_PARQUET_CACHE_SIZE)
+OPTION_PARQUET_CACHE = _ThreadSafeLRU(MAX_OPTION_CHAIN_CACHE_SIZE)
+OPTION_CONTRACT_CACHE = _ThreadSafeLRU(MAX_OPTION_CHAIN_CACHE_SIZE)
+
+# Option-contract manifest cache. Building the manifest requires either a
+# recursive local filesystem walk or an Azure Blob listing, so it must never
+# happen once per contract lookup. A finite TTL allows newly uploaded files to
+# become visible without restarting the service. Set the TTL to 0 to keep a
+# manifest until it is explicitly invalidated.
+_OPTION_CONTRACT_INDEX_CACHE = {}
+_OPTION_CONTRACT_INDEX_CACHE_LOCK = Lock()
+OPTION_CONTRACT_INDEX_TTL_SECONDS = max(
+    0.0,
+    float(os.getenv("OPTION_CONTRACT_INDEX_TTL_SECONDS", "300")),
+)
+_OPTION_CONTRACT_FILENAME_PATTERN = re.compile(
+    r"^(.+?)(\d{6})(\d+(?:\.\d+)?)(CE|PE)$",
+    re.IGNORECASE,
+)
 
 
 # =========================================================
@@ -29,19 +135,30 @@ OPTION_CONTRACT_CACHE = {}
 # =========================================================
 
 def is_path_allowed(path, instrument="NIFTY"):
-    cfg = get_dataset_config(instrument)
-    base = os.path.abspath(cfg.get("base_path") or PARQUET_BASE_PATH)
-    option_base = os.path.abspath(OPTION_PARQUET_BASE_PATH)
+    """Validate a local path or Blob prefix before reading market data."""
+    if STORAGE_MODE == "blob":
+        value = str(path).replace("\\", "/").strip("/")
+        parts = [part for part in value.split("/") if part]
+        return bool(value) and ".." not in parts
 
-    target = os.path.abspath(str(path))
+    cfg = get_dataset_config(instrument)
+    roots = [
+        os.path.abspath(str(cfg.get("base_path") or PARQUET_BASE_PATH)),
+        os.path.abspath(str(OPTION_PARQUET_BASE_PATH)),
+    ]
+    target = os.path.abspath(os.path.expanduser(str(path)))
 
     if not os.path.exists(target) and target.lower().endswith(".zip"):
         target = os.path.dirname(target)
 
-    return (
-        os.path.commonpath([base, target]) == base
-        or os.path.commonpath([option_base, target]) == option_base
-    )
+    for root in roots:
+        try:
+            if os.path.commonpath([root, target]) == root:
+                return True
+        except ValueError:
+            # Different Windows drives, or otherwise incomparable roots.
+            continue
+    return False
 
 
 def _extract_date_from_text(text):
@@ -49,32 +166,187 @@ def _extract_date_from_text(text):
     return match.group(1) if match else None
 
 
+def _join_storage_path(*parts):
+    cleaned = [
+        str(part).replace("\\", "/").strip("/")
+        for part in parts
+        if part is not None and str(part).strip()
+    ]
+
+    return "/".join(cleaned)
+
+
 def _get_idx_folder(week_folder, date_str=None):
+    if STORAGE_MODE == "blob":
+        return _join_storage_path(week_folder, "IDX_TICK")
+
     folder = os.path.join(week_folder, "IDX_TICK")
     return folder if os.path.isdir(folder) else week_folder
 
 
 def _get_opt_folder(week_folder, date_str=None):
+    if STORAGE_MODE == "blob":
+        return _join_storage_path(week_folder, "OPT_TICK")
+
     folder = os.path.join(week_folder, "OPT_TICK")
     return folder if os.path.isdir(folder) else week_folder
 
 
+def _normalize_storage_folder(folder):
+    """Return a stable cache key for a local folder or Blob prefix."""
+    value = str(folder).replace("\\", "/").strip("/")
+
+    if STORAGE_MODE == "blob":
+        return value
+
+    return os.path.normcase(os.path.abspath(value))
+
+
+def invalidate_option_contract_index(opt_folder=None):
+    """
+    Invalidate cached option-contract manifests.
+
+    Pass a specific OPT_TICK folder/prefix to invalidate only that manifest,
+    or omit it to clear all manifests. This is useful immediately after a data
+    upload or deployment that changes the option files.
+    """
+    with _OPTION_CONTRACT_INDEX_CACHE_LOCK:
+        if opt_folder is None:
+            _OPTION_CONTRACT_INDEX_CACHE.clear()
+            return
+
+        cache_key = (STORAGE_MODE, _normalize_storage_folder(opt_folder))
+        _OPTION_CONTRACT_INDEX_CACHE.pop(cache_key, None)
+
+
+def _get_option_contract_index(opt_folder):
+    """
+    Return a cached option-contract manifest for ``opt_folder``.
+
+    The manifest maps ``(symbol, expiry, strike, side)`` to the full local path
+    or Azure Blob name. The expensive filesystem walk / Blob listing is done
+    only on a cache miss or after the configured TTL expires.
+    """
+    normalized_folder = _normalize_storage_folder(opt_folder)
+    cache_key = (STORAGE_MODE, normalized_folder)
+    now = time.monotonic()
+
+    with _OPTION_CONTRACT_INDEX_CACHE_LOCK:
+        cached = _OPTION_CONTRACT_INDEX_CACHE.get(cache_key)
+        if cached is not None:
+            age_seconds = now - cached["created_at"]
+            if (
+                OPTION_CONTRACT_INDEX_TTL_SECONDS == 0
+                or age_seconds < OPTION_CONTRACT_INDEX_TTL_SECONDS
+            ):
+                return cached["index"]
+
+        index = {}
+
+        if STORAGE_MODE == "blob":
+            try:
+                file_paths = list_blob_names(normalized_folder)
+            except Exception as exc:
+                logger.exception(
+                    "Unable to list option-contract blobs under %s: %s",
+                    normalized_folder,
+                    exc,
+                )
+                file_paths = []
+        else:
+            if not os.path.isdir(normalized_folder):
+                _OPTION_CONTRACT_INDEX_CACHE[cache_key] = {
+                    "created_at": now,
+                    "index": index,
+                }
+                return index
+
+            file_paths = (
+                os.path.join(root, filename)
+                for root, _, files in os.walk(normalized_folder)
+                for filename in files
+            )
+
+        for file_path in file_paths:
+            file_path = str(file_path)
+            filename = file_path.replace("\\", "/").rsplit("/", 1)[-1]
+
+            if not filename.lower().endswith(".parquet"):
+                continue
+
+            base_name = os.path.splitext(filename)[0].upper()
+            match = _OPTION_CONTRACT_FILENAME_PATTERN.fullmatch(base_name)
+
+            if match is None:
+                continue
+
+            symbol = match.group(1).upper()
+            expiry = match.group(2)
+
+            try:
+                strike = int(float(match.group(3)))
+            except (TypeError, ValueError, OverflowError):
+                continue
+
+            side = match.group(4).upper()
+            contract_key = (symbol, expiry, strike, side)
+
+            # Keep the first deterministic match. Duplicate contract files are
+            # logged because silently replacing one can make results unstable.
+            if contract_key in index:
+                logger.warning(
+                    "Duplicate option contract %s under %s; keeping %s and "
+                    "ignoring %s",
+                    contract_key,
+                    normalized_folder,
+                    index[contract_key],
+                    file_path,
+                )
+                continue
+
+            index[contract_key] = file_path
+
+        _OPTION_CONTRACT_INDEX_CACHE[cache_key] = {
+            "created_at": now,
+            "index": index,
+        }
+        logger.info(
+            "Built option-contract manifest for %s with %d contracts",
+            normalized_folder,
+            len(index),
+        )
+        return index
+
+
 def _find_parquet_file(folder, filename):
-    folder = os.path.abspath(str(folder))
-    filename = str(filename).lower()
-    key = (folder, filename)
+    folder = str(folder).replace("\\", "/").strip("/")
+    filename = str(filename)
+
+    key = (folder, filename.lower())
 
     if key in PARQUET_FILE_PATH_CACHE:
         return PARQUET_FILE_PATH_CACHE[key]
+
+    if STORAGE_MODE == "blob":
+        blob_name = find_blob_by_filename(
+            prefix=folder,
+            filename=filename,
+        )
+
+        PARQUET_FILE_PATH_CACHE[key] = blob_name
+        return blob_name
+
+    # Local filesystem fallback
+    folder = os.path.abspath(folder)
 
     if not os.path.isdir(folder):
         PARQUET_FILE_PATH_CACHE[key] = None
         return None
 
     for root, _, files in os.walk(folder):
-        for f in files:
-            if f.lower() == filename:
-                path = os.path.join(root, f)
+        for current_file in files:
+            if current_file.lower() == filename.lower():
+                path = os.path.join(root, current_file)
                 PARQUET_FILE_PATH_CACHE[key] = path
                 return path
 
@@ -86,13 +358,20 @@ OPTION_WEEK_FOLDER_CACHE = {}
 
 
 def _resolve_option_week_folder(week_folder):
-    week_folder_key = os.path.abspath(str(week_folder))
+    week_folder = str(week_folder).replace("\\", "/").strip("/")
+
+    if STORAGE_MODE == "blob":
+        return week_folder
+
+    week_folder_key = os.path.abspath(week_folder)
 
     cached = OPTION_WEEK_FOLDER_CACHE.get(week_folder_key)
     if cached is not None:
         return cached
 
-    week_name = os.path.basename(os.path.normpath(str(week_folder)))
+    week_name = os.path.basename(
+        os.path.normpath(week_folder)
+    )
 
     candidates = [
         week_name,
@@ -107,17 +386,19 @@ def _resolve_option_week_folder(week_folder):
             name,
         )
 
-        print("Checking option folder:", option_folder, flush=True)
-
         if os.path.isdir(option_folder):
-            print("Using option folder:", option_folder, flush=True)
-            OPTION_WEEK_FOLDER_CACHE[week_folder_key] = option_folder
+            OPTION_WEEK_FOLDER_CACHE[
+                week_folder_key
+            ] = option_folder
+
             return option_folder
 
-    print("WARNING: option folder not found. Falling back to:", week_folder, flush=True)
+    fallback = week_folder
 
-    fallback = str(week_folder)
-    OPTION_WEEK_FOLDER_CACHE[week_folder_key] = fallback
+    OPTION_WEEK_FOLDER_CACHE[
+        week_folder_key
+    ] = fallback
+
     return fallback
 
 # =========================================================
@@ -125,15 +406,23 @@ def _resolve_option_week_folder(week_folder):
 # =========================================================
 
 def _read_parquet_normalized(path, mode="spot"):
-    path = os.path.abspath(str(path))
+    path = str(path)
     mode = str(mode).lower()
     cache_key = (path, mode)
 
     cached = RAW_PARQUET_CACHE.get(cache_key)
-    if cached is not None:
-        return cached.copy()
 
-    df = pd.read_parquet(path)
+    if cached is not None:
+        # Shallow wrapper: avoids duplicating the full cached frame. Treat cached
+        # columns as read-only; make a deep copy only before destructive mutation.
+        return cached.copy(deep=False)
+
+    if STORAGE_MODE == "blob":
+        df = read_parquet_blob(path)
+    else:
+        path = os.path.abspath(path)
+        df = pd.read_parquet(path)
+
     lower_cols = {str(c).lower(): c for c in df.columns}
 
     if "datetime" in lower_cols:
@@ -204,11 +493,8 @@ def _read_parquet_normalized(path, mode="spot"):
 
     out = out.sort_values("datetime").reset_index(drop=True)
 
-    if len(RAW_PARQUET_CACHE) >= MAX_RAW_PARQUET_CACHE_SIZE:
-        RAW_PARQUET_CACHE.pop(next(iter(RAW_PARQUET_CACHE)))
-
-    RAW_PARQUET_CACHE[cache_key] = out.copy()
-    return out
+    RAW_PARQUET_CACHE.put(cache_key, out)
+    return out.copy(deep=False)
 
 
 # =========================================================
@@ -280,24 +566,34 @@ def load_tick_data(folder_or_path, instrument="NIFTY"):
     return pd.DataFrame(columns=["datetime", "value"])
 
 
-def load_index_data_by_symbol(folder, date_str, symbol_name="INDIAVIX"):
-    idx_folder = os.path.join(folder, "IDX_TICK")
-
-    if not os.path.isdir(idx_folder):
-        return pd.DataFrame(columns=["datetime", "value"])
-
+def load_index_data_by_symbol(
+    folder,
+    date_str,
+    symbol_name="INDIAVIX",
+):
+    idx_folder = _get_idx_folder(folder, date_str)
     symbol_name = str(symbol_name).upper().strip()
 
-    possible_paths = [
-        os.path.join(idx_folder, symbol_name),
-        os.path.join(idx_folder, f"{symbol_name}.parquet"),
+    possible_names = [
+        symbol_name,
+        f"{symbol_name}.parquet",
     ]
 
-    for path in possible_paths:
-        if os.path.exists(path):
-            return _read_parquet_normalized(path, mode="spot")
+    for filename in possible_names:
+        path = _find_parquet_file(
+            idx_folder,
+            filename,
+        )
 
-    return pd.DataFrame(columns=["datetime", "value"])
+        if path:
+            return _read_parquet_normalized(
+                path,
+                mode="spot",
+            )
+
+    return pd.DataFrame(
+        columns=["datetime", "value"]
+    )
 
 
 # =========================================================
@@ -311,261 +607,384 @@ def consolidated_chain_folder(week_folder, date_str):
     return _resolve_option_week_folder(week_folder)
 
 
-def consolidated_chain_path(week_folder, date_str, expiry_str, instrument="NIFTY"):
+
+def consolidated_chain_path(
+    week_folder,
+    date_str,
+    expiry_str,
+    instrument="NIFTY",
+):
+    """Return the consolidated option-chain path or blob name."""
     cfg = get_dataset_config(instrument)
     symbol = str(cfg["symbol"]).upper()
-
     option_week_folder = _resolve_option_week_folder(week_folder)
+    filename = f"{symbol}_{expiry_str}.parquet"
+
+    if STORAGE_MODE == "blob":
+        return _join_storage_path(
+            option_week_folder,
+            "OPT_TICK",
+            filename,
+        )
 
     return os.path.join(
         option_week_folder,
         "OPT_TICK",
-        f"{symbol}_{expiry_str}.parquet"
+        filename,
     )
 
 
-from threading import Lock
+_OPTION_CHAIN_CACHE = _ThreadSafeLRU(MAX_OPTION_CHAIN_CACHE_SIZE)
+_OPTION_CHAIN_CACHE_LOCK = RLock()
 
-_OPTION_CHAIN_CACHE = {}
-_OPTION_CHAIN_CACHE_LOCK = Lock()
-
-SHARED_OPTION_CACHE_DIR = os.getenv(
-    "SHARED_OPTION_CACHE_DIR",
-    "/app/shared_cache/option_chain"
+_DEFAULT_CACHE_DIR = (
+    Path.home()
+    / ".cache"
+    / "option-simulator"
+    / "option_chain"
 )
 
-os.makedirs(SHARED_OPTION_CACHE_DIR, exist_ok=True)
+SHARED_OPTION_CACHE_DIR = os.path.abspath(
+    os.path.expanduser(
+        os.getenv(
+            "SHARED_OPTION_CACHE_DIR",
+            str(_DEFAULT_CACHE_DIR),
+        )
+    )
+)
+
+os.makedirs(
+    SHARED_OPTION_CACHE_DIR,
+    exist_ok=True,
+)
+
 
 def _option_chain_disk_cache_path(cache_key):
-    key_hash = hashlib.md5(cache_key.encode("utf-8")).hexdigest()
+    key_hash = hashlib.md5(
+        cache_key.encode("utf-8"),
+        usedforsecurity=False,
+    ).hexdigest()
     return os.path.join(SHARED_OPTION_CACHE_DIR, f"{key_hash}.parquet")
 
 
-def load_consolidated_option_chain(folder, date_str, expiry_str, instrument="NIFTY"):
-    path = consolidated_chain_path(
-        week_folder=folder,
-        date_str=date_str,
-        expiry_str=expiry_str,
-        instrument=instrument,
+def _normalize_timestamp_series(values: pd.Series) -> pd.Series:
+    ts = pd.to_datetime(values, errors="coerce")
+    if getattr(ts.dt, "tz", None) is None:
+        return ts.dt.tz_localize(IST, ambiguous="NaT", nonexistent="NaT")
+    return ts.dt.tz_convert(IST)
+
+
+def _normalize_wide_consolidated(df: pd.DataFrame, date_str: str) -> Optional[pd.DataFrame]:
+    """Normalize schema [timestamp, strike, ce, pe]."""
+    required = {"timestamp", "strike", "ce", "pe"}
+    if not required.issubset(df.columns):
+        return None
+
+    out = df.loc[:, ["timestamp", "strike", "ce", "pe"]].copy()
+    out["timestamp"] = _normalize_timestamp_series(out["timestamp"])
+    out["strike"] = pd.to_numeric(out["strike"], errors="coerce")
+    out["ce"] = pd.to_numeric(out["ce"], errors="coerce")
+    out["pe"] = pd.to_numeric(out["pe"], errors="coerce")
+    out = out.dropna(subset=["timestamp", "strike"])
+
+    requested = pd.to_datetime(str(date_str), format="%Y%m%d", errors="coerce")
+    if pd.isna(requested):
+        return None
+    out = out[out["timestamp"].dt.strftime("%Y%m%d") == requested.strftime("%Y%m%d")]
+    out = out[
+        (out["timestamp"].dt.time >= SESSION_START)
+        & (out["timestamp"].dt.time <= SESSION_END)
+    ]
+    if out.empty:
+        return None
+
+    out["strike"] = out["strike"].astype("int32")
+    return (
+        out.drop_duplicates(subset=["timestamp", "strike"], keep="last")
+        .sort_values(["timestamp", "strike"], kind="mergesort")
+        .reset_index(drop=True)
     )
 
-    cache_key = f"{os.path.abspath(path)}|{date_str}|{instrument}"
+
+def _normalize_long_consolidated(df: pd.DataFrame, date_str: str) -> Optional[pd.DataFrame]:
+    """Normalize legacy schema [date, time, strike, option_type, price]."""
+    required = {"date", "time", "strike", "option_type", "price"}
+    if not required.issubset(df.columns):
+        return None
+
+    work = df.loc[:, ["date", "time", "strike", "option_type", "price"]].copy()
+    work["date"] = pd.to_numeric(work["date"], errors="coerce")
+    requested_date = pd.to_numeric(date_str, errors="coerce")
+    if pd.isna(requested_date):
+        return None
+    work = work[work["date"] == int(requested_date)]
+    if work.empty:
+        return None
+
+    work["timestamp"] = _normalize_timestamp_series(
+        work["date"].astype("Int64").astype(str) + " " + work["time"].astype(str)
+    )
+    work["strike"] = pd.to_numeric(work["strike"], errors="coerce")
+    work["price"] = pd.to_numeric(work["price"], errors="coerce")
+    work["option_type"] = work["option_type"].astype(str).str.upper().str.strip()
+    work = work.dropna(subset=["timestamp", "strike", "price"])
+    work = work[work["option_type"].isin(["CE", "PE"])]
+    work = work[
+        (work["timestamp"].dt.time >= SESSION_START)
+        & (work["timestamp"].dt.time <= SESSION_END)
+    ]
+    if work.empty:
+        return None
+
+    work["strike"] = work["strike"].astype("int32")
+    # Last tick in each minute for each strike/side.
+    work["timestamp"] = work["timestamp"].dt.floor("min")
+    work = (
+        work.sort_values("timestamp", kind="mergesort")
+        .drop_duplicates(["timestamp", "strike", "option_type"], keep="last")
+    )
+    out = work.pivot_table(
+        index=["timestamp", "strike"],
+        columns="option_type",
+        values="price",
+        aggfunc="last",
+    ).reset_index()
+    out.columns.name = None
+    out = out.rename(columns={"CE": "ce", "PE": "pe"})
+    if "ce" not in out.columns:
+        out["ce"] = np.nan
+    if "pe" not in out.columns:
+        out["pe"] = np.nan
+    return out[["timestamp", "strike", "ce", "pe"]].sort_values(
+        ["timestamp", "strike"], kind="mergesort"
+    ).reset_index(drop=True)
+
+
+def _atomic_write_parquet(df: pd.DataFrame, destination: str) -> None:
+    os.makedirs(os.path.dirname(destination), exist_ok=True)
+    tmp_path = f"{destination}.{os.getpid()}.{time.time_ns()}.tmp"
+    try:
+        df.to_parquet(tmp_path, engine="pyarrow", compression="snappy", index=False)
+        os.replace(tmp_path, destination)
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+def load_consolidated_option_chain(
+    folder,
+    date_str,
+    expiry_str,
+    instrument="NIFTY",
+):
+    """Load one consolidated option chain as [timestamp, strike, ce, pe].
+
+    Supports both the production wide schema generated by the current builder and
+    the older long schema. The normalized frame is cached in a bounded process-local
+    LRU and in an atomic local Parquet cache.
+    """
+    path = consolidated_chain_path(folder, date_str, expiry_str, instrument)
+    cache_key = f"v{CONSOLIDATED_SCHEMA_VERSION}|{STORAGE_MODE}|{path}|{date_str}|{instrument.upper()}"
     disk_cache_path = _option_chain_disk_cache_path(cache_key)
 
-    with _OPTION_CHAIN_CACHE_LOCK:
-        cached = _OPTION_CHAIN_CACHE.get(cache_key)
-
+    cached = _OPTION_CHAIN_CACHE.get(cache_key)
     if cached is not None:
-        return cached.copy()
+        return cached.copy(deep=False)
 
     if os.path.isfile(disk_cache_path):
         try:
-            out = pd.read_parquet(disk_cache_path)
-
-            with _OPTION_CHAIN_CACHE_LOCK:
-                _OPTION_CHAIN_CACHE[cache_key] = out.copy()
-
-            return out.copy()
-
-        except Exception:
+            cached_disk = pd.read_parquet(
+                disk_cache_path,
+                columns=["timestamp", "strike", "ce", "pe"],
+            )
+            normalized = _normalize_wide_consolidated(cached_disk, date_str)
+            if normalized is not None and not normalized.empty:
+                _OPTION_CHAIN_CACHE.put(cache_key, normalized)
+                return normalized.copy(deep=False)
+        except Exception as exc:
+            logger.warning("Discarding invalid option-chain disk cache %s: %s", disk_cache_path, exc)
             try:
                 os.remove(disk_cache_path)
             except OSError:
                 pass
 
-    # No consolidated file available.
-    # This is okay. Simulator will fall back to per-contract files.
-    if not os.path.isfile(path):
+    if STORAGE_MODE == "blob":
+        try:
+            if not blob_exists(path):
+                return None
+        except Exception as exc:
+            logger.exception("Unable to check consolidated option-chain blob %s: %s", path, exc)
+            return None
+    elif not os.path.isfile(path):
         return None
 
-    try:
-        df = pd.read_parquet(
-            path,
-            columns=["date", "time", "strike", "option_type", "price"],
-        )
-    except Exception:
-        df = pd.read_parquet(path)
-
-    required = {"date", "time", "strike", "option_type", "price"}
-
-    if df.empty:
-        return None
-
-    if not required.issubset(df.columns):
-        return None
-
-    df = df.copy()
-
-    df["date"] = pd.to_numeric(df["date"], errors="coerce")
-    df = df[df["date"] == int(date_str)]
-
-    if df.empty:
-        return None
-
-    df["timestamp"] = pd.to_datetime(
-        df["date"].astype("int64").astype(str)
-        + " "
-        + df["time"].astype(str),
-        errors="coerce",
-    )
-
-    df["price"] = pd.to_numeric(df["price"], errors="coerce")
-    df["strike"] = pd.to_numeric(df["strike"], errors="coerce")
-    df["option_type"] = df["option_type"].astype(str).str.upper().str.strip()
-
-    df = df.dropna(subset=["timestamp", "price", "strike"])
-
-    if df.empty:
-        return None
-
-    df["strike"] = df["strike"].astype(int)
-
-    if df["timestamp"].dt.tz is None:
-        df["timestamp"] = df["timestamp"].dt.tz_localize(
-            IST,
-            ambiguous="NaT",
-            nonexistent="NaT",
-        )
-    else:
-        df["timestamp"] = df["timestamp"].dt.tz_convert(IST)
-
-    df = df.dropna(subset=["timestamp"])
-
-    df = df[
-        (df["timestamp"].dt.time >= SESSION_START)
-        & (df["timestamp"].dt.time <= SESSION_END)
+    df = None
+    # Prefer the wide production schema and projected reads.
+    projections = [
+        ["timestamp", "strike", "ce", "pe"],
+        ["date", "time", "strike", "option_type", "price"],
+        None,
     ]
+    last_error = None
+    for columns in projections:
+        try:
+            if STORAGE_MODE == "blob":
+                df = read_parquet_blob(path, columns=columns)
+            else:
+                df = pd.read_parquet(path, columns=columns)
+            break
+        except Exception as exc:
+            last_error = exc
+            df = None
 
+    if df is None:
+        logger.error("Unable to read consolidated option chain %s: %s", path, last_error)
+        return None
     if df.empty:
         return None
 
-    ce_raw = df[df["option_type"] == "CE"]
-    pe_raw = df[df["option_type"] == "PE"]
-
-    ce = (
-        ce_raw
-        .set_index("timestamp")
-        .groupby("strike")["price"]
-        .resample("1min")
-        .last()
-        .dropna()
-        .reset_index()
-        .rename(columns={"price": "ce"})
-    )
-
-    pe = (
-        pe_raw
-        .set_index("timestamp")
-        .groupby("strike")["price"]
-        .resample("1min")
-        .last()
-        .dropna()
-        .reset_index()
-        .rename(columns={"price": "pe"})
-    )
-
-    if ce.empty and pe.empty:
+    normalized = _normalize_wide_consolidated(df, date_str)
+    if normalized is None:
+        normalized = _normalize_long_consolidated(df, date_str)
+    if normalized is None or normalized.empty:
+        logger.error(
+            "Unsupported or empty consolidated schema in %s; columns=%s",
+            path,
+            list(df.columns),
+        )
         return None
 
-    out = pd.merge(
-        ce,
-        pe,
-        on=["strike", "timestamp"],
-        how="outer",
-    )
-
-    if out.empty:
-        return None
-
-    out = (
-        out[["timestamp", "strike", "ce", "pe"]]
-        .sort_values(["timestamp", "strike"])
-        .reset_index(drop=True)
-    )
-
-    with _OPTION_CHAIN_CACHE_LOCK:
-        _OPTION_CHAIN_CACHE[cache_key] = out.copy()
-
+    _OPTION_CHAIN_CACHE.put(cache_key, normalized)
     try:
-        tmp_path = f"{disk_cache_path}.tmp"
-        out.to_parquet(tmp_path, index=False)
-        os.replace(tmp_path, disk_cache_path)
-    except Exception:
-        pass
+        _atomic_write_parquet(normalized, disk_cache_path)
+    except Exception as exc:
+        logger.warning("Unable to save option-chain disk cache %s: %s", disk_cache_path, exc)
 
-    return out.copy()
+    return normalized.copy(deep=False)
 
-def load_required_option_data_for_date(folder, date_str, expiry_str, strike, instrument="NIFTY"):
+
+def load_required_option_data_for_date(
+    folder,
+    date_str,
+    expiry_str,
+    strike,
+    instrument="NIFTY",
+):
     empty = {
-        "CE": pd.DataFrame(columns=["datetime", "price", "volume", "oi"]),
-        "PE": pd.DataFrame(columns=["datetime", "price", "volume", "oi"]),
+        "CE": pd.DataFrame(
+            columns=["datetime", "price", "volume"]
+        ),
+        "PE": pd.DataFrame(
+            columns=["datetime", "price", "volume"]
+        ),
     }
 
     cfg = get_dataset_config(instrument)
     symbol = str(cfg["symbol"]).upper()
-
     opt_folder = _get_opt_folder(folder, date_str)
 
-    if not os.path.isdir(opt_folder):
+    result = {}
+    contract_index = _get_option_contract_index(opt_folder)
+
+    try:
+        normalized_strike = int(float(strike))
+    except (TypeError, ValueError, OverflowError):
+        logger.warning("Invalid option strike requested: %r", strike)
         return empty
 
-    result = {}
+    normalized_expiry = str(expiry_str).strip()
 
     for side in ["CE", "PE"]:
-        pattern = re.compile(
-            rf"^{re.escape(symbol)}{re.escape(str(expiry_str))}{int(strike)}{side}$",
-            re.IGNORECASE
+        # -----------------------------------------------------
+        # 1. Resolve the option contract from the cached manifest
+        # -----------------------------------------------------
+        matched_path = contract_index.get(
+            (symbol, normalized_expiry, normalized_strike, side)
         )
-
-        matched_path = None
-
-        for root, _, files in os.walk(opt_folder):
-            for f in files:
-                base = os.path.splitext(f)[0].upper()
-
-                if pattern.match(base):
-                    matched_path = os.path.join(root, f)
-                    break
-
-            if matched_path:
-                break
 
         if not matched_path:
             result[side] = empty[side]
             continue
 
+        # -----------------------------------------------------
+        # 2. Read the Parquet file
+        # -----------------------------------------------------
+
         try:
-            df = pd.read_parquet(matched_path)
-        except Exception:
+            if STORAGE_MODE == "blob":
+                df = read_parquet_blob(matched_path)
+            else:
+                df = pd.read_parquet(matched_path)
+
+        except Exception as exc:
+            print(
+                f"Unable to read option file: {matched_path}. "
+                f"Error: {exc}",
+                flush=True,
+            )
+
             result[side] = empty[side]
             continue
 
-        if df.empty:
+        if df is None or df.empty:
             result[side] = empty[side]
             continue
 
-        lower_cols = {str(c).lower(): c for c in df.columns}
+        # -----------------------------------------------------
+        # 3. Detect columns
+        # -----------------------------------------------------
 
+        lower_cols = {
+            str(column).lower(): column
+            for column in df.columns
+        }
+
+        # Create timestamp
         if "datetime" in lower_cols:
-            dt = pd.to_datetime(df[lower_cols["datetime"]], errors="coerce")
-        elif {"date", "time"}.issubset(lower_cols):
             dt = pd.to_datetime(
-                df[lower_cols["date"]].astype(str) + " " + df[lower_cols["time"]].astype(str),
-                errors="coerce"
+                df[lower_cols["datetime"]],
+                errors="coerce",
             )
+
+        elif {
+            "date",
+            "time",
+        }.issubset(lower_cols):
+            dt = pd.to_datetime(
+                df[lower_cols["date"]].astype(str)
+                + " "
+                + df[lower_cols["time"]].astype(str),
+                errors="coerce",
+            )
+
+        elif len(df.columns) >= 2:
+            dt = pd.to_datetime(
+                df.iloc[:, 0].astype(str)
+                + " "
+                + df.iloc[:, 1].astype(str),
+                errors="coerce",
+            )
+
         else:
-            dt = pd.to_datetime(
-                df.iloc[:, 0].astype(str) + " " + df.iloc[:, 1].astype(str),
-                errors="coerce"
-            )
+            result[side] = empty[side]
+            continue
 
         price_col = (
             lower_cols.get("price")
             or lower_cols.get("ltp")
             or lower_cols.get("value")
             or lower_cols.get("close")
-            or df.columns[2]
         )
+
+        if price_col is None:
+            if len(df.columns) >= 3:
+                price_col = df.columns[2]
+            else:
+                result[side] = empty[side]
+                continue
 
         volume_col = (
             lower_cols.get("volume")
@@ -573,119 +992,167 @@ def load_required_option_data_for_date(folder, date_str, expiry_str, strike, ins
             or lower_cols.get("quantity")
         )
 
-        oi_col = (
-            lower_cols.get("oi")
-            or lower_cols.get("open_interest")
-            or lower_cols.get("openinterest")
+        # -----------------------------------------------------
+        # 4. Normalize option data
+        # -----------------------------------------------------
+
+        out = pd.DataFrame(
+            {
+                "datetime": dt,
+                "price": pd.to_numeric(
+                    df[price_col],
+                    errors="coerce",
+                ),
+                "volume": (
+                    pd.to_numeric(
+                        df[volume_col],
+                        errors="coerce",
+                    ).fillna(0)
+                    if volume_col is not None
+                    else 0
+                ),
+            }
         )
 
-        out = pd.DataFrame({
-            "datetime": dt,
-            "price": pd.to_numeric(df[price_col], errors="coerce"),
-            "volume": (
-                pd.to_numeric(df[volume_col], errors="coerce").fillna(0)
-                if volume_col
-                else 0
-            ),
-            "oi": (
-                pd.to_numeric(df[oi_col], errors="coerce")
-                if oi_col
-                else np.nan
-            ),
-        }).dropna(subset=["datetime", "price"])
+        out = out.dropna(
+            subset=[
+                "datetime",
+                "price",
+            ]
+        )
 
         if out.empty:
             result[side] = empty[side]
             continue
 
-        if getattr(out["datetime"].dt, "tz", None) is None:
-            out["datetime"] = out["datetime"].dt.tz_localize(
-                IST,
-                ambiguous="NaT",
-                nonexistent="NaT"
+        # -----------------------------------------------------
+        # 5. Convert timestamps to IST
+        # -----------------------------------------------------
+
+        if out["datetime"].dt.tz is None:
+            out["datetime"] = (
+                out["datetime"].dt.tz_localize(
+                    IST,
+                    ambiguous="NaT",
+                    nonexistent="NaT",
+                )
             )
         else:
-            out["datetime"] = out["datetime"].dt.tz_convert(IST)
+            out["datetime"] = (
+                out["datetime"].dt.tz_convert(IST)
+            )
 
         out = out.dropna(subset=["datetime"])
 
+        # -----------------------------------------------------
+        # 6. Filter trading-session records
+        # -----------------------------------------------------
+
         out = out[
-            (out["datetime"].dt.time >= SESSION_START)
-            & (out["datetime"].dt.time <= SESSION_END)
+            (
+                out["datetime"].dt.time
+                >= SESSION_START
+            )
+            & (
+                out["datetime"].dt.time
+                <= SESSION_END
+            )
         ]
 
-        result[side] = out.sort_values("datetime").reset_index(drop=True)
+        if out.empty:
+            result[side] = empty[side]
+            continue
+
+        result[side] = (
+            out.sort_values("datetime")
+            .reset_index(drop=True)
+        )
 
     return {
         "CE": result.get("CE", empty["CE"]),
         "PE": result.get("PE", empty["PE"]),
     }
+
+
 def load_single_option_file_from_zip(folder, member_name):
     member_name = str(member_name).replace(".csv", ".parquet").replace(".zip", ".parquet")
 
     path = _find_parquet_file(folder, member_name)
 
     if not path:
-        return pd.DataFrame(columns=["datetime", "price", "volume", "oi"])
+        return pd.DataFrame(columns=["datetime", "price", "volume"])
 
     return _read_parquet_normalized(path, mode="option")
 
 
-def find_option_contract_files(folder, date_str, expiry_str, instrument="NIFTY"):
+
+def find_option_contract_files(
+    folder,
+    date_str,
+    expiry_str,
+    instrument="NIFTY",
+):
+    """Return contracts for an expiry using the cached option manifest."""
+    cfg = get_dataset_config(instrument)
+    symbol = str(cfg["symbol"]).upper()
+    expiry = str(expiry_str).strip()
     opt_folder = _get_opt_folder(folder, date_str)
+    contract_index = _get_option_contract_index(opt_folder)
 
-    if not os.path.isdir(opt_folder):
-        return []
+    found = [
+        (strike, side, path)
+        for (current_symbol, current_expiry, strike, side), path
+        in contract_index.items()
+        if current_symbol == symbol and current_expiry == expiry
+    ]
 
-    found = []
+    # Stable ordering helps callers, tests, and reproducible API responses.
+    return sorted(found, key=lambda item: (item[0], item[1], item[2]))
 
-    pattern = re.compile(
-        rf"^(.+?){re.escape(str(expiry_str))}(\d+(?:\.\d+)?)(CE|PE)$",
-        re.IGNORECASE
-    )
-
-    for root, _, files in os.walk(opt_folder):
-        for f in files:
-            base = os.path.splitext(f)[0].upper()
-            match = pattern.match(base)
-
-            if not match:
-                continue
-
-            strike = float(match.group(2))
-            side = match.group(3).upper()
-
-            found.append((int(strike), side, os.path.join(root, f)))
-
-    return found
-
-
-# =========================================================
-# CANDLES / FOLDER DISCOVERY
-# =========================================================
 
 def create_candles(tick_df, interval_minutes):
+    """Create session-aligned OHLC candles without copying unrelated columns."""
     if tick_df is None or tick_df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=["open", "high", "low", "close"])
+    if "datetime" not in tick_df.columns or "value" not in tick_df.columns:
+        raise ValueError("tick_df must contain 'datetime' and 'value' columns")
 
-    df = tick_df.copy()
-    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
-    df["value"] = pd.to_numeric(df["value"], errors="coerce")
-    df = df.dropna(subset=["datetime", "value"])
+    interval = int(interval_minutes)
+    if interval <= 0 or interval > 1440:
+        raise ValueError("interval_minutes must be between 1 and 1440")
 
+    df = pd.DataFrame({
+        "datetime": pd.to_datetime(tick_df["datetime"], errors="coerce"),
+        "value": pd.to_numeric(tick_df["value"], errors="coerce"),
+    }).dropna(subset=["datetime", "value"])
     if df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=["open", "high", "low", "close"])
 
     if getattr(df["datetime"].dt, "tz", None) is None:
-        df["datetime"] = df["datetime"].dt.tz_localize(IST)
+        df["datetime"] = df["datetime"].dt.tz_localize(
+            IST, ambiguous="NaT", nonexistent="NaT"
+        )
     else:
         df["datetime"] = df["datetime"].dt.tz_convert(IST)
+    df = df.dropna(subset=["datetime"])
 
+    session_offset = pd.Timedelta(
+        hours=SESSION_START.hour,
+        minutes=SESSION_START.minute,
+        seconds=SESSION_START.second,
+    )
     candles = (
         df.set_index("datetime")["value"]
-        .resample(f"{int(interval_minutes)}min")
+        .sort_index()
+        .resample(
+            f"{interval}min",
+            origin="start_day",
+            offset=session_offset,
+            label="left",
+            closed="left",
+        )
         .ohlc()
-        .dropna()
+        .dropna(how="any")
     )
     candles.columns = ["open", "high", "low", "close"]
     return candles
@@ -693,6 +1160,25 @@ def create_candles(tick_df, interval_minutes):
 
 def get_week_folders(instrument="NIFTY"):
     cfg = get_dataset_config(instrument)
+
+    if STORAGE_MODE == "blob":
+        week_names = set()
+
+        for blob_name in list_blob_names():
+            top_level = blob_name.split("/", 1)[0]
+
+            match = re.match(r"^\s*(\d+)", top_level)
+
+            if not match:
+                continue
+
+            week_no = int(match.group(1))
+
+            if cfg["week_start"] <= week_no <= cfg["week_end"]:
+                week_names.add((week_no, top_level))
+
+        return sorted(week_names, key=lambda item: item[0])
+
     base_path = cfg["base_path"]
 
     if not os.path.isdir(base_path):
@@ -707,6 +1193,7 @@ def get_week_folders(instrument="NIFTY"):
             continue
 
         match = re.match(r"^\s*(\d+)", name)
+
         if not match:
             continue
 
@@ -715,14 +1202,142 @@ def get_week_folders(instrument="NIFTY"):
         if cfg["week_start"] <= week_no <= cfg["week_end"]:
             folders.append((week_no, path))
 
-    return sorted(folders, key=lambda x: x[0])
+    return sorted(folders, key=lambda item: item[0])
 
 
-def get_dates_for_week_folder(week_number, folder, instrument="NIFTY"):
+# Cache of per-(week folder, instrument) trading-date lists so repeated
+# /api/defaults calls don't re-read blobs on every request.
+_WEEK_DATES_CACHE = {}
+_WEEK_DATES_CACHE_LOCK = Lock()
+
+
+def _dates_from_frame(d: "pd.DataFrame | None") -> set:
+    """
+    Extract YYYYMMDD date strings from a frame that has either a `date`
+    column (int/str like 20260702) or a `datetime` column.
+    """
+    dates: set = set()
+
+    if d is None or d.empty:
+        return dates
+
+    lower = {str(c).lower(): c for c in d.columns}
+
+    if "date" in lower:
+        col = pd.to_numeric(d[lower["date"]], errors="coerce").dropna()
+        if not col.empty:
+            dates.update(
+                col.astype("int64").astype(str).unique().tolist()
+            )
+            return dates
+
+    if "datetime" in lower:
+        dt = pd.to_datetime(d[lower["datetime"]], errors="coerce").dropna()
+        if not dt.empty:
+            dates.update(dt.dt.strftime("%Y%m%d").unique().tolist())
+
+    return dates
+
+
+def get_dates_for_week_folder(
+    week_number,
+    folder,
+    instrument="NIFTY",
+):
     dates = set()
 
-    if not os.path.isdir(folder):
-        return []
+    if STORAGE_MODE == "blob":
+        prefix = str(folder).replace("\\", "/").strip("/")
+        cache_key = (prefix, str(instrument).upper())
+
+        with _WEEK_DATES_CACHE_LOCK:
+            cached = _WEEK_DATES_CACHE.get(cache_key)
+
+        if cached is not None:
+            return list(cached)
+
+        cfg = get_dataset_config(instrument)
+
+        # -----------------------------------------------------
+        # 1. Read the trading dates from the index parquet
+        #    (IDX_TICK/<SYMBOL>.parquet). Blob names in this
+        #    layout carry no YYYYMMDD tokens, so the old
+        #    filename-regex approach matched garbage digits from
+        #    contract names (expiry+strike) instead of dates.
+        # -----------------------------------------------------
+
+        idx_prefix = _join_storage_path(prefix, "IDX_TICK")
+
+        idx_blob = None
+        for candidate in (
+            f"{cfg['symbol']}.parquet",
+            str(cfg["symbol"]),
+            cfg.get("zip_member", f"{cfg['symbol']}.parquet").replace(
+                ".csv", ".parquet"
+            ),
+        ):
+            try:
+                idx_blob = find_blob_by_filename(
+                    prefix=idx_prefix,
+                    filename=candidate,
+                )
+            except Exception:
+                idx_blob = None
+
+            if idx_blob:
+                break
+
+        if idx_blob:
+            # Try a cheap projected read of just the date column first.
+            try:
+                d = read_parquet_blob(idx_blob, columns=["date"])
+                dates.update(_dates_from_frame(d))
+            except Exception:
+                pass
+
+            # Fall back to a full read if the file has no plain
+            # `date` column (e.g. datetime-only schema).
+            if not dates:
+                try:
+                    d = read_parquet_blob(idx_blob)
+                    dates.update(_dates_from_frame(d))
+                except Exception as exc:
+                    logger.warning(
+                        "Unable to read index blob %s for dates: %s",
+                        idx_blob,
+                        exc,
+                    )
+
+        # -----------------------------------------------------
+        # 2. Fallback: date-stamped folder names in blob paths
+        #    (e.g. NSE_OPT_TICK_20260702/...). Only accept
+        #    8-digit runs that parse as real calendar dates so
+        #    contract digits like 26063043000 are rejected.
+        # -----------------------------------------------------
+
+        if not dates:
+            try:
+                for blob_name in list_blob_names(prefix):
+                    for token in re.findall(r"(?<!\d)(\d{8})(?!\d)", str(blob_name)):
+                        parsed = pd.to_datetime(
+                            token, format="%Y%m%d", errors="coerce"
+                        )
+                        if pd.notna(parsed) and 2000 <= parsed.year <= 2100:
+                            dates.add(token)
+            except Exception as exc:
+                logger.warning(
+                    "Blob-name date fallback failed for %s: %s",
+                    prefix,
+                    exc,
+                )
+
+        result = sorted(dates)
+
+        with _WEEK_DATES_CACHE_LOCK:
+            _WEEK_DATES_CACHE[cache_key] = list(result)
+
+        return result
+
 
     # 1. Old structure: folders with date in name
     for name in os.listdir(folder):
@@ -803,6 +1418,44 @@ def get_dates_for_week_folder(week_number, folder, instrument="NIFTY"):
     return sorted(dates)
 
 
+def clear_runtime_caches(clear_disk_option_cache: bool = False) -> None:
+    """Clear process-local caches; optionally remove normalized disk cache files."""
+    PARQUET_FILE_PATH_CACHE.clear()
+    RAW_PARQUET_CACHE.clear()
+    OPTION_PARQUET_CACHE.clear()
+    OPTION_CONTRACT_CACHE.clear()
+    _OPTION_CHAIN_CACHE.clear()
+    OPTION_WEEK_FOLDER_CACHE.clear()
+    invalidate_option_contract_index()
+    with _WEEK_DATES_CACHE_LOCK:
+        _WEEK_DATES_CACHE.clear()
+
+    if clear_disk_option_cache and os.path.isdir(SHARED_OPTION_CACHE_DIR):
+        for entry in os.scandir(SHARED_OPTION_CACHE_DIR):
+            if entry.is_file() and entry.name.lower().endswith(".parquet"):
+                try:
+                    os.remove(entry.path)
+                except OSError as exc:
+                    logger.warning("Unable to remove cache file %s: %s", entry.path, exc)
+
+
+def runtime_cache_stats() -> dict:
+    """Return lightweight process-local cache diagnostics."""
+    with _OPTION_CONTRACT_INDEX_CACHE_LOCK:
+        manifest_count = len(_OPTION_CONTRACT_INDEX_CACHE)
+    with _WEEK_DATES_CACHE_LOCK:
+        week_date_entries = len(_WEEK_DATES_CACHE)
+    return {
+        "storage_mode": STORAGE_MODE,
+        "raw_parquet": RAW_PARQUET_CACHE.stats(),
+        "option_chain": _OPTION_CHAIN_CACHE.stats(),
+        "path_cache_entries": len(PARQUET_FILE_PATH_CACHE),
+        "option_manifest_entries": manifest_count,
+        "week_date_cache_entries": week_date_entries,
+        "shared_option_cache_dir": SHARED_OPTION_CACHE_DIR,
+    }
+
+
 # =========================================================
 # OPTION HELPERS
 # =========================================================
@@ -853,73 +1506,169 @@ def _export_dataframe(df, output_path, output_format="parquet"):
 # FUTURE LOADER - OLD PATH
 # =========================================================
 
-def load_future_data_for_date(folder, date_str, month="current", instrument="NIFTY"):
+
+def load_future_data_for_date(
+    folder,
+    date_str,
+    month="current",
+    instrument="NIFTY",
+):
+    """Load the selected futures contract from local or Azure Blob storage."""
     cfg = get_dataset_config(instrument)
 
     if not is_path_allowed(folder, instrument):
         raise PermissionError(f"Access denied: {folder}")
 
     symbol = str(cfg["symbol"]).upper()
-
     month = str(month or "current").strip().lower()
     month = month.replace("-", "_").replace(" ", "_")
 
-    candidate_folders = [
-        os.path.join(folder, "FUT_TICK"),
-        os.path.join(folder, f"NSE_FUT_TICK_{date_str}", "Contract Futures"),
-        os.path.join(folder, f"NSE_FUT_TICK_{date_str}"),
-        folder,
-    ]
-
-    future_files = []
+    if STORAGE_MODE == "blob":
+        candidate_folders = [
+            _join_storage_path(folder, "FUT_TICK"),
+            _join_storage_path(
+                folder,
+                f"NSE_FUT_TICK_{date_str}",
+                "Contract Futures",
+            ),
+            _join_storage_path(
+                folder,
+                f"NSE_FUT_TICK_{date_str}",
+            ),
+            str(folder).replace("\\", "/").strip("/"),
+        ]
+    else:
+        candidate_folders = [
+            os.path.join(folder, "FUT_TICK"),
+            os.path.join(
+                folder,
+                f"NSE_FUT_TICK_{date_str}",
+                "Contract Futures",
+            ),
+            os.path.join(
+                folder,
+                f"NSE_FUT_TICK_{date_str}",
+            ),
+            folder,
+        ]
 
     pattern = re.compile(
-        rf"^{re.escape(symbol)}\d{{2}}(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)FUT$",
-        re.IGNORECASE
+        rf"^{re.escape(symbol)}\d{{2}}"
+        r"(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)"
+        r"FUT$",
+        re.IGNORECASE,
     )
 
+    future_files = []
+    seen_paths = set()
+
     for search_folder in candidate_folders:
-        if not os.path.isdir(search_folder):
-            continue
+        if STORAGE_MODE == "blob":
+            paths = list_blob_names(search_folder)
+        else:
+            if not os.path.isdir(search_folder):
+                continue
 
-        for root, _, files in os.walk(search_folder):
-            for f in files:
-                if not f.lower().endswith(".parquet"):
-                    continue
+            paths = (
+                os.path.join(root, filename)
+                for root, _, files in os.walk(search_folder)
+                for filename in files
+            )
 
-                base_name = os.path.splitext(f.upper())[0]
+        for file_path in paths:
+            file_path = str(file_path)
 
-                if pattern.match(base_name):
-                    future_files.append((base_name, os.path.join(root, f)))
+            if file_path in seen_paths:
+                continue
+            seen_paths.add(file_path)
+
+            filename = (
+                file_path
+                .replace("\\", "/")
+                .rsplit("/", 1)[-1]
+            )
+
+            if not filename.lower().endswith(".parquet"):
+                continue
+
+            base_name = os.path.splitext(filename)[0].upper()
+
+            if pattern.match(base_name):
+                future_files.append((base_name, file_path))
 
     if not future_files:
-        print(f"No future files found for {symbol} in {folder}")
-        return pd.DataFrame(columns=["datetime", "price", "volume", "oi"])
+        print(
+            f"No future files found for {symbol} in {folder}",
+            flush=True,
+        )
+        return pd.DataFrame(
+            columns=["datetime", "price", "volume"]
+        )
 
     month_order = {
-        "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4,
-        "MAY": 5, "JUN": 6, "JUL": 7, "AUG": 8,
-        "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+        "JAN": 1,
+        "FEB": 2,
+        "MAR": 3,
+        "APR": 4,
+        "MAY": 5,
+        "JUN": 6,
+        "JUL": 7,
+        "AUG": 8,
+        "SEP": 9,
+        "OCT": 10,
+        "NOV": 11,
+        "DEC": 12,
     }
 
     def get_month_rank(file_name):
         file_name = str(file_name).upper()
+
         for mon, rank in month_order.items():
-            if mon + "FUT" in file_name:
+            if f"{mon}FUT" in file_name:
                 return rank
+
         return 999
 
-    future_files = sorted(future_files, key=lambda x: get_month_rank(x[0]))
+    future_files.sort(key=lambda item: get_month_rank(item[0]))
 
-    if month in {"current", "this_month", "current_month", "near", "nearby"}:
-        selected = future_files[0][1]
+    if month in {
+        "current",
+        "this_month",
+        "current_month",
+        "near",
+        "nearby",
+    }:
+        selected_index = 0
     elif month in {"next", "next_month"}:
-        selected = future_files[min(1, len(future_files) - 1)][1]
-    elif month in {"far", "far_month", "next_to_next", "next_to_next_month"}:
-        selected = future_files[min(2, len(future_files) - 1)][1]
+        selected_index = 1
+    elif month in {
+        "far",
+        "far_month",
+        "next_to_next",
+        "next_to_next_month",
+    }:
+        selected_index = 2
     else:
-        selected = future_files[0][1]
+        selected_index = 0
 
-    print("Using future file:", selected)
+    selected_index = min(
+        selected_index,
+        len(future_files) - 1,
+    )
+    selected = future_files[selected_index][1]
 
-    return _read_parquet_normalized(selected, mode="option")
+    logger.info("Using future file: %s", selected)
+
+    try:
+        return _read_parquet_normalized(
+            selected,
+            mode="option",
+        )
+    except Exception as exc:
+        print(
+            f"Unable to read future file {selected}: {exc}",
+            flush=True,
+        )
+        return pd.DataFrame(
+            columns=["datetime", "price", "volume"]
+        )
