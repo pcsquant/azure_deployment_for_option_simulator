@@ -9,6 +9,7 @@ This version adds:
 - only 10 candles before + current + 10 candles after are kept per option leg
 - works for 1m, 2m, 3m, 5m, 10m, 15m, etc.
 - keeps existing API contract unchanged
+- uses Redis + ThreadPoolExecutor for asynchronous IV-surface jobs
 
 It uses your existing modules:
     agent_for_data/config_for_simulation.py
@@ -23,6 +24,7 @@ Frontend files expected:
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import math
@@ -36,7 +38,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from data_engine_for_simulation import (
+    load_raw_option_contract_ticks,
+)
 from flask import Flask, g, jsonify, render_template, request
+from flask.json.provider import JSONProvider
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 try:
@@ -44,22 +50,41 @@ try:
 except ImportError:  # pragma: no cover - dependency validation happens at startup
     redis = None
 
+
 try:
-    from kafka import KafkaProducer
+    import orjson
 except ImportError:  # pragma: no cover
-    KafkaProducer = None
+    orjson = None
 
 from black_scholes_iv_for_simulation import append_black_scholes_iv
+
+try:
+    from black_scholes_iv_for_simulation import clear_iv_cache, iv_cache_stats
+except ImportError:  # Backward compatibility with an older IV module.
+    def clear_iv_cache() -> None:
+        return None
+
+    def iv_cache_stats() -> dict:
+        return {"enabled": False}
 from chart import build_chart_payload
-from config_for_simulation import CANDLE_INTERVAL_MINUTES, IST, get_dataset_config
+from config_for_simulation import (
+    CANDLE_INTERVAL_MINUTES,
+    DATA_LAYOUT,
+    IST,
+    STORAGE_MODE,
+    get_dataset_config,
+    log_configuration,
+    validate_configuration,
+)
 from data_engine_for_simulation import (
-    clear_runtime_caches,
     create_candles,
     get_dates_for_week_folder,
     get_nearest_strike,
+    get_option_chain_snapshot,
     get_upcoming_expiry_np,
     get_week_folders,
     load_consolidated_option_chain,
+    load_future_data_for_date,
     load_index_data_by_symbol,
     load_required_option_data_for_date,
     runtime_cache_stats,
@@ -72,6 +97,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(logging.WARNING)
+logging.getLogger("azure.storage.blob").setLevel(logging.WARNING)
+
 
 def _env_bool(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
@@ -80,8 +108,28 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+
+class _OrjsonProvider(JSONProvider):
+    """Fast Flask JSON provider with safe fallback-compatible behavior."""
+
+    def dumps(self, obj: Any, **kwargs) -> str:
+        if orjson is None:
+            return json.dumps(obj, default=str, separators=(",", ":"))
+        return orjson.dumps(
+            obj,
+            option=orjson.OPT_NON_STR_KEYS | orjson.OPT_SERIALIZE_NUMPY,
+            default=str,
+        ).decode("utf-8")
+
+    def loads(self, value: Any, **kwargs) -> Any:
+        if orjson is None:
+            return json.loads(value)
+        return orjson.loads(value)
+
+
 def create_app() -> Flask:
     flask_app = Flask(__name__)
+    flask_app.json = _OrjsonProvider(flask_app)
     flask_app.config.update(
         JSON_SORT_KEYS=False,
         MAX_CONTENT_LENGTH=int(os.getenv("MAX_CONTENT_LENGTH", str(2 * 1024 * 1024))),
@@ -99,6 +147,16 @@ def create_app() -> Flask:
 
 
 app = create_app()
+
+# Validate static configuration at process startup. Historical paths are checked
+# lazily because Blob mode does not require local data directories.
+validate_configuration(require_data_paths=False)
+log_configuration()
+logger.info(
+    "Options Simulator startup: storage_mode=%s data_layout=%s",
+    STORAGE_MODE,
+    DATA_LAYOUT,
+)
 
 
 @app.before_request
@@ -140,13 +198,8 @@ def _internal_error(error):
 
 
 def _slice_consolidated_option_data(chain, strike):
-    """Return the standard CE/PE option-data shape for one strike.
-
-    The consolidated chain stores timestamp/strike/ce/pe columns.  Downstream
-    code expects datetime/price/volume frames, so normalize the fast-path
-    result to exactly the same interface as the per-contract fallback loader.
-    """
-    empty = pd.DataFrame(columns=["datetime", "price", "volume"])
+    """Return standard CE/PE frames with price, volume and OI."""
+    empty = pd.DataFrame(columns=["datetime", "price", "volume", "oi"])
 
     if chain is None or chain.empty:
         return {"CE": empty.copy(), "PE": empty.copy()}
@@ -161,26 +214,35 @@ def _slice_consolidated_option_data(chain, strike):
     ]
 
     result = {}
-    for side, price_column in (("CE", "ce"), ("PE", "pe")):
+    for side, price_column, oi_column in (
+        ("CE", "ce", "ce_oi"),
+        ("PE", "pe", "pe_oi"),
+    ):
         if price_column not in strike_rows.columns:
             result[side] = empty.copy()
             continue
 
-        frame = strike_rows[["timestamp", price_column]].rename(
-            columns={"timestamp": "datetime", price_column: "price"}
+        columns = ["timestamp", price_column]
+        if oi_column in strike_rows.columns:
+            columns.append(oi_column)
+
+        frame = strike_rows[columns].rename(
+            columns={"timestamp": "datetime", price_column: "price", oi_column: "oi"}
         ).copy()
+        if "oi" not in frame.columns:
+            frame["oi"] = np.nan
         frame["datetime"] = pd.to_datetime(frame["datetime"], errors="coerce")
         frame["price"] = pd.to_numeric(frame["price"], errors="coerce")
+        frame["oi"] = pd.to_numeric(frame["oi"], errors="coerce")
         frame["volume"] = 0
         frame = (
             frame.dropna(subset=["datetime", "price"])
             .sort_values("datetime")
             .reset_index(drop=True)
         )
-        result[side] = frame[["datetime", "price", "volume"]]
+        result[side] = frame[["datetime", "price", "volume", "oi"]]
 
     return result
-
 
 def _load_option_data_fast(folder, date_str, expiry_str, strike, dataset, chain=None):
     """Use the consolidated chain first and fall back to contract files.
@@ -236,16 +298,108 @@ SPOT_CANDLE_CACHE: "OrderedDict[Tuple[Any, ...], pd.DataFrame]" = OrderedDict()
 OPTION_WINDOW_CACHE_LOCK = threading.RLock()
 SPOT_CANDLE_CACHE_LOCK = threading.RLock()
 
+# Complete option-chain payload cache. This avoids repeating spot resolution,
+# chain lookup, IV solving and JSON preparation for identical historical requests.
+MAX_CHAIN_SNAPSHOT_CACHE_SIZE = max(
+    1,
+    int(os.getenv("CHAIN_SNAPSHOT_CACHE_SIZE", "256")),
+)
+CHAIN_SNAPSHOT_CACHE_TTL_SECONDS = max(
+    0.0,
+    float(os.getenv("CHAIN_SNAPSHOT_CACHE_TTL_SECONDS", "900")),
+)
+CHAIN_SNAPSHOT_CACHE: "OrderedDict[Tuple[Any, ...], Tuple[float, Dict[str, Any]]]" = OrderedDict()
+CHAIN_SNAPSHOT_CACHE_LOCK = threading.RLock()
+
+
+def _get_chain_snapshot_cache(key: Tuple[Any, ...]) -> Optional[Dict[str, Any]]:
+    now = time.monotonic()
+    with CHAIN_SNAPSHOT_CACHE_LOCK:
+        item = CHAIN_SNAPSHOT_CACHE.get(key)
+        if item is None:
+            return None
+
+        created_at, payload = item
+        if (
+            CHAIN_SNAPSHOT_CACHE_TTL_SECONDS > 0
+            and now - created_at >= CHAIN_SNAPSHOT_CACHE_TTL_SECONDS
+        ):
+            CHAIN_SNAPSHOT_CACHE.pop(key, None)
+            return None
+
+        CHAIN_SNAPSHOT_CACHE.move_to_end(key)
+        return copy.deepcopy(payload)
+
+
+def _put_chain_snapshot_cache(
+    key: Tuple[Any, ...],
+    payload: Dict[str, Any],
+) -> None:
+    with CHAIN_SNAPSHOT_CACHE_LOCK:
+        CHAIN_SNAPSHOT_CACHE[key] = (time.monotonic(), copy.deepcopy(payload))
+        CHAIN_SNAPSHOT_CACHE.move_to_end(key)
+        while len(CHAIN_SNAPSHOT_CACHE) > MAX_CHAIN_SNAPSHOT_CACHE_SIZE:
+            CHAIN_SNAPSHOT_CACHE.popitem(last=False)
+
+
+def _clear_chain_snapshot_cache() -> None:
+    with CHAIN_SNAPSHOT_CACHE_LOCK:
+        CHAIN_SNAPSHOT_CACHE.clear()
+
+
+# Completed option-metric chart payloads are cached separately because a chart
+# request can involve full-session resampling plus IV/Greek calculation.
+MAX_METRIC_CHART_CACHE_SIZE = max(
+    1,
+    int(os.getenv("METRIC_CHART_CACHE_SIZE", "256")),
+)
+METRIC_CHART_CACHE_TTL_SECONDS = max(
+    0.0,
+    float(os.getenv("METRIC_CHART_CACHE_TTL_SECONDS", "900")),
+)
+METRIC_CHART_CACHE: "OrderedDict[Tuple[Any, ...], Tuple[float, Dict[str, Any]]]" = OrderedDict()
+METRIC_CHART_CACHE_LOCK = threading.RLock()
+
+
+def _get_metric_chart_cache(key: Tuple[Any, ...]) -> Optional[Dict[str, Any]]:
+    now = time.monotonic()
+    with METRIC_CHART_CACHE_LOCK:
+        item = METRIC_CHART_CACHE.get(key)
+        if item is None:
+            return None
+        created_at, payload = item
+        if (
+            METRIC_CHART_CACHE_TTL_SECONDS > 0
+            and now - created_at >= METRIC_CHART_CACHE_TTL_SECONDS
+        ):
+            METRIC_CHART_CACHE.pop(key, None)
+            return None
+        METRIC_CHART_CACHE.move_to_end(key)
+        return copy.deepcopy(payload)
+
+
+def _put_metric_chart_cache(key: Tuple[Any, ...], payload: Dict[str, Any]) -> None:
+    with METRIC_CHART_CACHE_LOCK:
+        METRIC_CHART_CACHE[key] = (time.monotonic(), copy.deepcopy(payload))
+        METRIC_CHART_CACHE.move_to_end(key)
+        while len(METRIC_CHART_CACHE) > MAX_METRIC_CHART_CACHE_SIZE:
+            METRIC_CHART_CACHE.popitem(last=False)
+
+
+def _clear_metric_chart_cache() -> None:
+    with METRIC_CHART_CACHE_LOCK:
+        METRIC_CHART_CACHE.clear()
+
+
+
 # Speed mode: IV/Greeks calculation is expensive.
 # Default OFF for faster simulation. Set ENABLE_IV_CALC=true to enable it.
 ENABLE_IV_CALC = _env_bool("ENABLE_IV_CALC", True)
 
-# Redis and kafka
+# Redis configuration
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 REDIS_REQUIRED = _env_bool("REDIS_REQUIRED", False)
-KAFKA_REQUIRED = _env_bool("KAFKA_REQUIRED", False)
 
 redis_client = None
 if redis is not None:
@@ -253,49 +407,30 @@ if redis is not None:
         redis_client = redis.Redis.from_url(
             REDIS_URL,
             decode_responses=True,
-            socket_connect_timeout=float(os.getenv("REDIS_CONNECT_TIMEOUT_SECONDS", "2")),
-            socket_timeout=float(os.getenv("REDIS_SOCKET_TIMEOUT_SECONDS", "3")),
+            socket_connect_timeout=float(
+                os.getenv("REDIS_CONNECT_TIMEOUT_SECONDS", "2")
+            ),
+            socket_timeout=float(
+                os.getenv("REDIS_SOCKET_TIMEOUT_SECONDS", "3")
+            ),
             health_check_interval=30,
+            retry_on_timeout=True,
         )
         redis_client.ping()
+        logger.info("Redis connection established.")
     except Exception as exc:
         redis_client = None
         if REDIS_REQUIRED:
-            raise RuntimeError(f"Redis is required but unavailable: {exc}") from exc
-        logger.warning("Redis unavailable; async IV-surface routes are disabled: %s", exc)
+            raise RuntimeError(
+                f"Redis is required but unavailable: {exc}"
+            ) from exc
+        logger.warning(
+            "Redis unavailable; async IV-surface routes will return 503: %s",
+            exc,
+        )
 elif REDIS_REQUIRED:
     raise RuntimeError("redis package is required but not installed.")
 
-_kafka_producer = None
-_kafka_lock = threading.Lock()
-
-
-def get_kafka_producer():
-    global _kafka_producer
-    if KafkaProducer is None:
-        raise RuntimeError("kafka-python is not installed.")
-    if _kafka_producer is not None:
-        return _kafka_producer
-    with _kafka_lock:
-        if _kafka_producer is None:
-            try:
-                _kafka_producer = KafkaProducer(
-                    bootstrap_servers=[x.strip() for x in KAFKA_BOOTSTRAP_SERVERS.split(",") if x.strip()],
-                    value_serializer=lambda value: json.dumps(
-                        value, separators=(",", ":"), default=str
-                    ).encode("utf-8"),
-                    acks="all",
-                    retries=int(os.getenv("KAFKA_PRODUCER_RETRIES", "5")),
-                    request_timeout_ms=int(os.getenv("KAFKA_REQUEST_TIMEOUT_MS", "15000")),
-                    max_block_ms=int(os.getenv("KAFKA_MAX_BLOCK_MS", "15000")),
-                    linger_ms=int(os.getenv("KAFKA_LINGER_MS", "5")),
-                    compression_type=os.getenv("KAFKA_COMPRESSION_TYPE", "gzip"),
-                )
-            except Exception as exc:
-                if KAFKA_REQUIRED:
-                    raise
-                raise RuntimeError(f"Kafka producer unavailable: {exc}") from exc
-    return _kafka_producer
 
 
 # =========================================================
@@ -309,10 +444,41 @@ def _json_error(message: str, status: int = 400, **extra):
 
 
 def _normalize_dataset(value: Optional[str]) -> str:
-    value = str(value or "NIFTY").strip().upper()
-    if value in {"BSE", "SENSEX"}:
-        return "SENSEX"
-    return "NIFTY"
+    """
+    Normalize frontend instrument names into the names used by
+    data_engine_for_simulation.py and Azure Parquet files.
+    """
+
+    value = (
+        str(value or "NIFTY")
+        .strip()
+        .upper()
+        .replace("-", "")
+        .replace("_", "")
+        .replace(" ", "")
+    )
+
+    aliases = {
+        "NIFTY": "NIFTY",
+        "NIFTY50": "NIFTY",
+
+        "BANKNIFTY": "BANKNIFTY",
+        "NIFTYBANK": "BANKNIFTY",
+        "BANKNIFTYINDEX": "BANKNIFTY",
+
+        "SENSEX": "SENSEX",
+        "BSE": "SENSEX",
+        "BSESENSEX": "SENSEX",
+    }
+
+    normalized = aliases.get(value)
+
+    if normalized is None:
+        raise ValueError(
+            f"Unsupported dataset/instrument: {value}"
+        )
+
+    return normalized
 
 
 def _normalize_date(value: Optional[str]) -> str:
@@ -429,6 +595,39 @@ def _get_cache(cache: OrderedDict, key: Tuple[Any, ...]) -> Optional[pd.DataFram
 
 
 # =========================================================
+# DATA RESOLUTION CACHE
+# =========================================================
+
+MAX_DATA_RESOLUTION_CACHE_SIZE = max(1, int(os.getenv("DATA_RESOLUTION_CACHE_SIZE", "256")))
+DATA_RESOLUTION_CACHE_TTL_SECONDS = max(0.0, float(os.getenv("DATA_RESOLUTION_CACHE_TTL_SECONDS", "3600")))
+DATA_RESOLUTION_CACHE: "OrderedDict[Tuple[Any, ...], Tuple[float, Tuple[Any, ...]]]" = OrderedDict()
+DATA_RESOLUTION_CACHE_LOCK = threading.RLock()
+
+def _get_data_resolution_cache(key: Tuple[Any, ...]) -> Optional[Tuple[Any, ...]]:
+    now = time.monotonic()
+    with DATA_RESOLUTION_CACHE_LOCK:
+        item = DATA_RESOLUTION_CACHE.get(key)
+        if item is None:
+            return None
+        created_at, value = item
+        if DATA_RESOLUTION_CACHE_TTL_SECONDS > 0 and now - created_at >= DATA_RESOLUTION_CACHE_TTL_SECONDS:
+            DATA_RESOLUTION_CACHE.pop(key, None)
+            return None
+        DATA_RESOLUTION_CACHE.move_to_end(key)
+        return tuple(value)
+
+def _put_data_resolution_cache(key: Tuple[Any, ...], value: Tuple[Any, ...]) -> None:
+    with DATA_RESOLUTION_CACHE_LOCK:
+        DATA_RESOLUTION_CACHE[key] = (time.monotonic(), tuple(value))
+        DATA_RESOLUTION_CACHE.move_to_end(key)
+        while len(DATA_RESOLUTION_CACHE) > MAX_DATA_RESOLUTION_CACHE_SIZE:
+            DATA_RESOLUTION_CACHE.popitem(last=False)
+
+def _clear_data_resolution_cache() -> None:
+    with DATA_RESOLUTION_CACHE_LOCK:
+        DATA_RESOLUTION_CACHE.clear()
+
+# =========================================================
 # DATA RESOLUTION
 # =========================================================
 
@@ -437,80 +636,65 @@ def _resolve_week_folder_for_date(
     dataset: str,
     week_number: Optional[int] = None,
 ) -> Tuple[int, str, str]:
+    """Resolve dataset/date metadata once and reuse it for later time clicks."""
     query_date = _normalize_date(query_date)
-    target_date = datetime.strptime(query_date, "%Y-%m-%d").date()
+    dataset = _normalize_dataset(dataset)
+    normalized_week = int(week_number) if week_number is not None else None
+    cache_key = ("date", dataset, query_date, normalized_week)
+    cached = _get_data_resolution_cache(cache_key)
+    if cached is not None:
+        return int(cached[0]), str(cached[1]), str(cached[2])
 
+    target_date = datetime.strptime(query_date, "%Y-%m-%d").date()
     if target_date > MAX_ALLOWED_QUERY_DATE:
         raise ValueError(
             f"Selected date {query_date} is after allowed cutoff "
             f"{MAX_ALLOWED_QUERY_DATE.strftime('%Y-%m-%d')}."
         )
-
+    target_key = target_date.strftime("%Y%m%d")
     for num, folder in get_week_folders(instrument=dataset):
-        if week_number is not None and int(num) != int(week_number):
+        if normalized_week is not None and int(num) != normalized_week:
             continue
-
-        available_dates = get_dates_for_week_folder(
-            num,
-            folder,
-            instrument=dataset,
-        )
-
-        for date_str in available_dates:
-            current_date = datetime.strptime(date_str, "%Y%m%d").date()
-
-            if current_date > MAX_ALLOWED_QUERY_DATE:
-                continue
-
-            if current_date == target_date:
-                return int(num), folder, date_str
-
-    if week_number is not None:
-        raise ValueError(f"{dataset} date {query_date} not found in week {week_number}.")
-
+        available_dates = get_dates_for_week_folder(num, folder, instrument=dataset)
+        if target_key in {str(x) for x in available_dates}:
+            result = (int(num), str(folder), target_key)
+            _put_data_resolution_cache(cache_key, result)
+            return result
+    if normalized_week is not None:
+        raise ValueError(f"{dataset} date {query_date} not found in week {normalized_week}.")
     raise ValueError(f"{dataset} date {query_date} not found in historical data folders.")
 
-
 def _resolve_default_week_date(dataset: str) -> Tuple[int, str, str, str]:
+    """Resolve and cache the latest available trading date."""
+    dataset = _normalize_dataset(dataset)
+    cache_key = ("default", dataset)
+    cached = _get_data_resolution_cache(cache_key)
+    if cached is not None:
+        return int(cached[0]), str(cached[1]), str(cached[2]), str(cached[3])
+
     latest_item = None
-
     for num, folder in get_week_folders(instrument=dataset):
-        dates = get_dates_for_week_folder(
-            num,
-            folder,
-            instrument=dataset,
-        )
-
-        for date_str in dates:
+        for date_str in get_dates_for_week_folder(num, folder, instrument=dataset):
             try:
-                dt = datetime.strptime(date_str, "%Y%m%d").date()
+                dt = datetime.strptime(str(date_str), "%Y%m%d").date()
             except Exception:
                 continue
-
-            # Do not choose any default date after the allowed cutoff.
             if dt > MAX_ALLOWED_QUERY_DATE:
                 continue
-
-            item = (dt, int(num), folder, date_str)
-
+            item = (dt, int(num), str(folder), str(date_str))
             if latest_item is None or item[0] > latest_item[0]:
                 latest_item = item
-
     if latest_item is None:
         raise ValueError(
             f"No available historical dates found for {dataset} on or before "
             f"{MAX_ALLOWED_QUERY_DATE.strftime('%Y-%m-%d')}."
         )
-
     dt, week_number, folder, date_str = latest_item
+    result = (week_number, folder, date_str, dt.strftime("%Y-%m-%d"))
+    _put_data_resolution_cache(cache_key, result)
+    return result
 
-    return (
-        week_number,
-        folder,
-        date_str,
-        dt.strftime("%Y-%m-%d"),
-    )
-def get_available_expiries_for_date(query_date, dataset="NIFTY", max_months=2):
+def get_available_expiries_for_date(query_date, dataset="NIFTY", max_months=4):
     cfg = get_dataset_config(dataset)
     expiries = pd.to_datetime(cfg["combined_expiry"])
 
@@ -687,6 +871,41 @@ def _option_ltp_at_time_cached(
     return _option_ltp_from_window(cached_window, target_ts)
 
 
+
+def _oi_at_time(
+    raw_df: pd.DataFrame,
+    target_ts: pd.Timestamp,
+    interval_minutes: int,
+) -> Tuple[Optional[float], Optional[float]]:
+    """Return current OI and interval-over-interval OI change."""
+    if raw_df is None or raw_df.empty or "oi" not in raw_df.columns:
+        return None, None
+
+    df = raw_df[["datetime", "oi"]].copy()
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    df["oi"] = pd.to_numeric(df["oi"], errors="coerce")
+    df = df.dropna(subset=["datetime", "oi"]).sort_values("datetime")
+    if df.empty:
+        return None, None
+
+    if getattr(df["datetime"].dt, "tz", None) is None:
+        df["datetime"] = df["datetime"].dt.tz_localize(IST)
+    else:
+        df["datetime"] = df["datetime"].dt.tz_convert(IST)
+
+    target_ts = _to_ist_timestamp(target_ts)
+    current = df[df["datetime"] <= target_ts]
+    if current.empty:
+        return None, None
+
+    current_oi = _safe_float(current.iloc[-1]["oi"])
+    previous_cutoff = target_ts - timedelta(minutes=max(1, int(interval_minutes)))
+    previous = df[df["datetime"] <= previous_cutoff]
+    previous_oi = _safe_float(previous.iloc[-1]["oi"]) if not previous.empty else current_oi
+    change = None if current_oi is None or previous_oi is None else current_oi - previous_oi
+    return current_oi, change
+
+
 # =========================================================
 # SPOT CANDLES
 # =========================================================
@@ -698,27 +917,23 @@ def _get_spot_candles_for_day(
     candle_interval_minutes: int,
 ) -> pd.DataFrame:
     """
-    Load and cache spot/index candles for one trading day.
+    Load and cache spot/index candles for a trading day.
 
-    Production storage layout:
-        <week-folder>/IDX_TICK/<YYYYMMDD>/<SYMBOL>.parquet
-
-    The date-aware ``load_index_data_by_symbol`` loader is required here.
-    Calling ``load_tick_data(folder)`` without the selected date can resolve
-    the wrong Blob prefix and return an empty DataFrame.
+    The resolved week folder must be passed directly to load_tick_data().
+    load_tick_data() internally resolves the IDX_TICK directory and the
+    instrument Parquet file for both local and Azure Blob storage.
     """
+
     folder = str(folder).strip()
-    date_str = str(date_str).replace("-", "").strip()
+    date_str = str(date_str).strip()
     dataset = str(dataset).strip().upper()
     candle_interval_minutes = int(candle_interval_minutes)
 
     if not folder:
         raise ValueError("folder cannot be empty")
 
-    if len(date_str) != 8 or not date_str.isdigit():
-        raise ValueError(
-            "date_str must be in YYYYMMDD format."
-        )
+    if not date_str:
+        raise ValueError("date_str cannot be empty")
 
     if not dataset:
         raise ValueError("dataset cannot be empty")
@@ -736,23 +951,27 @@ def _get_spot_candles_for_day(
         folder,
     )
 
-    cached = _get_cache(
-        SPOT_CANDLE_CACHE,
-        cache_key,
-    )
+    cached = _get_cache(SPOT_CANDLE_CACHE, cache_key)
 
     if cached is not None:
         return cached.copy()
 
     try:
+        # Date-aware loader supports the production layout:
+        #
+        #   <week_folder>/IDX_TICK/<YYYYMMDD>/<SYMBOL>.parquet
+        #
+        # It also preserves compatibility with older flat layouts through the
+        # path-resolution logic inside data_engine_for_simulation.py.
         tick_df = load_index_data_by_symbol(
             folder=folder,
             date_str=date_str,
             symbol_name=dataset,
         )
+
     except Exception:
         logger.exception(
-            "Failed to load spot index data: "
+            "Failed to load spot tick data: "
             "dataset=%s date=%s folder=%s",
             dataset,
             date_str,
@@ -775,6 +994,7 @@ def _get_spot_candles_for_day(
             tick_df,
             candle_interval_minutes,
         )
+
     except Exception:
         logger.exception(
             "Failed to create spot candles: "
@@ -788,11 +1008,10 @@ def _get_spot_candles_for_day(
     if candles is None or candles.empty:
         logger.warning(
             "Spot candle creation returned no rows: "
-            "dataset=%s date=%s interval=%s tick_rows=%d",
+            "dataset=%s date=%s interval=%s",
             dataset,
             date_str,
             candle_interval_minutes,
-            len(tick_df),
         )
         return pd.DataFrame()
 
@@ -803,16 +1022,6 @@ def _get_spot_candles_for_day(
         cache_key,
         candles,
         MAX_SPOT_CANDLE_CACHE_SIZE,
-    )
-
-    logger.info(
-        "Spot candles ready: dataset=%s date=%s interval=%s "
-        "tick_rows=%d candle_rows=%d",
-        dataset,
-        date_str,
-        candle_interval_minutes,
-        len(tick_df),
-        len(candles),
     )
 
     return candles.copy()
@@ -850,6 +1059,60 @@ def _nearest_candle_row(
     return ts, candles.loc[ts]
 
 
+def _resample_option_close_for_session(
+    raw_df: pd.DataFrame,
+    interval_minutes: int,
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+) -> pd.Series:
+    """Return a full-session option close series aligned to session candles.
+
+    Unlike the small UI window helper, this function does not truncate the
+    morning session. That truncation was the reason early times such as 09:48
+    produced an empty PE_DELTA chart when the window was centered at 15:30.
+    """
+    if raw_df is None or raw_df.empty:
+        return pd.Series(dtype="float64")
+    if "datetime" not in raw_df.columns or "price" not in raw_df.columns:
+        return pd.Series(dtype="float64")
+
+    frame = raw_df.loc[:, ["datetime", "price"]].copy()
+    frame["datetime"] = pd.to_datetime(frame["datetime"], errors="coerce")
+    frame["price"] = pd.to_numeric(frame["price"], errors="coerce")
+    frame = frame.dropna(subset=["datetime", "price"])
+    if frame.empty:
+        return pd.Series(dtype="float64")
+
+    if getattr(frame["datetime"].dt, "tz", None) is None:
+        frame["datetime"] = frame["datetime"].dt.tz_localize(
+            IST, ambiguous="NaT", nonexistent="NaT"
+        )
+    else:
+        frame["datetime"] = frame["datetime"].dt.tz_convert(IST)
+    frame = frame.dropna(subset=["datetime"])
+    frame = frame[
+        (frame["datetime"] >= _to_ist_timestamp(start_ts))
+        & (frame["datetime"] <= _to_ist_timestamp(end_ts))
+    ]
+    if frame.empty:
+        return pd.Series(dtype="float64")
+
+    session_offset = pd.Timedelta(hours=9, minutes=15)
+    return (
+        frame.set_index("datetime")["price"]
+        .sort_index()
+        .resample(
+            f"{int(interval_minutes)}min",
+            origin="start_day",
+            offset=session_offset,
+            label="left",
+            closed="left",
+        )
+        .last()
+        .dropna()
+    )
+
+
 # =========================================================
 # OPTION CHAIN BUILDER
 # =========================================================
@@ -866,16 +1129,25 @@ def build_option_chain_snapshot(
     selected_expiry: Optional[str] = None,
     compute_greeks: bool = True,
 ) -> Dict[str, Any]:
+    """Build one historical option-chain snapshot with profiling and caching."""
+
+    total_started = time.perf_counter()
+    timings: Dict[str, float] = {}
+
     dataset = _normalize_dataset(dataset)
     query_time = _normalize_time(query_time)
     candle_interval_minutes = int(candle_interval_minutes)
+    strike_count_each_side = int(strike_count_each_side)
 
     if candle_interval_minutes <= 0:
         raise ValueError("interval must be greater than zero.")
+    if strike_count_each_side < 0 or strike_count_each_side > 100:
+        raise ValueError("strike_count_each_side must be between 0 and 100.")
 
     cfg = get_dataset_config(dataset)
     strike_step = int(cfg["strike_step"])
 
+    stage = time.perf_counter()
     if query_date:
         query_date = _normalize_date(query_date)
         resolved_week, folder, date_str = _resolve_week_folder_for_date(
@@ -887,13 +1159,44 @@ def build_option_chain_snapshot(
         resolved_week, folder, date_str, query_date = _resolve_default_week_date(
             dataset=dataset,
         )
+    timings["resolve_data_ms"] = round((time.perf_counter() - stage) * 1000, 3)
 
+    expiry_str = selected_expiry or get_upcoming_expiry_np(
+        datetime.strptime(date_str, "%Y%m%d").date(),
+        instrument=dataset,
+        expiry_rule=expiry_rule,
+    )
+    if expiry_str is None:
+        raise ValueError("No upcoming expiry found.")
+    expiry_str = str(expiry_str).strip()
+
+    cache_key = (
+        dataset,
+        date_str,
+        expiry_str,
+        query_time,
+        candle_interval_minutes,
+        strike_count_each_side,
+        spot_price_field,
+        bool(compute_greeks),
+    )
+    cached_payload = _get_chain_snapshot_cache(cache_key)
+    if cached_payload is not None:
+        cached_payload["cache_hit"] = True
+        cached_payload["performance"] = {
+            "cache_lookup_ms": round((time.perf_counter() - total_started) * 1000, 3),
+            "total_ms": round((time.perf_counter() - total_started) * 1000, 3),
+        }
+        return cached_payload
+
+    stage = time.perf_counter()
     spot_candles = _get_spot_candles_for_day(
         folder=folder,
         date_str=date_str,
         dataset=dataset,
         candle_interval_minutes=candle_interval_minutes,
     )
+    timings["spot_candles_ms"] = round((time.perf_counter() - stage) * 1000, 3)
 
     if spot_candles.empty:
         raise ValueError("No spot candles found for selected date.")
@@ -903,7 +1206,6 @@ def build_option_chain_snapshot(
         date_str=date_str,
         query_time=query_time,
     )
-
     target_ts = _to_ist_timestamp(target_ts)
 
     if spot_price_field not in {"open", "high", "low", "close"}:
@@ -913,43 +1215,7 @@ def build_option_chain_snapshot(
     if spot is None:
         raise ValueError(f"Spot candle field '{spot_price_field}' is missing or invalid.")
 
-    day_open = _safe_float(spot_candles.iloc[0].get("open"))
-    if day_open is None:
-        day_open = spot
-
-    # =========================
-    # INDIA VIX VALUE
-    # =========================
-    india_vix_value = None
-
-    try:
-        vix_df = load_index_data_by_symbol(
-            folder=folder,
-            date_str=date_str,
-            symbol_name="INDIAVIX",
-        )
-
-        if vix_df is not None and not vix_df.empty:
-            vix_df = vix_df.copy()
-            vix_df["datetime"] = pd.to_datetime(vix_df["datetime"], errors="coerce")
-            vix_df["value"] = pd.to_numeric(vix_df["value"], errors="coerce")
-            vix_df = vix_df.dropna(subset=["datetime", "value"])
-
-            if not vix_df.empty:
-                if getattr(vix_df["datetime"].dt, "tz", None) is None:
-                    vix_df["datetime"] = vix_df["datetime"].dt.tz_localize(IST)
-                else:
-                    vix_df["datetime"] = vix_df["datetime"].dt.tz_convert(IST)
-
-                target_vix = vix_df[vix_df["datetime"] <= target_ts]
-
-                if not target_vix.empty:
-                    india_vix_value = _safe_float(target_vix.iloc[-1]["value"])
-
-    except Exception as exc:
-        logger.warning("INDIA VIX load error: %s", exc)
-        india_vix_value = None
-
+    day_open = _safe_float(spot_candles.iloc[0].get("open"), spot)
     atm = int(
         get_nearest_strike(
             spot,
@@ -958,80 +1224,88 @@ def build_option_chain_snapshot(
         )
     )
 
-    expiry_str = selected_expiry or get_upcoming_expiry_np(
-        datetime.strptime(date_str, "%Y%m%d").date(),
-        instrument=dataset,
-        expiry_rule=expiry_rule,
-    )
-
-    if expiry_str is None:
-        raise ValueError("No upcoming expiry found.")
-
     strikes = [
-        atm + i * strike_step
-        for i in range(-int(strike_count_each_side), int(strike_count_each_side) + 1)
+        atm + offset * strike_step
+        for offset in range(-strike_count_each_side, strike_count_each_side + 1)
     ]
 
-    rows = []
+    # India VIX is best-effort and must not fail the main chain request.
+    stage = time.perf_counter()
+    india_vix_value = None
+    try:
+        vix_df = load_index_data_by_symbol(
+            folder=folder,
+            date_str=date_str,
+            symbol_name="INDIAVIX",
+        )
+        if vix_df is not None and not vix_df.empty:
+            vix_ts = pd.to_datetime(vix_df["datetime"], errors="coerce")
+            vix_values = pd.to_numeric(vix_df["value"], errors="coerce")
+            vix_work = pd.DataFrame({"datetime": vix_ts, "value": vix_values}).dropna()
+            if not vix_work.empty:
+                if getattr(vix_work["datetime"].dt, "tz", None) is None:
+                    vix_work["datetime"] = vix_work["datetime"].dt.tz_localize(
+                        IST,
+                        ambiguous="NaT",
+                        nonexistent="NaT",
+                    )
+                else:
+                    vix_work["datetime"] = vix_work["datetime"].dt.tz_convert(IST)
+                values_before = vix_work.loc[vix_work["datetime"] <= target_ts, "value"]
+                if not values_before.empty:
+                    india_vix_value = _safe_float(values_before.iloc[-1])
+    except Exception as exc:
+        logger.warning("INDIA VIX load error: %s", exc)
+    timings["vix_ms"] = round((time.perf_counter() - stage) * 1000, 3)
 
-    consolidated_chain = load_consolidated_option_chain(
+    # Fast path: data_engine performs one indexed lookup and binary-searches the
+    # latest timestamp at or before target_ts. This avoids scanning the full chain
+    # once for every strike.
+    stage = time.perf_counter()
+    snapshot = get_option_chain_snapshot(
         folder=folder,
         date_str=date_str,
         expiry_str=expiry_str,
+        target_timestamp=target_ts,
         instrument=dataset,
+        interval_minutes=candle_interval_minutes,
     )
+    timings["chain_snapshot_ms"] = round((time.perf_counter() - stage) * 1000, 3)
 
-    chain_source = "consolidated" if consolidated_chain is not None else "contracts"
+    rows: List[Dict[str, Any]] = []
+    chain_source = "consolidated"
 
-    for strike in strikes:
-        option_data = _load_option_data_fast(
-            folder=folder,
-            date_str=date_str,
-            expiry_str=expiry_str,
-            strike=int(strike),
-            dataset=dataset,
-            chain=consolidated_chain,
-        )
+    if snapshot is not None and not snapshot.empty:
+        snapshot_columns = [
+            "timestamp", "strike", "ce", "pe",
+            "ce_oi", "pe_oi", "ce_change_oi", "pe_change_oi",
+        ]
+        for column in snapshot_columns:
+            if column not in snapshot.columns:
+                snapshot[column] = np.nan
+        snapshot = snapshot.loc[:, snapshot_columns].copy(deep=False)
+        strike_values = pd.to_numeric(snapshot["strike"], errors="coerce")
+        snapshot = snapshot.loc[strike_values.notna()].copy()
+        snapshot["strike"] = strike_values.loc[strike_values.notna()].astype(int)
+        by_strike = snapshot.drop_duplicates("strike", keep="last").set_index("strike")
 
-        ce_cache_key = (
-            "option_window",
-            dataset,
-            date_str,
-            expiry_str,
-            int(strike),
-            "CE",
-            candle_interval_minutes,
-            target_ts.strftime("%Y-%m-%d %H:%M:%S%z"),
-        )
+        for strike in strikes:
+            ce_ltp = pe_ltp = None
+            ce_oi = pe_oi = None
+            ce_change_oi = pe_change_oi = None
+            if int(strike) in by_strike.index:
+                strike_row = by_strike.loc[int(strike)]
+                if isinstance(strike_row, pd.DataFrame):
+                    strike_row = strike_row.iloc[-1]
+                ce_ltp = _safe_float(strike_row.get("ce"))
+                pe_ltp = _safe_float(strike_row.get("pe"))
+                ce_oi = _safe_float(strike_row.get("ce_oi"))
+                pe_oi = _safe_float(strike_row.get("pe_oi"))
+                ce_change_oi = _safe_float(strike_row.get("ce_change_oi"))
+                pe_change_oi = _safe_float(strike_row.get("pe_change_oi"))
 
-        pe_cache_key = (
-            "option_window",
-            dataset,
-            date_str,
-            expiry_str,
-            int(strike),
-            "PE",
-            candle_interval_minutes,
-            target_ts.strftime("%Y-%m-%d %H:%M:%S%z"),
-        )
-
-        ce_ltp = _option_ltp_at_time_cached(
-            raw_df=option_data.get("CE"),
-            target_ts=target_ts,
-            candle_interval_minutes=candle_interval_minutes,
-            cache_key=ce_cache_key,
-        )
-
-        pe_ltp = _option_ltp_at_time_cached(
-            raw_df=option_data.get("PE"),
-            target_ts=target_ts,
-            candle_interval_minutes=candle_interval_minutes,
-            cache_key=pe_cache_key,
-        )
-
-        rows.append(
-            {
-                "timestamp": pd.Timestamp(target_ts).tz_convert(IST).tz_localize(None),
+            rows.append({
+                "timestamp": target_ts.tz_convert(IST).tz_localize(None),
                 "trade_date": datetime.strptime(date_str, "%Y%m%d").date(),
                 "instrument": dataset,
                 "expiry": expiry_str,
@@ -1040,66 +1314,131 @@ def build_option_chain_snapshot(
                 "close": float(spot),
                 "ce": ce_ltp,
                 "pe": pe_ltp,
-            }
-        )
+                "ce_oi": ce_oi,
+                "pe_oi": pe_oi,
+                "ce_change_oi": ce_change_oi,
+                "pe_change_oi": pe_change_oi,
+            })
+    else:
+        # Backward-compatible fallback for dates without a consolidated file.
+        chain_source = "contracts"
+        for strike in strikes:
+            option_data = load_required_option_data_for_date(
+                folder=folder,
+                date_str=date_str,
+                expiry_str=expiry_str,
+                strike=int(strike),
+                instrument=dataset,
+            )
 
-    chain_df = pd.DataFrame(rows)
+            ce_ltp = _option_ltp_at_time_cached(
+                raw_df=option_data.get("CE"),
+                target_ts=target_ts,
+                candle_interval_minutes=candle_interval_minutes,
+                cache_key=(
+                    "option_window", dataset, date_str, expiry_str, int(strike),
+                    "CE", candle_interval_minutes,
+                    target_ts.strftime("%Y-%m-%d %H:%M:%S%z"),
+                ),
+            )
+            pe_ltp = _option_ltp_at_time_cached(
+                raw_df=option_data.get("PE"),
+                target_ts=target_ts,
+                candle_interval_minutes=candle_interval_minutes,
+                cache_key=(
+                    "option_window", dataset, date_str, expiry_str, int(strike),
+                    "PE", candle_interval_minutes,
+                    target_ts.strftime("%Y-%m-%d %H:%M:%S%z"),
+                ),
+            )
+            ce_oi, ce_change_oi = _oi_at_time(
+                option_data.get("CE"), target_ts, candle_interval_minutes
+            )
+            pe_oi, pe_change_oi = _oi_at_time(
+                option_data.get("PE"), target_ts, candle_interval_minutes
+            )
 
+            rows.append({
+                "timestamp": target_ts.tz_convert(IST).tz_localize(None),
+                "trade_date": datetime.strptime(date_str, "%Y%m%d").date(),
+                "instrument": dataset,
+                "expiry": expiry_str,
+                "nearest_strike": int(strike),
+                "strike": int(strike),
+                "close": float(spot),
+                "ce": ce_ltp,
+                "pe": pe_ltp,
+                "ce_oi": ce_oi,
+                "pe_oi": pe_oi,
+                "ce_change_oi": ce_change_oi,
+                "pe_change_oi": pe_change_oi,
+            })
+
+    chain_df = pd.DataFrame.from_records(rows)
+
+    stage = time.perf_counter()
     if ENABLE_IV_CALC:
         try:
-            chain_df = append_black_scholes_iv(chain_df, compute_greeks=compute_greeks)
+            chain_df = append_black_scholes_iv(
+                chain_df,
+                compute_greeks=compute_greeks,
+                inplace=True,
+            )
+        except TypeError:
+            # Backward compatibility with an older function signature.
+            chain_df = append_black_scholes_iv(
+                chain_df,
+                compute_greeks=compute_greeks,
+            )
         except Exception as exc:
-            chain_df["iv"] = np.nan
-            chain_df["ce_iv"] = np.nan
-            chain_df["pe_iv"] = np.nan
-            chain_df["ce_delta"] = np.nan
-            chain_df["pe_delta"] = np.nan
-            chain_df["ce_gamma"] = np.nan
-            chain_df["pe_gamma"] = np.nan
-            chain_df["ce_vega"] = np.nan
-            chain_df["pe_vega"] = np.nan
-            chain_df["ce_theta"] = np.nan
-            chain_df["pe_theta"] = np.nan
+            logger.exception("IV calculation failed")
             chain_df["_iv_error"] = str(exc)
-    else:
-        chain_df["iv"] = np.nan
-        chain_df["ce_iv"] = np.nan
-        chain_df["pe_iv"] = np.nan
-        chain_df["ce_delta"] = np.nan
-        chain_df["pe_delta"] = np.nan
-        chain_df["ce_gamma"] = np.nan
-        chain_df["pe_gamma"] = np.nan
-        chain_df["ce_vega"] = np.nan
-        chain_df["pe_vega"] = np.nan
-        chain_df["ce_theta"] = np.nan
-        chain_df["pe_theta"] = np.nan
 
-    chain_rows = []
+    for column in (
+        "ce_oi", "pe_oi", "ce_change_oi", "pe_change_oi",
+        "iv", "ce_iv", "pe_iv",
+        "ce_delta", "pe_delta",
+        "ce_gamma", "pe_gamma",
+        "ce_vega", "pe_vega",
+        "ce_theta", "pe_theta",
+    ):
+        if column not in chain_df.columns:
+            chain_df[column] = np.nan
+    timings["iv_greeks_ms"] = round((time.perf_counter() - stage) * 1000, 3)
 
-    for _, row in chain_df.iterrows():
-        strike = _safe_int(row.get("strike"))
+    stage = time.perf_counter()
+    chain_rows = [
+        {
+            "strike": _safe_int(row.strike),
+            "atm": _safe_int(row.strike) == atm,
+            "ce_ltp": _round_or_none(row.ce, 2),
+            "pe_ltp": _round_or_none(row.pe, 2),
+            "ce_oi": _round_or_none(row.ce_oi, 0),
+            "pe_oi": _round_or_none(row.pe_oi, 0),
+            "ce_change_oi": _round_or_none(row.ce_change_oi, 0),
+            "pe_change_oi": _round_or_none(row.pe_change_oi, 0),
+            # Compatibility aliases for frontends using call/put naming.
+            "call_oi": _round_or_none(row.ce_oi, 0),
+            "put_oi": _round_or_none(row.pe_oi, 0),
+            "call_change_oi": _round_or_none(row.ce_change_oi, 0),
+            "put_change_oi": _round_or_none(row.pe_change_oi, 0),
+            "iv": _round_or_none(row.iv, 4),
+            "ce_iv": _round_or_none(row.ce_iv, 4),
+            "pe_iv": _round_or_none(row.pe_iv, 4),
+            "ce_delta": _round_or_none(row.ce_delta, 4),
+            "pe_delta": _round_or_none(row.pe_delta, 4),
+            "ce_gamma": _round_or_none(row.ce_gamma, 6),
+            "pe_gamma": _round_or_none(row.pe_gamma, 6),
+            "ce_vega": _round_or_none(row.ce_vega, 4),
+            "pe_vega": _round_or_none(row.pe_vega, 4),
+            "ce_theta": _round_or_none(row.ce_theta, 4),
+            "pe_theta": _round_or_none(row.pe_theta, 4),
+        }
+        for row in chain_df.itertuples(index=False)
+    ]
+    timings["response_build_ms"] = round((time.perf_counter() - stage) * 1000, 3)
 
-        chain_rows.append(
-            {
-                "strike": strike,
-                "atm": strike == atm,
-                "ce_ltp": _round_or_none(row.get("ce"), 2),
-                "pe_ltp": _round_or_none(row.get("pe"), 2),
-                "iv": _round_or_none(row.get("iv"), 4),
-                "ce_iv": _round_or_none(row.get("ce_iv"), 4),
-                "pe_iv": _round_or_none(row.get("pe_iv"), 4),
-                "ce_delta": _round_or_none(row.get("ce_delta"), 4),
-                "pe_delta": _round_or_none(row.get("pe_delta"), 4),
-                "ce_gamma": _round_or_none(row.get("ce_gamma"), 6),
-                "pe_gamma": _round_or_none(row.get("pe_gamma"), 6),
-                "ce_vega": _round_or_none(row.get("ce_vega"), 4),
-                "pe_vega": _round_or_none(row.get("pe_vega"), 4),
-                "ce_theta": _round_or_none(row.get("ce_theta"), 4),
-                "pe_theta": _round_or_none(row.get("pe_theta"), 4),
-            }
-        )
-
-    valid_iv = pd.to_numeric(chain_df.get("iv"), errors="coerce").dropna()
+    valid_iv = pd.to_numeric(chain_df["iv"], errors="coerce").dropna()
     atm_iv = valid_iv.mean() if not valid_iv.empty else None
 
     available_expiries = get_available_expiries_for_date(
@@ -1108,13 +1447,15 @@ def build_option_chain_snapshot(
         max_months=2,
     )
 
-    return {
+    timings["total_ms"] = round((time.perf_counter() - total_started) * 1000, 3)
+
+    payload = {
         "ok": True,
         "dataset": dataset,
         "underlying": dataset,
         "query_date": query_date,
         "date_str": date_str,
-        "query_time": pd.Timestamp(target_ts).strftime("%H:%M"),
+        "query_time": target_ts.strftime("%H:%M"),
         "resolved_week_number": resolved_week,
         "expiry": expiry_str,
         "expiry_label": _fmt_expiry_label(expiry_str),
@@ -1127,7 +1468,7 @@ def build_option_chain_snapshot(
         ),
         "day_open": round(float(day_open), 2),
         "atm": int(atm),
-        "strike_step": int(strike_step),
+        "strike_step": strike_step,
         "lot_size": int(LOT_SIZE_BY_INSTRUMENT.get(dataset, 65)),
         "interval": candle_interval_minutes,
         "max_allowed_query_date": MAX_ALLOWED_QUERY_DATE.strftime("%Y-%m-%d"),
@@ -1136,9 +1477,29 @@ def build_option_chain_snapshot(
         "option_window_cache_size": len(OPTION_WINDOW_CACHE),
         "iv_enabled": ENABLE_IV_CALC,
         "chain_source": chain_source,
-        "atm_iv": round(float(atm_iv), 4) if atm_iv is not None and np.isfinite(atm_iv) else None,
+        "cache_hit": False,
+        "atm_iv": (
+            round(float(atm_iv), 4)
+            if atm_iv is not None and np.isfinite(atm_iv)
+            else None
+        ),
+        "performance": timings,
         "rows": chain_rows,
     }
+
+    _put_chain_snapshot_cache(cache_key, payload)
+    logger.info(
+        "Option-chain snapshot dataset=%s date=%s time=%s expiry=%s "
+        "source=%s rows=%d timings=%s",
+        dataset,
+        date_str,
+        query_time,
+        expiry_str,
+        chain_source,
+        len(chain_rows),
+        timings,
+    )
+    return payload
 
 
 # =========================================================
@@ -1518,6 +1879,14 @@ def api_chain():
 
         strike_count = int(request.args.get("strike_count", 14))
         interval = int(request.args.get("interval", CANDLE_INTERVAL_MINUTES))
+        compute_greeks = _env_bool(
+            "DEFAULT_CHAIN_COMPUTE_GREEKS",
+            True,
+        )
+        if request.args.get("compute_greeks") is not None:
+            compute_greeks = str(request.args.get("compute_greeks")).strip().lower() in {
+                "1", "true", "yes", "on"
+            }
 
         selected_expiry = request.args.get("expiry")
 
@@ -1530,15 +1899,25 @@ def api_chain():
             strike_count_each_side=strike_count,
             candle_interval_minutes=interval,
             selected_expiry=selected_expiry,
+            compute_greeks=compute_greeks,
         )
 
-        return jsonify(result)
+        response = jsonify(result)
+        performance = result.get("performance") or {}
+        if performance:
+            response.headers["Server-Timing"] = ", ".join(
+                f"{name.replace('_ms', '')};dur={value}"
+                for name, value in performance.items()
+                if name.endswith("_ms")
+            )
+        return response
 
     except Exception as exc:
         return _json_error(str(exc), 400)
 
 # =========================================================
 # ASYNC IV SURFACE ROUTES
+# Redis + ThreadPoolExecutor
 # =========================================================
 
 if redis_client is not None:
@@ -1548,7 +1927,6 @@ if redis_client is not None:
         register_iv_surface_routes(
             app=app,
             redis_client=redis_client,
-            get_kafka_producer=get_kafka_producer,
             build_option_chain_snapshot=build_option_chain_snapshot,
             get_available_expiries_for_date=get_available_expiries_for_date,
             normalize_dataset=_normalize_dataset,
@@ -1559,18 +1937,32 @@ if redis_client is not None:
             json_error=_json_error,
             default_interval=CANDLE_INTERVAL_MINUTES,
         )
-    except Exception as exc:
-        if REDIS_REQUIRED or KAFKA_REQUIRED:
-            raise
-        logger.exception("Unable to register async IV-surface routes: %s", exc)
-else:
-    @app.route("/api/iv-surface")
-    def api_iv_surface_unavailable():
-        return _json_error("IV-surface service is unavailable because Redis is not connected.", 503)
 
-    @app.route("/api/iv-surface/status/<job_id_value>")
+        logger.info(
+            "IV-surface routes registered using Redis + ThreadPoolExecutor."
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "Unable to register async IV-surface routes: %s",
+            exc,
+        )
+        raise
+
+else:
+    @app.get("/api/iv-surface")
+    def api_iv_surface_unavailable():
+        return _json_error(
+            "IV-surface service is unavailable because Redis is not connected.",
+            503,
+        )
+
+    @app.get("/api/iv-surface/status/<job_id_value>")
     def api_iv_surface_status_unavailable(job_id_value: str):
-        return _json_error("IV-surface service is unavailable because Redis is not connected.", 503)
+        return _json_error(
+            "IV-surface service is unavailable because Redis is not connected.",
+            503,
+        )
 
 
 @app.route("/api/index-chart")
@@ -1700,229 +2092,32 @@ def api_index_chart():
 
 @app.route("/api/option-metric-chart")
 def api_option_metric_chart():
+    request_started = time.perf_counter()
+    timings: Dict[str, float] = {}
+
     try:
         dataset = _normalize_dataset(
-            request.args.get("dataset")
-            or request.args.get("underlying")
+            request.args.get("dataset") or request.args.get("underlying")
         )
-
-        query_date = request.args.get("date") or request.args.get("query_date")
-        query_date = _normalize_date(query_date) if query_date else None
+        query_date_value = request.args.get("date") or request.args.get("query_date")
+        query_date = _normalize_date(query_date_value) if query_date_value else None
 
         strike = int(request.args.get("strike"))
-        metric = str(request.args.get("metric")).lower()
+        metric = str(request.args.get("metric") or "").strip().lower()
         interval = int(request.args.get("interval", CANDLE_INTERVAL_MINUTES))
         selected_expiry = request.args.get("expiry")
 
         allowed = {
-            "ce_ltp",
-            "pe_ltp",
-            "ce_iv",
-            "pe_iv",
-            "ce_delta",
-            "pe_delta",
+            "ce_ltp", "pe_ltp",
+            "ce_iv", "pe_iv",
+            "ce_delta", "pe_delta",
         }
-
         if metric not in allowed:
-            raise ValueError("Unsupported metric")
+            raise ValueError(f"Unsupported metric: {metric}")
+        if interval <= 0 or interval > 1440:
+            raise ValueError("interval must be between 1 and 1440 minutes")
 
-        if query_date:
-            resolved_week, folder, date_str = _resolve_week_folder_for_date(
-                query_date=query_date,
-                dataset=dataset,
-                week_number=None,
-            )
-        else:
-            resolved_week, folder, date_str, query_date = (
-                _resolve_default_week_date(dataset)
-            )
-
-        end_date = _normalize_date(
-            request.args.get("end_date") or query_date
-        )
-
-        end_time = _normalize_time(
-            request.args.get("time")
-            or request.args.get("end_time")
-            or "15:30"
-        )
-
-        expiry_str = selected_expiry or get_upcoming_expiry_np(
-            datetime.strptime(date_str, "%Y%m%d").date(),
-            instrument=dataset,
-        )
-
-        opt = _load_option_data_fast(
-            folder=folder,
-            date_str=date_str,
-            expiry_str=expiry_str,
-            strike=strike,
-            dataset=dataset,
-        )
-
-        ce = _build_option_candle_window(
-            opt["CE"],
-            IST.localize(
-                datetime.strptime(
-                    date_str + " 15:30:00",
-                    "%Y%m%d %H:%M:%S",
-                )
-            ),
-            interval,
-            before=200,
-            after=0,
-        )
-
-        pe = _build_option_candle_window(
-            opt["PE"],
-            IST.localize(
-                datetime.strptime(
-                    date_str + " 15:30:00",
-                    "%Y%m%d %H:%M:%S",
-                )
-            ),
-            interval,
-            before=200,
-            after=0,
-        )
-
-        spot_candles = _get_spot_candles_for_day(
-            folder,
-            date_str,
-            dataset,
-            interval,
-        )
-
-        if spot_candles is None or spot_candles.empty:
-            return jsonify({
-                "ok": True,
-                "dataset": dataset,
-                "query_date": query_date,
-                "end_date": end_date,
-                "end_time": end_time,
-                "date_str": date_str,
-                "strike": strike,
-                "metric": metric,
-                "rows": [],
-            })
-
-        if getattr(spot_candles.index, "tz", None) is None:
-            spot_index_ist = spot_candles.index.tz_localize(IST)
-        else:
-            spot_index_ist = spot_candles.index.tz_convert(IST)
-
-        ce_close = pd.Series(index=spot_index_ist, dtype="float64")
-        pe_close = pd.Series(index=spot_index_ist, dtype="float64")
-
-        if ce is not None and not ce.empty:
-            ce_tmp = ce.copy()
-            ce_tmp["timestamp"] = pd.to_datetime(ce_tmp["timestamp"], errors="coerce")
-            ce_tmp = ce_tmp.dropna(subset=["timestamp"])
-
-            ce_idx = ce_tmp.set_index("timestamp")
-            if getattr(ce_idx.index, "tz", None) is None:
-                ce_idx.index = ce_idx.index.tz_localize(IST)
-            else:
-                ce_idx.index = ce_idx.index.tz_convert(IST)
-
-            ce_close = ce_idx["close"].reindex(spot_index_ist, method="ffill")
-
-        if pe is not None and not pe.empty:
-            pe_tmp = pe.copy()
-            pe_tmp["timestamp"] = pd.to_datetime(pe_tmp["timestamp"], errors="coerce")
-            pe_tmp = pe_tmp.dropna(subset=["timestamp"])
-
-            pe_idx = pe_tmp.set_index("timestamp")
-            if getattr(pe_idx.index, "tz", None) is None:
-                pe_idx.index = pe_idx.index.tz_localize(IST)
-            else:
-                pe_idx.index = pe_idx.index.tz_convert(IST)
-
-            pe_close = pe_idx["close"].reindex(spot_index_ist, method="ffill")
-
-        rows_df = pd.DataFrame({
-            "timestamp": spot_index_ist.tz_localize(None),
-            "trade_date": datetime.strptime(date_str, "%Y%m%d").date(),
-            "instrument": dataset,
-            "expiry": expiry_str,
-            "nearest_strike": strike,
-            "strike": strike,
-            "close": spot_candles["close"].values,
-            "ce": ce_close.values,
-            "pe": pe_close.values,
-        })
-
-        start_dt = datetime.strptime(
-            f"{query_date} 09:15",
-            "%Y-%m-%d %H:%M",
-        )
-
-        end_dt = datetime.strptime(
-            f"{end_date} {end_time}",
-            "%Y-%m-%d %H:%M",
-        )
-
-        rows_df = rows_df[
-            (rows_df["timestamp"] >= start_dt)
-            & (rows_df["timestamp"] <= end_dt)
-        ]
-
-        if metric in {"ce_iv", "pe_iv", "ce_delta", "pe_delta"}:
-            rows_df = append_black_scholes_iv(rows_df)
-
-        col_map = {
-            "ce_ltp": "ce",
-            "pe_ltp": "pe",
-            "ce_iv": "ce_iv",
-            "pe_iv": "pe_iv",
-            "ce_delta": "ce_delta",
-            "pe_delta": "pe_delta",
-        }
-
-        col = col_map[metric]
-        rows = []
-
-        for _, r in rows_df.dropna(subset=[col]).iterrows():
-            ts = pd.Timestamp(r["timestamp"])
-
-            if ts.tzinfo is not None:
-                ts = ts.tz_convert(IST).tz_localize(None)
-
-            rows.append({
-                "time": int(ts.timestamp()),
-                "value": round(float(r[col]), 4),
-            })
-
-        return jsonify({
-            "ok": True,
-            "dataset": dataset,
-            "query_date": query_date,
-            "end_date": end_date,
-            "end_time": end_time,
-            "date_str": date_str,
-            "strike": strike,
-            "metric": metric,
-            "rows": rows,
-        })
-
-    except Exception as exc:
-        return _json_error(str(exc), 400)
-
-@app.route("/api/option-ltp-candle-chart")
-def api_option_ltp_candle_chart():
-    try:
-        dataset = _normalize_dataset(request.args.get("dataset") or request.args.get("underlying"))
-        query_date = request.args.get("date") or request.args.get("query_date")
-        query_date = _normalize_date(query_date) if query_date else None
-
-        strike = int(request.args.get("strike"))
-        side = str(request.args.get("side") or "CE").upper()
-        interval = int(request.args.get("interval", CANDLE_INTERVAL_MINUTES))
-        selected_expiry = request.args.get("expiry")
-
-        if side not in {"CE", "PE"}:
-            raise ValueError("side must be CE or PE")
-
+        stage = time.perf_counter()
         if query_date:
             resolved_week, folder, date_str = _resolve_week_folder_for_date(
                 query_date=query_date,
@@ -1931,74 +2126,613 @@ def api_option_ltp_candle_chart():
             )
         else:
             resolved_week, folder, date_str, query_date = _resolve_default_week_date(dataset)
-
-        expiry_str = selected_expiry or get_upcoming_expiry_np(
-            datetime.strptime(date_str, "%Y%m%d").date(),
-            instrument=dataset,
-        )
-
-        opt = _load_option_data_fast(
-            folder=folder,
-            date_str=date_str,
-            expiry_str=expiry_str,
-            strike=strike,
-            dataset=dataset,
-        )
-
-        raw_df = opt.get(side)
-
-        if raw_df is None or raw_df.empty:
-            return jsonify({
-                "ok": True,
-                "dataset": dataset,
-                "query_date": query_date,
-                "date_str": date_str,
-                "strike": strike,
-                "side": side,
-                "rows": [],
-            })
-
-        raw_df = raw_df.copy()
-        raw_df["value"] = raw_df["price"]
+        timings["resolve_data_ms"] = round((time.perf_counter() - stage) * 1000, 3)
 
         end_date = _normalize_date(request.args.get("end_date") or query_date)
         end_time = _normalize_time(
             request.args.get("time") or request.args.get("end_time") or "15:30"
         )
 
-        start_dt = IST.localize(
+        expiry_str = selected_expiry or get_upcoming_expiry_np(
+            datetime.strptime(date_str, "%Y%m%d").date(),
+            instrument=dataset,
+        )
+        if not expiry_str:
+            raise ValueError("No upcoming expiry found")
+        expiry_str = str(expiry_str).strip()
+
+        metric_cache_key = (
+            dataset, query_date, end_date, end_time, expiry_str,
+            int(strike), metric, int(interval),
+        )
+        cached = _get_metric_chart_cache(metric_cache_key)
+        if cached is not None:
+            elapsed = round((time.perf_counter() - request_started) * 1000, 3)
+            cached["cache_hit"] = True
+            cached["performance"] = {"cache_lookup_ms": elapsed, "total_ms": elapsed}
+            return jsonify(cached)
+
+        start_ts = IST.localize(
             datetime.strptime(f"{query_date} 09:15", "%Y-%m-%d %H:%M")
         )
-
-        end_dt = IST.localize(
+        end_ts = IST.localize(
             datetime.strptime(f"{end_date} {end_time}", "%Y-%m-%d %H:%M")
         )
+        if end_ts < start_ts:
+            raise ValueError("end date/time cannot be before start date/time")
 
-        payload = build_chart_payload(
-            raw_df,
-            interval=interval,
-            start=start_dt,
-            end=end_dt,
-            previous_candles=100,
-            sma=(20, 50),
-            ema=(9, 20),
-            price_col="value",
+        stage = time.perf_counter()
+        consolidated = load_consolidated_option_chain(
+            folder=folder,
+            date_str=date_str,
+            expiry_str=expiry_str,
+            instrument=dataset,
         )
+        opt = _load_option_data_fast(
+            folder=folder,
+            date_str=date_str,
+            expiry_str=expiry_str,
+            strike=strike,
+            dataset=dataset,
+            chain=consolidated,
+        )
+        timings["option_load_ms"] = round((time.perf_counter() - stage) * 1000, 3)
 
-        return jsonify({
+        stage = time.perf_counter()
+        ce_close = _resample_option_close_for_session(
+            opt.get("CE"), interval, start_ts, end_ts
+        )
+        pe_close = _resample_option_close_for_session(
+            opt.get("PE"), interval, start_ts, end_ts
+        )
+        timings["option_resample_ms"] = round((time.perf_counter() - stage) * 1000, 3)
+
+        stage = time.perf_counter()
+        spot_candles = _get_spot_candles_for_day(
+            folder=folder,
+            date_str=date_str,
+            dataset=dataset,
+            candle_interval_minutes=interval,
+        )
+        timings["spot_load_ms"] = round((time.perf_counter() - stage) * 1000, 3)
+
+        if spot_candles is None or spot_candles.empty:
+            return _json_error(
+                "No spot candles found for the selected date.",
+                404,
+                dataset=dataset, date_str=date_str, strike=strike, metric=metric, rows=[],
+            )
+
+        if getattr(spot_candles.index, "tz", None) is None:
+            spot_index = spot_candles.index.tz_localize(IST)
+        else:
+            spot_index = spot_candles.index.tz_convert(IST)
+
+        in_range = (spot_index >= start_ts) & (spot_index <= end_ts)
+        spot_frame = spot_candles.loc[in_range].copy()
+        spot_index = spot_index[in_range]
+        if spot_frame.empty:
+            return _json_error(
+                "No spot candles found inside the requested chart range.",
+                404, rows=[],
+            )
+
+        # Reindex option closes to the exact spot-candle grid. Forward-fill only
+        # after the first real option observation; leading missing values stay NaN.
+        ce_aligned = ce_close.reindex(spot_index).ffill() if not ce_close.empty else pd.Series(index=spot_index, dtype="float64")
+        pe_aligned = pe_close.reindex(spot_index).ffill() if not pe_close.empty else pd.Series(index=spot_index, dtype="float64")
+
+        rows_df = pd.DataFrame({
+            "timestamp": spot_index.tz_localize(None),
+            "trade_date": datetime.strptime(date_str, "%Y%m%d").date(),
+            "instrument": dataset,
+            "expiry": expiry_str,
+            "nearest_strike": int(strike),
+            "strike": int(strike),
+            "close": pd.to_numeric(spot_frame["close"], errors="coerce").to_numpy(),
+            "ce": ce_aligned.to_numpy(),
+            "pe": pe_aligned.to_numpy(),
+        })
+
+        diagnostics = {
+            "spot_rows": int(rows_df["close"].notna().sum()),
+            "ce_price_rows": int(rows_df["ce"].notna().sum()),
+            "pe_price_rows": int(rows_df["pe"].notna().sum()),
+        }
+
+        stage = time.perf_counter()
+        if metric in {"ce_iv", "pe_iv", "ce_delta", "pe_delta"}:
+            compute_greeks = metric in {"ce_delta", "pe_delta"}
+            try:
+                rows_df = append_black_scholes_iv(
+                    rows_df,
+                    compute_greeks=compute_greeks,
+                    inplace=True,
+                )
+            except TypeError:
+                rows_df = append_black_scholes_iv(
+                    rows_df, compute_greeks=compute_greeks
+                )
+        timings["iv_greeks_ms"] = round((time.perf_counter() - stage) * 1000, 3)
+
+        col_map = {
+            "ce_ltp": "ce", "pe_ltp": "pe",
+            "ce_iv": "ce_iv", "pe_iv": "pe_iv",
+            "ce_delta": "ce_delta", "pe_delta": "pe_delta",
+        }
+        col = col_map[metric]
+        if col not in rows_df.columns:
+            rows_df[col] = np.nan
+
+        for name in ("ce_iv", "pe_iv", "ce_delta", "pe_delta"):
+            diagnostics[f"{name}_rows"] = int(
+                rows_df[name].notna().sum() if name in rows_df.columns else 0
+            )
+
+        valid = rows_df.loc[rows_df[col].notna(), ["timestamp", col]]
+        if valid.empty:
+            timings["total_ms"] = round((time.perf_counter() - request_started) * 1000, 3)
+            logger.warning(
+                "No metric chart data dataset=%s date=%s expiry=%s strike=%s "
+                "metric=%s diagnostics=%s timings=%s",
+                dataset, date_str, expiry_str, strike, metric, diagnostics, timings,
+            )
+            return _json_error(
+                f"No valid {metric} values were calculated for strike {strike}.",
+                422,
+                dataset=dataset, query_date=query_date, end_date=end_date,
+                end_time=end_time, date_str=date_str, expiry=expiry_str,
+                strike=strike, metric=metric, diagnostics=diagnostics,
+                performance=timings, rows=[],
+            )
+
+        stage = time.perf_counter()
+        rows = []
+        for row in valid.itertuples(index=False, name=None):
+            ts, value = row
+            ts = pd.Timestamp(ts)
+            if ts.tzinfo is not None:
+                ts = ts.tz_convert(IST).tz_localize(None)
+            rows.append({
+                "time": int(ts.timestamp()),
+                "value": round(float(value), 4),
+            })
+        timings["response_build_ms"] = round((time.perf_counter() - stage) * 1000, 3)
+        timings["total_ms"] = round((time.perf_counter() - request_started) * 1000, 3)
+
+        payload = {
             "ok": True,
             "dataset": dataset,
             "query_date": query_date,
+            "end_date": end_date,
+            "end_time": end_time,
             "date_str": date_str,
+            "resolved_week_number": resolved_week,
+            "expiry": expiry_str,
             "strike": strike,
-            "side": side,
+            "metric": metric,
             "interval": interval,
-            "rows": payload["candles"],
-            "indicators": payload["indicators"],
-        })
+            "cache_hit": False,
+            "diagnostics": diagnostics,
+            "performance": timings,
+            "rows": rows,
+        }
+        _put_metric_chart_cache(metric_cache_key, payload)
+        logger.info(
+            "Metric chart dataset=%s date=%s expiry=%s strike=%s metric=%s "
+            "rows=%d timings=%s",
+            dataset, date_str, expiry_str, strike, metric, len(rows), timings,
+        )
+        return jsonify(payload)
+
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    except Exception as exc:
+        logger.exception("Option metric chart failed")
+        return _json_error("Unable to build option metric chart.", 500, detail=str(exc))
+
+
+@app.route("/api/option-ltp-candle-chart")
+def api_option_ltp_candle_chart():
+    try:
+        dataset = _normalize_dataset(
+            request.args.get("dataset")
+            or request.args.get("underlying")
+        )
+
+        query_date = (
+            request.args.get("date")
+            or request.args.get("query_date")
+        )
+
+        query_date = (
+            _normalize_date(query_date)
+            if query_date
+            else None
+        )
+
+        strike = int(request.args.get("strike"))
+
+        side = str(
+            request.args.get("side") or "CE"
+        ).upper()
+
+        interval = int(
+            request.args.get(
+                "interval",
+                CANDLE_INTERVAL_MINUTES,
+            )
+        )
+
+        selected_expiry = request.args.get("expiry")
+
+        if side not in {"CE", "PE"}:
+            raise ValueError("side must be CE or PE")
+
+        if interval <= 0:
+            raise ValueError(
+                "interval must be greater than zero"
+            )
+
+        # -------------------------------------------------
+        # Resolve selected date and week folder
+        # -------------------------------------------------
+
+        if query_date:
+            resolved_week, folder, date_str = (
+                _resolve_week_folder_for_date(
+                    query_date=query_date,
+                    dataset=dataset,
+                    week_number=None,
+                )
+            )
+        else:
+            (
+                resolved_week,
+                folder,
+                date_str,
+                query_date,
+            ) = _resolve_default_week_date(dataset)
+
+        # -------------------------------------------------
+        # Resolve expiry
+        # -------------------------------------------------
+
+        expiry_str = (
+            selected_expiry
+            or get_upcoming_expiry_np(
+                datetime.strptime(
+                    date_str,
+                    "%Y%m%d",
+                ).date(),
+                instrument=dataset,
+            )
+        )
+
+        if not expiry_str:
+            raise ValueError(
+                "No expiry found for selected date."
+            )
+
+        expiry_str = str(expiry_str).strip()
+
+        # -------------------------------------------------
+        # Load every raw tick for the selected contract
+        # -------------------------------------------------
+
+        raw_df = load_raw_option_contract_ticks(
+            folder=folder,
+            date_str=date_str,
+            expiry_str=expiry_str,
+            strike=strike,
+            option_type=side,
+            instrument=dataset,
+        )
+
+        if raw_df is None or raw_df.empty:
+            return jsonify(
+                {
+                    "ok": True,
+                    "dataset": dataset,
+                    "query_date": query_date,
+                    "date_str": date_str,
+                    "expiry": expiry_str,
+                    "strike": strike,
+                    "side": side,
+                    "interval": interval,
+                    "tick_count": 0,
+                    "candle_count": 0,
+                    "rows": [],
+                }
+            )
+
+        # -------------------------------------------------
+        # Prepare raw option ticks
+        # -------------------------------------------------
+
+        raw_df = raw_df.copy()
+
+        if "datetime" not in raw_df.columns:
+            raise ValueError(
+                "Option data does not contain datetime column."
+            )
+
+        if "price" not in raw_df.columns:
+            raise ValueError(
+                "Option data does not contain price column."
+            )
+
+        raw_df["datetime"] = pd.to_datetime(
+            raw_df["datetime"],
+            errors="coerce",
+        )
+
+        raw_df["price"] = pd.to_numeric(
+            raw_df["price"],
+            errors="coerce",
+        )
+
+        raw_df = (
+            raw_df
+            .dropna(subset=["datetime", "price"])
+            .sort_values("datetime")
+            .reset_index(drop=True)
+        )
+
+        if raw_df.empty:
+            raise ValueError(
+                "No valid raw option ticks found."
+            )
+
+        # -------------------------------------------------
+        # Ensure timestamps are in IST
+        # -------------------------------------------------
+
+        if getattr(
+            raw_df["datetime"].dt,
+            "tz",
+            None,
+        ) is None:
+            raw_df["datetime"] = (
+                raw_df["datetime"]
+                .dt.tz_localize(
+                    IST,
+                    ambiguous="NaT",
+                    nonexistent="NaT",
+                )
+            )
+        else:
+            raw_df["datetime"] = (
+                raw_df["datetime"]
+                .dt.tz_convert(IST)
+            )
+
+        raw_df = raw_df.dropna(
+            subset=["datetime"]
+        )
+
+        # -------------------------------------------------
+        # Requested chart range
+        # -------------------------------------------------
+
+        start_time = _normalize_time(
+            request.args.get("start_time")
+            or request.args.get("from_time")
+            or "09:15"
+        )
+
+        end_date = _normalize_date(
+            request.args.get("end_date")
+            or query_date
+        )
+
+        end_time = _normalize_time(
+            request.args.get("time")
+            or request.args.get("end_time")
+            or "15:30"
+        )
+
+        start_dt = IST.localize(
+            datetime.strptime(
+                f"{query_date} {start_time}",
+                "%Y-%m-%d %H:%M",
+            )
+        )
+
+        end_dt = IST.localize(
+            datetime.strptime(
+                f"{end_date} {end_time}",
+                "%Y-%m-%d %H:%M",
+            )
+        )
+
+        if end_dt < start_dt:
+            raise ValueError(
+                "End date/time cannot be before start date/time."
+            )
+
+        raw_df = raw_df[
+            (raw_df["datetime"] >= start_dt)
+            & (raw_df["datetime"] <= end_dt)
+        ].copy()
+
+        if raw_df.empty:
+            return jsonify(
+                {
+                    "ok": True,
+                    "dataset": dataset,
+                    "query_date": query_date,
+                    "end_date": end_date,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "date_str": date_str,
+                    "expiry": expiry_str,
+                    "strike": strike,
+                    "side": side,
+                    "interval": interval,
+                    "tick_count": 0,
+                    "candle_count": 0,
+                    "rows": [],
+                }
+            )
+
+        # -------------------------------------------------
+        # Optional diagnostics
+        # -------------------------------------------------
+
+        ticks_per_minute = (
+            raw_df
+            .set_index("datetime")
+            .resample("1min")["price"]
+            .count()
+        )
+
+        logger.info(
+            "Option raw-tick chart dataset=%s date=%s expiry=%s "
+            "strike=%s side=%s ticks=%s min_ticks_per_min=%s "
+            "max_ticks_per_min=%s avg_ticks_per_min=%.2f",
+            dataset,
+            date_str,
+            expiry_str,
+            strike,
+            side,
+            len(raw_df),
+            int(ticks_per_minute.min())
+            if not ticks_per_minute.empty
+            else 0,
+            int(ticks_per_minute.max())
+            if not ticks_per_minute.empty
+            else 0,
+            float(ticks_per_minute.mean())
+            if not ticks_per_minute.empty
+            else 0.0,
+        )
+
+        # -------------------------------------------------
+        # Build OHLC candles from all raw ticks
+        # -------------------------------------------------
+
+        candle_df = (
+            raw_df
+            .set_index("datetime")["price"]
+            .sort_index()
+            .resample(
+                f"{interval}min",
+                origin="start_day",
+                offset=pd.Timedelta(
+                    hours=9,
+                    minutes=15,
+                ),
+                label="left",
+                closed="left",
+            )
+            .ohlc()
+            .dropna(
+                subset=[
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                ]
+            )
+        )
+
+        if candle_df.empty:
+            return jsonify(
+                {
+                    "ok": True,
+                    "dataset": dataset,
+                    "query_date": query_date,
+                    "end_date": end_date,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "date_str": date_str,
+                    "expiry": expiry_str,
+                    "strike": strike,
+                    "side": side,
+                    "interval": interval,
+                    "tick_count": int(len(raw_df)),
+                    "candle_count": 0,
+                    "rows": [],
+                }
+            )
+
+        # -------------------------------------------------
+        # Convert candles for Lightweight Charts
+        # -------------------------------------------------
+
+        rows = []
+
+        for timestamp, candle in candle_df.iterrows():
+            timestamp = pd.Timestamp(timestamp)
+
+            if timestamp.tzinfo is not None:
+                timestamp = (
+                    timestamp
+                    .tz_convert(IST)
+                    .tz_localize(None)
+                )
+
+            rows.append(
+                {
+                    "time": int(timestamp.timestamp()),
+                    "open": round(
+                        float(candle["open"]),
+                        2,
+                    ),
+                    "high": round(
+                        float(candle["high"]),
+                        2,
+                    ),
+                    "low": round(
+                        float(candle["low"]),
+                        2,
+                    ),
+                    "close": round(
+                        float(candle["close"]),
+                        2,
+                    ),
+                }
+            )
+
+        return jsonify(
+            {
+                "ok": True,
+                "dataset": dataset,
+                "query_date": query_date,
+                "end_date": end_date,
+                "start_time": start_time,
+                "end_time": end_time,
+                "date_str": date_str,
+                "resolved_week_number": resolved_week,
+                "expiry": expiry_str,
+                "strike": strike,
+                "side": side,
+                "interval": interval,
+                "tick_count": int(len(raw_df)),
+                "candle_count": int(len(rows)),
+                "rows": rows,
+            }
+        )
+
+    except ValueError as exc:
+        return _json_error(
+            str(exc),
+            400,
+        )
 
     except Exception as exc:
-        return _json_error(str(exc), 400)
+        logger.exception(
+            "Option LTP candle-chart error"
+        )
+
+        return _json_error(
+            "Unable to build option candle chart.",
+            500,
+            detail=str(exc),
+        )
+
+
 @app.route("/api/india-vix-chart")
 def api_india_vix_chart():
     try:
@@ -2135,9 +2869,6 @@ def api_future_chart():
 
         if interval <= 0:
             raise ValueError("interval must be greater than zero.")
-
-        from data_engine_for_simulation import load_future_data_for_date
-        from chart import build_chart_payload
 
         start_day = datetime.strptime(start_date, "%Y-%m-%d").date()
         end_day = datetime.strptime(end_date, "%Y-%m-%d").date()
@@ -2346,16 +3077,24 @@ def api_cache_status():
     return jsonify(
         {
             "ok": True,
-            "application": {
-                "option_window_cache_size": len(OPTION_WINDOW_CACHE),
-                "option_window_cache_limit": MAX_OPTION_WINDOW_CACHE_SIZE,
-                "spot_candle_cache_size": len(SPOT_CANDLE_CACHE),
-                "spot_candle_cache_limit": MAX_SPOT_CANDLE_CACHE_SIZE,
-                "window_candles_before": WINDOW_CANDLES_BEFORE,
-                "window_candles_after": WINDOW_CANDLES_AFTER,
-                "iv_enabled": ENABLE_IV_CALC,
-            },
+            "option_window_cache_size": len(OPTION_WINDOW_CACHE),
+            "option_window_cache_limit": MAX_OPTION_WINDOW_CACHE_SIZE,
+            "spot_candle_cache_size": len(SPOT_CANDLE_CACHE),
+            "spot_candle_cache_limit": MAX_SPOT_CANDLE_CACHE_SIZE,
+            "window_candles_before": WINDOW_CANDLES_BEFORE,
+            "window_candles_after": WINDOW_CANDLES_AFTER,
+            "iv_enabled": ENABLE_IV_CALC,
+            "chain_snapshot_cache_size": len(CHAIN_SNAPSHOT_CACHE),
+            "chain_snapshot_cache_limit": MAX_CHAIN_SNAPSHOT_CACHE_SIZE,
+            "chain_snapshot_cache_ttl_seconds": CHAIN_SNAPSHOT_CACHE_TTL_SECONDS,
+            "metric_chart_cache_size": len(METRIC_CHART_CACHE),
+            "metric_chart_cache_limit": MAX_METRIC_CHART_CACHE_SIZE,
+            "metric_chart_cache_ttl_seconds": METRIC_CHART_CACHE_TTL_SECONDS,
+            "data_resolution_cache_size": len(DATA_RESOLUTION_CACHE),
+            "data_resolution_cache_limit": MAX_DATA_RESOLUTION_CACHE_SIZE,
+            "data_resolution_cache_ttl_seconds": DATA_RESOLUTION_CACHE_TTL_SECONDS,
             "data_engine": runtime_cache_stats(),
+            "iv_cache": iv_cache_stats(),
         }
     )
 
@@ -2367,18 +3106,16 @@ def api_cache_clear():
         return _json_error("Unauthorized.", 401)
     with OPTION_WINDOW_CACHE_LOCK:
         OPTION_WINDOW_CACHE.clear()
-
     with SPOT_CANDLE_CACHE_LOCK:
         SPOT_CANDLE_CACHE.clear()
-
-    clear_runtime_caches()
-
-    return jsonify(
-        {
-            "ok": True,
-            "message": "Application and data-engine RAM caches cleared.",
-        }
-    )
+    _clear_chain_snapshot_cache()
+    _clear_metric_chart_cache()
+    _clear_data_resolution_cache()
+    clear_iv_cache()
+    return jsonify({
+        "ok": True,
+        "message": "Application and IV RAM caches cleared.",
+    })
 
 
 @app.route("/api/health")
@@ -2392,18 +3129,27 @@ def api_health():
     payload = {
         "ok": True,
         "service": "options-simulator",
+        "storage_mode": STORAGE_MODE,
+        "data_layout": DATA_LAYOUT,
         "iv_enabled": ENABLE_IV_CALC,
         "redis_connected": redis_ok,
-        "kafka_configured": bool(KAFKA_BOOTSTRAP_SERVERS),
+        "iv_surface_backend": "redis_threadpool" if redis_ok else "unavailable",
         "option_window_cache_size": len(OPTION_WINDOW_CACHE),
         "spot_candle_cache_size": len(SPOT_CANDLE_CACHE),
+        "chain_snapshot_cache_size": len(CHAIN_SNAPSHOT_CACHE),
+        "metric_chart_cache_size": len(METRIC_CHART_CACHE),
+        "data_resolution_cache_size": len(DATA_RESOLUTION_CACHE),
     }
     return jsonify(payload), 200
 
+
+
 if __name__ == "__main__":
+    # Development runner only. In production use Gunicorn, for example:
+    # gunicorn --workers 2 --threads 4 --timeout 120 --bind 0.0.0.0:8000 simulator:app
     port = int(os.getenv("PORT", "8000"))
     host = os.getenv("HOST", "0.0.0.0")
-    debug = os.getenv("DEBUG_MODE", "false").lower() in {"1", "true", "yes"}
+    debug = os.getenv("DEBUG_MODE", "false").lower() in {"1", "true", "yes", "on"}
 
     app.run(
         host=host,
