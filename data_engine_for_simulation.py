@@ -1459,17 +1459,136 @@ def get_dates_for_week_folder(
 # OPTION HELPERS
 # =========================================================
 
-def get_upcoming_expiry_np(query_date, instrument="NIFTY", expiry_rule="current expiry"):
-    cfg = get_dataset_config(instrument)
-    expiries = pd.to_datetime(cfg["combined_expiry"])
-    q = pd.Timestamp(query_date).normalize()
+def get_upcoming_expiry_np(
+    query_date,
+    instrument="NIFTY",
+    expiry_rule="current expiry",
+):
+    """
+    Return the appropriate option expiry in YYMMDD format.
 
-    upcoming = expiries[expiries >= q]
+    Supported expiry rules:
+        current expiry
+        next expiry
+        next to next expiry
+        monthly expiry
+        next monthly expiry
+        next to next monthly expiry
+    """
+
+    cfg = get_dataset_config(instrument)
+
+    instrument = (
+        str(instrument or "NIFTY")
+        .strip()
+        .upper()
+        .replace(" ", "")
+        .replace("-", "")
+        .replace("_", "")
+    )
+
+    rule = (
+        str(expiry_rule or "current expiry")
+        .strip()
+        .lower()
+        .replace("-", " ")
+        .replace("_", " ")
+    )
+
+    rule = " ".join(rule.split())
+
+    query_ts = pd.Timestamp(query_date).normalize()
+
+    # -------------------------------------------------
+    # Select weekly/combined or monthly expiry calendar
+    # -------------------------------------------------
+
+    monthly_rules = {
+        "monthly",
+        "monthly expiry",
+        "current monthly",
+        "current monthly expiry",
+        "next monthly",
+        "next monthly expiry",
+        "next to next monthly",
+        "next to next monthly expiry",
+    }
+
+    if rule in monthly_rules:
+        expiry_values = cfg.get("monthly_expiry")
+
+        if expiry_values is None:
+            expiry_values = _derive_monthly_expiries(
+                cfg["combined_expiry"]
+            )
+    else:
+        expiry_values = cfg["combined_expiry"]
+
+    expiries = (
+        pd.DatetimeIndex(
+            pd.to_datetime(expiry_values)
+        )
+        .normalize()
+        .sort_values()
+        .unique()
+    )
+
+    upcoming = expiries[expiries >= query_ts]
 
     if len(upcoming) == 0:
         return None
 
-    return pd.Timestamp(upcoming[0]).strftime("%y%m%d")
+    # -------------------------------------------------
+    # Choose expiry position
+    # -------------------------------------------------
+
+    if rule in {
+        "current expiry",
+        "current",
+        "weekly",
+        "weekly expiry",
+        "monthly",
+        "monthly expiry",
+        "current monthly",
+        "current monthly expiry",
+    }:
+        position = 0
+
+    elif rule in {
+        "next expiry",
+        "next",
+        "next weekly",
+        "next weekly expiry",
+        "next monthly",
+        "next monthly expiry",
+    }:
+        position = 1
+
+    elif rule in {
+        "next to next expiry",
+        "next to next",
+        "next to next weekly",
+        "next to next weekly expiry",
+        "next to next monthly",
+        "next to next monthly expiry",
+    }:
+        position = 2
+
+    else:
+        logger.warning(
+            "Unsupported expiry rule '%s'; using current expiry.",
+            expiry_rule,
+        )
+        position = 0
+
+    if position >= len(upcoming):
+        return None
+
+    selected_expiry = pd.Timestamp(
+        upcoming[position]
+    )
+
+    return selected_expiry.strftime("%y%m%d")
 
 
 def get_nearest_strike(spot, instrument="NIFTY", expiry_rule="current expiry"):
