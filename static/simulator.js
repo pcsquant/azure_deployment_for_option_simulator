@@ -374,76 +374,209 @@ async function loadDefaults() {
   return data;
 }
 
-async function loadChain(forceReload = false) {
+function setRefreshLoading(isLoading) {
+  const refreshBtn = getEl("refreshBtn");
+
+  if (!refreshBtn) return;
+
+  if (!refreshBtn.dataset.originalText) {
+    refreshBtn.dataset.originalText =
+      refreshBtn.innerHTML || "Refresh";
+  }
+
+  refreshBtn.disabled = Boolean(isLoading);
+
+  if (isLoading) {
+    refreshBtn.classList.add("is-loading");
+    refreshBtn.innerHTML = `
+      <span class="button-spinner"></span>
+      Loading...
+    `;
+  } else {
+    refreshBtn.classList.remove("is-loading");
+    refreshBtn.innerHTML =
+      refreshBtn.dataset.originalText || "Refresh";
+  }
+}
+
+async function loadChain(
+  forceReload = false,
+  selectNearestExpiry = false
+) {
   try {
     ensureExpiryWarning();
     ensureMetricsCards();
     ensurePositionsHeaders();
 
-    const params = new URLSearchParams({
-              dataset: getDataset(),
-              date: getQueryDate(),
-              time: getQueryTime(),
-              interval: String(getInterval()),
-              strike_count: String(getStrikeCount()),
-              expiry_rule: "current expiry",
-              expiry: getEl("expirySelect")?.value || "",
-              _: String(Date.now())
-            });
+    const expirySelect = getEl("expirySelect");
 
-    const data = await fetchJson(`/api/chain?${params.toString()}`);
+    /*
+     * When selectNearestExpiry is true, do not send the
+     * previously selected expiry. This allows the backend
+     * to select the nearest valid expiry for the new date.
+     */
+    const requestedExpiry = selectNearestExpiry
+      ? ""
+      : expirySelect?.value || "";
+
+    const params = new URLSearchParams({
+      dataset: getDataset(),
+      date: getQueryDate(),
+      time: getQueryTime(),
+      interval: String(getInterval()),
+      strike_count: String(getStrikeCount()),
+      expiry_rule: "current expiry",
+      expiry: requestedExpiry,
+      _: String(Date.now())
+    });
+
+    const data = await fetchJson(
+      `/api/chain?${params.toString()}`
+    );
 
     if (!data.ok) {
-      throw new Error(data.error || "Option chain failed");
+      throw new Error(
+        data.error || "Option chain failed"
+      );
     }
 
-    chain = Array.isArray(data.rows) ? data.rows : [];
+    chain = Array.isArray(data.rows)
+      ? data.rows
+      : [];
 
     const warning = getEl("expiryWarning");
 
-    if (warning && data.query_date && data.expiry_label) {
+    if (
+      warning &&
+      data.query_date &&
+      data.expiry_label
+    ) {
+      const expiryType =
+        getDataset() === "BANKNIFTY"
+          ? "Monthly expiry"
+          : "Selected expiry";
+
       warning.textContent =
-        `⚠ Weekly expiry payoff is done for ${data.expiry_label}. ` +
-        `Payoff is valid only at expiry. Calendar and diagonal spreads are not supported.`;
+        `⚠ ${expiryType} payoff is calculated for ` +
+        `${data.expiry_label}. Payoff is valid only at ` +
+        `expiry. Calendar and diagonal spreads are not supported.`;
     }
 
     if (Number.isFinite(Number(data.spot))) {
       setSpot(data.spot);
     }
 
-    if (Number.isFinite(Number(data.india_vix))) {
+    if (
+      Number.isFinite(
+        Number(data.india_vix)
+      )
+    ) {
       const ivInput = getEl("iv");
-      if (ivInput) ivInput.value = Number(data.india_vix).toFixed(1);
+
+      if (ivInput) {
+        ivInput.value =
+          Number(data.india_vix).toFixed(1);
+      }
     }
 
     const dteInput = getEl("days");
-    if (dteInput && Number.isFinite(Number(data.dte))) {
+
+    if (
+      dteInput &&
+      Number.isFinite(Number(data.dte))
+    ) {
       dteInput.value = Number(data.dte);
-}
+    }
 
-    const expiryInput = getEl("expiryLabel");
-    if (expiryInput) expiryInput.value = data.expiry_label || "";
+    const expiryInput =
+      getEl("expiryLabel");
 
-    const expirySelect = getEl("expirySelect");
+    if (expiryInput) {
+      expiryInput.value =
+        data.expiry_label || "";
+    }
 
-    if (expirySelect && Array.isArray(data.available_expiries)) {
-      const currentValue = expirySelect.value || data.expiry;
+    /*
+     * Update expiry dropdown.
+     *
+     * Normal refresh:
+     *   preserve the user's selected expiry when it is
+     *   still available.
+     *
+     * Date change:
+     *   select the expiry returned by the backend,
+     *   which should be the nearest valid expiry.
+     */
+    if (
+      expirySelect &&
+      Array.isArray(data.available_expiries)
+    ) {
+      const previousExpiry =
+        expirySelect.value || "";
 
       expirySelect.innerHTML = "";
 
-      data.available_expiries.forEach(exp => {
-        const opt = document.createElement("option");
-        opt.value = exp.value;
-        opt.textContent = exp.label;
+      data.available_expiries.forEach(
+        expiry => {
+          const option =
+            document.createElement("option");
 
-        if (exp.value === currentValue || exp.value === data.expiry) {
-          opt.selected = true;
+          option.value =
+            String(expiry.value || "");
+
+          option.textContent =
+            expiry.label ||
+            expiry.value ||
+            "";
+
+          expirySelect.appendChild(option);
         }
+      );
 
-        expirySelect.appendChild(opt);
-      });
+      const availableValues =
+        Array.from(expirySelect.options)
+          .map(option => option.value);
+
+      if (
+        !selectNearestExpiry &&
+        previousExpiry &&
+        availableValues.includes(
+          previousExpiry
+        )
+      ) {
+        /*
+         * Manual refresh:
+         * keep the previously selected expiry.
+         */
+        expirySelect.value =
+          previousExpiry;
+      } else if (
+        data.expiry &&
+        availableValues.includes(
+          String(data.expiry)
+        )
+      ) {
+        /*
+         * Date changed:
+         * select the nearest expiry chosen by backend.
+         */
+        expirySelect.value =
+          String(data.expiry);
+      } else if (
+        expirySelect.options.length > 0
+      ) {
+        /*
+         * Fallback:
+         * first available expiry.
+         */
+        expirySelect.selectedIndex = 0;
+      }
     }
 
+    /*
+     * Keep the existing positions, but update the fixed
+     * quantity according to the currently selected dataset.
+     */
     legs = legs.map(leg => ({
       ...leg,
       qty: getFixedQty()
@@ -452,17 +585,29 @@ async function loadChain(forceReload = false) {
     renderChain();
     renderVolSmile();
     renderLegs();
+
     await calculate();
 
+    return data;
 
   } catch (err) {
-    console.error("loadChain error:", err);
+    console.error(
+      "loadChain error:",
+      err
+    );
+
     chain = [];
+
     renderChain();
-    alert(err.message || "Failed to load option chain");
+
+    alert(
+      err.message ||
+      "Failed to load option chain"
+    );
+
+    return null;
   }
 }
-
 
 
 let optionMetricChart = null;
@@ -4007,127 +4152,433 @@ window.addEventListener("DOMContentLoaded", () => {
   initialiseIndicatorSettingsModal();
   initialiseChartDrawingTools();
 
+  // =====================================================
+  // REFRESH BUTTON WITH LOADING SIGNAL
+  // =====================================================
 
   const refreshBtn = getEl("refreshBtn");
-  if (refreshBtn) refreshBtn.onclick = () => loadChain(true);
 
-  const prevBtn = getEl("prevIntervalBtn");
-  if (prevBtn) prevBtn.onclick = movePreviousInterval;
+  if (refreshBtn) {
+    refreshBtn.onclick = async () => {
+      if (refreshBtn.disabled) return;
 
-  const nextBtn = getEl("nextIntervalBtn");
-  if (nextBtn) nextBtn.onclick = moveNextInterval;
+      try {
+        setRefreshLoading(true);
 
-  const openGreeksBtn = getEl("openGreeksBtn");
-  if (openGreeksBtn) openGreeksBtn.addEventListener("click", openGreeksPopup);
+        /*
+         * Manual refresh:
+         * preserve the expiry currently selected by the user.
+         */
+        await loadChain(true, false);
 
-  const closeGreeksBtn = getEl("closeGreeksBtn");
-  if (closeGreeksBtn) closeGreeksBtn.addEventListener("click", closeGreeksPopup);
+      } catch (error) {
+        console.error(
+          "Refresh error:",
+          error
+        );
 
-  const chartOpenBtn = getEl("openChartPopup");
-  if (chartOpenBtn) chartOpenBtn.addEventListener("click", openChartPopup);
+        alert(
+          error.message ||
+          "Failed to refresh option chain"
+        );
 
-  const chartCloseBtn = getEl("closeChartPopup");
-  if (chartCloseBtn) chartCloseBtn.addEventListener("click", closeChartPopup);
-
-  const futureOpenBtn = getEl("openFutureChartPopup");
-  if (futureOpenBtn) futureOpenBtn.addEventListener("click", openFutureChartPopup);
-
-  const futureCloseBtn = getEl("closeFutureChartPopup");
-  if (futureCloseBtn) futureCloseBtn.addEventListener("click", closeFutureChartPopup);
-
-  const futureMonthSelect = getEl("futureMonthSelect");
-  if (futureMonthSelect) {
-    futureMonthSelect.addEventListener("change", openFutureChartPopup);
+      } finally {
+        setRefreshLoading(false);
+      }
+    };
   }
 
-  // Reload only when Apply button is clicked
+  // =====================================================
+  // DATE CHANGE
+  // AUTOMATICALLY SELECT NEAREST VALID EXPIRY
+  // =====================================================
 
-    const futureChartStartDate = getEl("futureChartStartDate");
-    const futureChartEndDate = getEl("futureChartEndDate");
-    const futureChartEndTime = getEl("futureChartEndTime");
-    const futureChartInterval = getEl("futureChartInterval");
+  const queryDateInput =
+    getEl("queryDate") ||
+    getEl("date") ||
+    getEl("query_date");
 
-  const vixOpenBtn = getEl("openVixChartPopup");
-  if (vixOpenBtn) vixOpenBtn.addEventListener("click", openIndiaVixChartPopup);
+  if (queryDateInput) {
+    queryDateInput.addEventListener(
+      "change",
+      async () => {
+        try {
+          setRefreshLoading(true);
 
-  const vixCloseBtn = getEl("closeVixChartPopup");
-  if (vixCloseBtn) vixCloseBtn.addEventListener("click", closeIndiaVixChartPopup);
+          /*
+           * Clear all existing strategy positions because
+           * premiums and Greeks belong to the old date.
+           */
+          legs = [];
+          renderLegs();
+          calculateLivePositionGreeks();
 
-  document.querySelectorAll(".chart-apply-btn").forEach(btn => {
-    if (btn.dataset.clickAttached) return;
+          /*
+           * The second argument is true.
+           *
+           * It prevents the previous expiry from being sent
+           * to the backend. The backend therefore selects the
+           * nearest valid expiry for the newly selected date.
+           */
+          await loadChain(true, true);
 
-    btn.addEventListener("click", () => {
-  if (btn.dataset.chart === "future") openFutureChartPopup();
-  if (btn.dataset.chart === "index") openChartPopup();
-  if (btn.dataset.chart === "vix") openIndiaVixChartPopup();
+        } catch (error) {
+          console.error(
+            "Date-change error:",
+            error
+          );
 
-  if (btn.dataset.chart === "option") {
-    openOptionMetricChart(
-      { preventDefault: () => {} },
-      Number(btn.dataset.strike),
-      btn.dataset.metric
+          alert(
+            error.message ||
+            "Failed to load data for the selected date"
+          );
+
+        } finally {
+          setRefreshLoading(false);
+        }
+      }
     );
   }
-});
 
-    btn.dataset.clickAttached = "true";
-  });
+  // =====================================================
+  // PREVIOUS AND NEXT INTERVAL BUTTONS
+  // =====================================================
 
-  const datasetSelect = getEl("dataset") || getEl("underlying") || getEl("symbol");
+  const prevBtn = getEl("prevIntervalBtn");
+
+  if (prevBtn) {
+    prevBtn.onclick = movePreviousInterval;
+  }
+
+  const nextBtn = getEl("nextIntervalBtn");
+
+  if (nextBtn) {
+    nextBtn.onclick = moveNextInterval;
+  }
+
+  // =====================================================
+  // GREEKS MODAL
+  // =====================================================
+
+  const openGreeksBtn = getEl("openGreeksBtn");
+
+  if (openGreeksBtn) {
+    openGreeksBtn.addEventListener(
+      "click",
+      openGreeksPopup
+    );
+  }
+
+  const closeGreeksBtn = getEl("closeGreeksBtn");
+
+  if (closeGreeksBtn) {
+    closeGreeksBtn.addEventListener(
+      "click",
+      closeGreeksPopup
+    );
+  }
+
+  // =====================================================
+  // INDEX CHART
+  // =====================================================
+
+  const chartOpenBtn = getEl("openChartPopup");
+
+  if (chartOpenBtn) {
+    chartOpenBtn.addEventListener(
+      "click",
+      openChartPopup
+    );
+  }
+
+  const chartCloseBtn = getEl("closeChartPopup");
+
+  if (chartCloseBtn) {
+    chartCloseBtn.addEventListener(
+      "click",
+      closeChartPopup
+    );
+  }
+
+  // =====================================================
+  // FUTURE CHART
+  // =====================================================
+
+  const futureOpenBtn =
+    getEl("openFutureChartPopup");
+
+  if (futureOpenBtn) {
+    futureOpenBtn.addEventListener(
+      "click",
+      openFutureChartPopup
+    );
+  }
+
+  const futureCloseBtn =
+    getEl("closeFutureChartPopup");
+
+  if (futureCloseBtn) {
+    futureCloseBtn.addEventListener(
+      "click",
+      closeFutureChartPopup
+    );
+  }
+
+  const futureMonthSelect =
+    getEl("futureMonthSelect");
+
+  if (futureMonthSelect) {
+    futureMonthSelect.addEventListener(
+      "change",
+      openFutureChartPopup
+    );
+  }
+
+  /*
+   * These variables may be used elsewhere in your existing
+   * chart code. Keep them if they are referenced later.
+   */
+  const futureChartStartDate =
+    getEl("futureChartStartDate");
+
+  const futureChartEndDate =
+    getEl("futureChartEndDate");
+
+  const futureChartEndTime =
+    getEl("futureChartEndTime");
+
+  const futureChartInterval =
+    getEl("futureChartInterval");
+
+  // =====================================================
+  // INDIA VIX CHART
+  // =====================================================
+
+  const vixOpenBtn =
+    getEl("openVixChartPopup");
+
+  if (vixOpenBtn) {
+    vixOpenBtn.addEventListener(
+      "click",
+      openIndiaVixChartPopup
+    );
+  }
+
+  const vixCloseBtn =
+    getEl("closeVixChartPopup");
+
+  if (vixCloseBtn) {
+    vixCloseBtn.addEventListener(
+      "click",
+      closeIndiaVixChartPopup
+    );
+  }
+
+  // =====================================================
+  // CHART APPLY BUTTONS
+  // =====================================================
+
+  document
+    .querySelectorAll(".chart-apply-btn")
+    .forEach(btn => {
+      if (
+        btn.dataset.clickAttached === "true"
+      ) {
+        return;
+      }
+
+      btn.addEventListener(
+        "click",
+        () => {
+          if (
+            btn.dataset.chart === "future"
+          ) {
+            openFutureChartPopup();
+          }
+
+          if (
+            btn.dataset.chart === "index"
+          ) {
+            openChartPopup();
+          }
+
+          if (
+            btn.dataset.chart === "vix"
+          ) {
+            openIndiaVixChartPopup();
+          }
+
+          if (
+            btn.dataset.chart === "option"
+          ) {
+            openOptionMetricChart(
+              {
+                preventDefault: () => {}
+              },
+              Number(btn.dataset.strike),
+              btn.dataset.metric
+            );
+          }
+        }
+      );
+
+      btn.dataset.clickAttached = "true";
+    });
+
+  // =====================================================
+  // DATASET CHANGE
+  // NIFTY / BANKNIFTY / SENSEX
+  // =====================================================
+
+  const datasetSelect =
+    getEl("dataset") ||
+    getEl("underlying") ||
+    getEl("symbol");
 
   if (datasetSelect) {
-    datasetSelect.addEventListener("change", () => {
-      legs = [];
-      renderLegs();
-      calculateLivePositionGreeks();
-      loadChain(true);
-    });
+    datasetSelect.addEventListener(
+      "change",
+      async () => {
+        try {
+          setRefreshLoading(true);
+
+          legs = [];
+          renderLegs();
+          calculateLivePositionGreeks();
+
+          /*
+           * Dataset changed, so the previous expiry must not
+           * be preserved.
+           *
+           * BANKNIFTY will therefore receive its nearest
+           * monthly expiry from the backend.
+           */
+          await loadChain(true, true);
+
+        } catch (error) {
+          console.error(
+            "Dataset-change error:",
+            error
+          );
+
+          alert(
+            error.message ||
+            "Failed to change dataset"
+          );
+
+        } finally {
+          setRefreshLoading(false);
+        }
+      }
+    );
   }
 
-  const expirySelect = getEl("expirySelect");
+  // =====================================================
+  // EXPIRY CHANGE
+  // =====================================================
+
+  const expirySelect =
+    getEl("expirySelect");
 
   if (expirySelect) {
-    expirySelect.addEventListener("change", () => {
-      legs = [];
-      renderLegs();
-      calculateLivePositionGreeks();
-      loadChain(true);
-    });
+    expirySelect.addEventListener(
+      "change",
+      async () => {
+        try {
+          setRefreshLoading(true);
+
+          legs = [];
+          renderLegs();
+          calculateLivePositionGreeks();
+
+          /*
+           * The user manually selected an expiry.
+           * Preserve and send that selected value.
+           */
+          await loadChain(true, false);
+
+        } catch (error) {
+          console.error(
+            "Expiry-change error:",
+            error
+          );
+
+          alert(
+            error.message ||
+            "Failed to load selected expiry"
+          );
+
+        } finally {
+          setRefreshLoading(false);
+        }
+      }
+    );
   }
 
-  window.addEventListener("resize", () => {
-    const indexContainer = getEl("fullscreenIndexChart");
-    if (fullscreenChart && indexContainer) {
-      fullscreenChart.applyOptions({
-        width: indexContainer.clientWidth,
-        height: indexContainer.clientHeight
-      });
-    }
+  // =====================================================
+  // RESPONSIVE CHART RESIZING
+  // =====================================================
 
-    const futureContainer = getEl("fullscreenFutureChart");
-    if (futureChart && futureContainer) {
-      futureChart.applyOptions({
-        width: futureContainer.clientWidth,
-        height: futureContainer.clientHeight
-      });
-    }
+  window.addEventListener(
+    "resize",
+    () => {
+      const indexContainer =
+        getEl("fullscreenIndexChart");
 
-    const vixContainer = getEl("fullscreenVixChart");
-    if (vixChart && vixContainer) {
-      vixChart.applyOptions({
-        width: vixContainer.clientWidth,
-        height: vixContainer.clientHeight
-      });
+      if (
+        fullscreenChart &&
+        indexContainer
+      ) {
+        fullscreenChart.applyOptions({
+          width: indexContainer.clientWidth,
+          height: indexContainer.clientHeight
+        });
+      }
+
+      const futureContainer =
+        getEl("fullscreenFutureChart");
+
+      if (
+        futureChart &&
+        futureContainer
+      ) {
+        futureChart.applyOptions({
+          width: futureContainer.clientWidth,
+          height: futureContainer.clientHeight
+        });
+      }
+
+      const vixContainer =
+        getEl("fullscreenVixChart");
+
+      if (
+        vixChart &&
+        vixContainer
+      ) {
+        vixChart.applyOptions({
+          width: vixContainer.clientWidth,
+          height: vixContainer.clientHeight
+        });
+      }
     }
-  });
+  );
+
+  // =====================================================
+  // EXISTING TAB CODE CONTINUES BELOW
+  // =====================================================
 
   const payoffTab = getEl("payoffTab");
-const volSmileTab = getEl("volSmileTab");
-const ivSurfaceTab = getEl("ivSurfaceTab");
+  const volSmileTab = getEl("volSmileTab");
+  const ivSurfaceTab = getEl("ivSurfaceTab");
 
-const payoffPanel = getEl("payoffPanel");
-const volSmilePanel = getEl("volSmilePanel");
-const ivSurfacePanel = getEl("ivSurfacePanel");
+  const payoffPanel = getEl("payoffPanel");
+  const volSmilePanel = getEl("volSmilePanel");
+  const ivSurfacePanel = getEl("ivSurfacePanel");
+
+  /*
+   * Keep the remainder of your existing DOMContentLoaded
+   * code below this point.
+   */
 
 function setMainPanel(activeTab, activePanel) {
   [payoffTab, volSmileTab, ivSurfaceTab].forEach(tab => {
