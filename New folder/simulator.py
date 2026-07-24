@@ -53,14 +53,16 @@ from black_scholes_iv_for_simulation import append_black_scholes_iv
 from chart import build_chart_payload
 from config_for_simulation import CANDLE_INTERVAL_MINUTES, IST, get_dataset_config
 from data_engine_for_simulation import (
+    clear_runtime_caches,
     create_candles,
     get_dates_for_week_folder,
     get_nearest_strike,
     get_upcoming_expiry_np,
     get_week_folders,
     load_consolidated_option_chain,
+    load_index_data_by_symbol,
     load_required_option_data_for_date,
-    load_tick_data,
+    runtime_cache_stats,
 )
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -696,23 +698,27 @@ def _get_spot_candles_for_day(
     candle_interval_minutes: int,
 ) -> pd.DataFrame:
     """
-    Load and cache spot/index candles for a trading day.
+    Load and cache spot/index candles for one trading day.
 
-    The resolved week folder must be passed directly to load_tick_data().
-    load_tick_data() internally resolves the IDX_TICK directory and the
-    instrument Parquet file for both local and Azure Blob storage.
+    Production storage layout:
+        <week-folder>/IDX_TICK/<YYYYMMDD>/<SYMBOL>.parquet
+
+    The date-aware ``load_index_data_by_symbol`` loader is required here.
+    Calling ``load_tick_data(folder)`` without the selected date can resolve
+    the wrong Blob prefix and return an empty DataFrame.
     """
-
     folder = str(folder).strip()
-    date_str = str(date_str).strip()
+    date_str = str(date_str).replace("-", "").strip()
     dataset = str(dataset).strip().upper()
     candle_interval_minutes = int(candle_interval_minutes)
 
     if not folder:
         raise ValueError("folder cannot be empty")
 
-    if not date_str:
-        raise ValueError("date_str cannot be empty")
+    if len(date_str) != 8 or not date_str.isdigit():
+        raise ValueError(
+            "date_str must be in YYYYMMDD format."
+        )
 
     if not dataset:
         raise ValueError("dataset cannot be empty")
@@ -730,28 +736,23 @@ def _get_spot_candles_for_day(
         folder,
     )
 
-    cached = _get_cache(SPOT_CANDLE_CACHE, cache_key)
+    cached = _get_cache(
+        SPOT_CANDLE_CACHE,
+        cache_key,
+    )
 
     if cached is not None:
         return cached.copy()
 
     try:
-        # Important:
-        # Pass the week folder directly.
-        #
-        # For Azure Blob Storage, load_tick_data() internally resolves:
-        #
-        #   <week_folder>/IDX_TICK/NIFTY.parquet
-        #
-        # Do not append NSE_IDX_TICK_YYYYMMDD here.
-        tick_df = load_tick_data(
-            folder,
-            instrument=dataset,
+        tick_df = load_index_data_by_symbol(
+            folder=folder,
+            date_str=date_str,
+            symbol_name=dataset,
         )
-
     except Exception:
         logger.exception(
-            "Failed to load spot tick data: "
+            "Failed to load spot index data: "
             "dataset=%s date=%s folder=%s",
             dataset,
             date_str,
@@ -774,7 +775,6 @@ def _get_spot_candles_for_day(
             tick_df,
             candle_interval_minutes,
         )
-
     except Exception:
         logger.exception(
             "Failed to create spot candles: "
@@ -788,10 +788,11 @@ def _get_spot_candles_for_day(
     if candles is None or candles.empty:
         logger.warning(
             "Spot candle creation returned no rows: "
-            "dataset=%s date=%s interval=%s",
+            "dataset=%s date=%s interval=%s tick_rows=%d",
             dataset,
             date_str,
             candle_interval_minutes,
+            len(tick_df),
         )
         return pd.DataFrame()
 
@@ -802,6 +803,16 @@ def _get_spot_candles_for_day(
         cache_key,
         candles,
         MAX_SPOT_CANDLE_CACHE_SIZE,
+    )
+
+    logger.info(
+        "Spot candles ready: dataset=%s date=%s interval=%s "
+        "tick_rows=%d candle_rows=%d",
+        dataset,
+        date_str,
+        candle_interval_minutes,
+        len(tick_df),
+        len(candles),
     )
 
     return candles.copy()
@@ -912,8 +923,6 @@ def build_option_chain_snapshot(
     india_vix_value = None
 
     try:
-        from data_engine_for_simulation import load_index_data_by_symbol
-
         vix_df = load_index_data_by_symbol(
             folder=folder,
             date_str=date_str,
@@ -2030,8 +2039,6 @@ def api_india_vix_chart():
                 dataset=dataset,
             )
 
-        from data_engine_for_simulation import load_index_data_by_symbol
-
         vix_df = load_index_data_by_symbol(
             folder=folder,
             date_str=date_str,
@@ -2339,13 +2346,16 @@ def api_cache_status():
     return jsonify(
         {
             "ok": True,
-            "option_window_cache_size": len(OPTION_WINDOW_CACHE),
-            "option_window_cache_limit": MAX_OPTION_WINDOW_CACHE_SIZE,
-            "spot_candle_cache_size": len(SPOT_CANDLE_CACHE),
-            "spot_candle_cache_limit": MAX_SPOT_CANDLE_CACHE_SIZE,
-            "window_candles_before": WINDOW_CANDLES_BEFORE,
-            "window_candles_after": WINDOW_CANDLES_AFTER,
-            "iv_enabled": ENABLE_IV_CALC,
+            "application": {
+                "option_window_cache_size": len(OPTION_WINDOW_CACHE),
+                "option_window_cache_limit": MAX_OPTION_WINDOW_CACHE_SIZE,
+                "spot_candle_cache_size": len(SPOT_CANDLE_CACHE),
+                "spot_candle_cache_limit": MAX_SPOT_CANDLE_CACHE_SIZE,
+                "window_candles_before": WINDOW_CANDLES_BEFORE,
+                "window_candles_after": WINDOW_CANDLES_AFTER,
+                "iv_enabled": ENABLE_IV_CALC,
+            },
+            "data_engine": runtime_cache_stats(),
         }
     )
 
@@ -2357,9 +2367,18 @@ def api_cache_clear():
         return _json_error("Unauthorized.", 401)
     with OPTION_WINDOW_CACHE_LOCK:
         OPTION_WINDOW_CACHE.clear()
+
     with SPOT_CANDLE_CACHE_LOCK:
         SPOT_CANDLE_CACHE.clear()
-    return jsonify({"ok": True, "message": "RAM caches cleared."})
+
+    clear_runtime_caches()
+
+    return jsonify(
+        {
+            "ok": True,
+            "message": "Application and data-engine RAM caches cleared.",
+        }
+    )
 
 
 @app.route("/api/health")
@@ -2381,16 +2400,10 @@ def api_health():
     }
     return jsonify(payload), 200
 
-def _get_fut_folder(week_folder, date_str):
-    folder = os.path.join(week_folder, f"NSE_FUT_TICK_{date_str}")
-    return folder if os.path.isdir(folder) else week_folder
-
-
-
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     host = os.getenv("HOST", "0.0.0.0")
-    debug = os.getenv("DEBUG_MODE", "true").lower() in {"1", "true", "yes"}
+    debug = os.getenv("DEBUG_MODE", "false").lower() in {"1", "true", "yes"}
 
     app.run(
         host=host,
