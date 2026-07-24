@@ -496,7 +496,6 @@ function renderExpiry() {
    ========================================================= */
 
 function getStrikeLevel(row) {
-    const levels = snapshot?.levels || {};
     const strike = nullableNumber(row?.strike);
 
     if (strike === null) {
@@ -507,7 +506,62 @@ function getStrikeLevel(row) {
         };
     }
 
-    if (numbersEqual(strike, levels.r2)) {
+    const levels = snapshot?.levels || {};
+
+    const atmStrike =
+        nullableNumber(snapshot?.atm) ??
+        nullableNumber(
+            chain.find((item) => item.atm)?.strike
+        );
+
+    const strikeStep =
+        nullableNumber(snapshot?.strike_step) ??
+        (
+            chain.length >= 2
+                ? Math.abs(
+                    num(chain[1].strike) -
+                    num(chain[0].strike)
+                )
+                : 50
+        );
+
+    /*
+     * Use backend levels when available.
+     * Otherwise calculate them from ATM.
+     */
+    const r1 =
+        nullableNumber(levels.r1) ??
+        (
+            atmStrike !== null
+                ? atmStrike - 3 * strikeStep
+                : null
+        );
+
+    const r2 =
+        nullableNumber(levels.r2) ??
+        (
+            atmStrike !== null
+                ? atmStrike - 4 * strikeStep
+                : null
+        );
+
+    const s1 =
+        nullableNumber(levels.s1) ??
+        (
+            atmStrike !== null
+                ? atmStrike + 3 * strikeStep
+                : null
+        );
+
+    const s2 =
+        nullableNumber(levels.s2) ??
+        (
+            atmStrike !== null
+                ? atmStrike + 4 * strikeStep
+                : null
+        );
+
+    if (numbersEqual(strike, r2)) {
         return {
             label: "R2",
             cellClass: "resistance-level",
@@ -515,7 +569,7 @@ function getStrikeLevel(row) {
         };
     }
 
-    if (numbersEqual(strike, levels.r1)) {
+    if (numbersEqual(strike, r1)) {
         return {
             label: "R1",
             cellClass: "resistance-level",
@@ -525,7 +579,7 @@ function getStrikeLevel(row) {
 
     if (
         row?.atm === true ||
-        numbersEqual(strike, snapshot?.atm)
+        numbersEqual(strike, atmStrike)
     ) {
         return {
             label: "ATM",
@@ -534,7 +588,7 @@ function getStrikeLevel(row) {
         };
     }
 
-    if (numbersEqual(strike, levels.s1)) {
+    if (numbersEqual(strike, s1)) {
         return {
             label: "S1",
             cellClass: "support-level",
@@ -542,7 +596,7 @@ function getStrikeLevel(row) {
         };
     }
 
-    if (numbersEqual(strike, levels.s2)) {
+    if (numbersEqual(strike, s2)) {
         return {
             label: "S2",
             cellClass: "support-level",
