@@ -112,11 +112,49 @@ def _join_storage_path(*parts):
 
 
 def _get_idx_folder(week_folder, date_str=None):
-    if STORAGE_MODE == "blob":
-        return _join_storage_path(week_folder, "IDX_TICK")
+    """
+    Return the index-data folder or Azure Blob prefix.
 
-    folder = os.path.join(week_folder, "IDX_TICK")
-    return folder if os.path.isdir(folder) else week_folder
+    Azure expected structure:
+        week_folder/IDX_TICK/YYYYMMDD/NIFTY.parquet
+    """
+
+    if STORAGE_MODE == "blob":
+        if date_str:
+            return _join_storage_path(
+                week_folder,
+                "IDX_TICK",
+                str(date_str),
+            )
+
+        return _join_storage_path(
+            week_folder,
+            "IDX_TICK",
+        )
+
+    candidates = []
+
+    if date_str:
+        candidates.append(
+            os.path.join(
+                week_folder,
+                "IDX_TICK",
+                str(date_str),
+            )
+        )
+
+    candidates.extend(
+        [
+            os.path.join(week_folder, "IDX_TICK"),
+            week_folder,
+        ]
+    )
+
+    for candidate in candidates:
+        if os.path.isdir(candidate):
+            return candidate
+
+    return week_folder
 
 
 def _get_opt_folder(week_folder, date_str=None):
