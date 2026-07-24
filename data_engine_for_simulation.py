@@ -1512,172 +1512,155 @@ def load_future_data_for_date(
     month="current",
     instrument="NIFTY",
 ):
-    """Load the selected futures contract from local or Azure Blob storage."""
-    cfg = get_dataset_config(instrument)
+    """
+    Load futures ticks from:
 
-    if not is_path_allowed(folder, instrument):
-        raise PermissionError(f"Access denied: {folder}")
+        <week-folder>/<YYYYMMDD>/FUT_TICK/<INSTRUMENT>.parquet
+    """
 
-    symbol = str(cfg["symbol"]).upper()
-    month = str(month or "current").strip().lower()
-    month = month.replace("-", "_").replace(" ", "_")
+    instrument = str(instrument).upper().strip()
+    date_str = str(date_str).replace("-", "").strip()
 
-    if STORAGE_MODE == "blob":
-        candidate_folders = [
-            _get_fut_folder(folder, date_str),
-            _join_storage_path(folder, "FUT_TICK"),
-            _join_storage_path(
-                folder,
-                f"NSE_FUT_TICK_{date_str}",
-                "Contract Futures",
-            ),
-            _join_storage_path(
-                folder,
-                f"NSE_FUT_TICK_{date_str}",
-            ),
-            str(folder).replace("\\", "/").strip("/"),
-        ]
-    else:
-        candidate_folders = [
-            _get_fut_folder(folder, date_str),
-            os.path.join(folder, "FUT_TICK"),
-            os.path.join(
-                folder,
-                f"NSE_FUT_TICK_{date_str}",
-                "Contract Futures",
-            ),
-            os.path.join(
-                folder,
-                f"NSE_FUT_TICK_{date_str}",
-            ),
-            folder,
-        ]
-
-    pattern = re.compile(
-        rf"^{re.escape(symbol)}\d{{2}}"
-        r"(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)"
-        r"FUT$",
-        re.IGNORECASE,
+    normalized_folder = (
+        str(folder)
+        .replace("\\", "/")
+        .strip("/")
     )
 
-    future_files = []
-    seen_paths = set()
-
-    for search_folder in candidate_folders:
-        if STORAGE_MODE == "blob":
-            paths = list_blob_names(search_folder)
-        else:
-            if not os.path.isdir(search_folder):
-                continue
-
-            paths = (
-                os.path.join(root, filename)
-                for root, _, files in os.walk(search_folder)
-                for filename in files
-            )
-
-        for file_path in paths:
-            file_path = str(file_path)
-
-            if file_path in seen_paths:
-                continue
-            seen_paths.add(file_path)
-
-            filename = (
-                file_path
-                .replace("\\", "/")
-                .rsplit("/", 1)[-1]
-            )
-
-            if not filename.lower().endswith(".parquet"):
-                continue
-
-            base_name = os.path.splitext(filename)[0].upper()
-
-            if pattern.match(base_name):
-                future_files.append((base_name, file_path))
-
-    if not future_files:
-        print(
-            f"No future files found for {symbol} in {folder}",
-            flush=True,
-        )
-        return pd.DataFrame(
-            columns=["datetime", "price", "volume"]
-        )
-
-    month_order = {
-        "JAN": 1,
-        "FEB": 2,
-        "MAR": 3,
-        "APR": 4,
-        "MAY": 5,
-        "JUN": 6,
-        "JUL": 7,
-        "AUG": 8,
-        "SEP": 9,
-        "OCT": 10,
-        "NOV": 11,
-        "DEC": 12,
-    }
-
-    def get_month_rank(file_name):
-        file_name = str(file_name).upper()
-
-        for mon, rank in month_order.items():
-            if f"{mon}FUT" in file_name:
-                return rank
-
-        return 999
-
-    future_files.sort(key=lambda item: get_month_rank(item[0]))
-
-    if month in {
-        "current",
-        "this_month",
-        "current_month",
-        "near",
-        "nearby",
-    }:
-        selected_index = 0
-    elif month in {"next", "next_month"}:
-        selected_index = 1
-    elif month in {
-        "far",
-        "far_month",
-        "next_to_next",
-        "next_to_next_month",
-    }:
-        selected_index = 2
-    else:
-        selected_index = 0
-
-    selected_index = min(
-        selected_index,
-        len(future_files) - 1,
+    future_path = (
+        f"{normalized_folder}/"
+        f"{date_str}/"
+        f"FUT_TICK/"
+        f"{instrument}.parquet"
     )
-    selected = future_files[selected_index][1]
 
-    print("Using future file:", selected, flush=True)
+    logger.info(
+        "Loading future data path=%s month=%s",
+        future_path,
+        month,
+    )
 
     try:
-        return _read_parquet_normalized(
-            selected,
-            mode="option",
-        )
+        if STORAGE_MODE == "blob":
+            frame = read_parquet_blob(future_path)
+        else:
+            frame = pd.read_parquet(future_path)
+
     except Exception as exc:
-        print(
-            f"Unable to read future file {selected}: {exc}",
-            flush=True,
+        logger.exception(
+            "Unable to load future data path=%s error=%s",
+            future_path,
+            exc,
         )
-        return pd.DataFrame(
-            columns=["datetime", "price", "volume"]
+        return pd.DataFrame()
+
+    if frame is None or frame.empty:
+        logger.warning(
+            "Future data is empty path=%s",
+            future_path,
+        )
+        return pd.DataFrame()
+
+    frame = frame.copy()
+
+    logger.info(
+        "Future source loaded rows=%d columns=%s",
+        len(frame),
+        frame.columns.tolist(),
+    )
+
+    # Build datetime
+    if "datetime" not in frame.columns:
+        if "date" not in frame.columns or "time" not in frame.columns:
+            logger.error(
+                "Future file requires datetime or date/time columns. "
+                "Available=%s",
+                frame.columns.tolist(),
+            )
+            return pd.DataFrame()
+
+        date_part = (
+            frame["date"]
+            .astype(str)
+            .str.replace(r"\.0$", "", regex=True)
+            .str.replace(r"\D", "", regex=True)
+            .str.zfill(8)
         )
 
+        time_part = (
+            frame["time"]
+            .astype(str)
+            .str.strip()
+        )
 
-# =========================================================
-# PUBLIC OPTION SNAPSHOT AND CACHE DIAGNOSTICS
-# =========================================================
+        frame["datetime"] = pd.to_datetime(
+            date_part + " " + time_part,
+            errors="coerce",
+        )
+    else:
+        frame["datetime"] = pd.to_datetime(
+            frame["datetime"],
+            errors="coerce",
+        )
+
+    # Normalize price
+    if "value" not in frame.columns:
+        if "price" in frame.columns:
+            frame["value"] = pd.to_numeric(
+                frame["price"],
+                errors="coerce",
+            )
+        else:
+            logger.error(
+                "Future file has no price/value column. Available=%s",
+                frame.columns.tolist(),
+            )
+            return pd.DataFrame()
+    else:
+        frame["value"] = pd.to_numeric(
+            frame["value"],
+            errors="coerce",
+        )
+
+    frame = frame.dropna(
+        subset=["datetime", "value"]
+    )
+
+    # Optional contract/month filtering
+    month_value = str(month or "current").lower().strip()
+
+    if "contract_name" in frame.columns:
+        frame["contract_name"] = (
+            frame["contract_name"]
+            .astype(str)
+            .str.upper()
+            .str.strip()
+        )
+
+        # Do not filter unless your file actually has multiple expiries.
+        # For now, keep all rows so the chart can display.
+        logger.info(
+            "Future contracts sample=%s",
+            frame["contract_name"]
+            .drop_duplicates()
+            .head(10)
+            .tolist(),
+        )
+
+    frame = (
+        frame
+        .sort_values("datetime")
+        .reset_index(drop=True)
+    )
+
+    logger.info(
+        "Future data ready rows=%d min_time=%s max_time=%s",
+        len(frame),
+        frame["datetime"].min(),
+        frame["datetime"].max(),
+    )
+
+    return frame
 
 def get_option_chain_snapshot(
     folder,
