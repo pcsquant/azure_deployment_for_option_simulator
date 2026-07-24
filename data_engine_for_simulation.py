@@ -1499,10 +1499,6 @@ def get_upcoming_expiry_np(
 
     query_ts = pd.Timestamp(query_date).normalize()
 
-    # -------------------------------------------------
-    # Select weekly/combined or monthly expiry calendar
-    # -------------------------------------------------
-
     monthly_rules = {
         "monthly",
         "monthly expiry",
@@ -1514,13 +1510,23 @@ def get_upcoming_expiry_np(
         "next to next monthly expiry",
     }
 
-    if rule in monthly_rules:
+    # BANKNIFTY always uses monthly expiries.
+    if instrument == "BANKNIFTY":
         expiry_values = cfg.get("monthly_expiry")
 
         if expiry_values is None:
             expiry_values = _derive_monthly_expiries(
                 cfg["combined_expiry"]
             )
+
+    elif rule in monthly_rules:
+        expiry_values = cfg.get("monthly_expiry")
+
+        if expiry_values is None:
+            expiry_values = _derive_monthly_expiries(
+                cfg["combined_expiry"]
+            )
+
     else:
         expiry_values = cfg["combined_expiry"]
 
@@ -1537,10 +1543,6 @@ def get_upcoming_expiry_np(
 
     if len(upcoming) == 0:
         return None
-
-    # -------------------------------------------------
-    # Choose expiry position
-    # -------------------------------------------------
 
     if rule in {
         "current expiry",
