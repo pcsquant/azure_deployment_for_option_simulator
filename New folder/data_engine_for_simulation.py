@@ -7,7 +7,8 @@ Azure/local layout:
     <week-folder>/FUT_TICK/<YYYYMMDD>/<SYMBOL>.parquet
 
 All caches are process-local RAM caches. This module does not create a
-shared disk-cache directory.
+shared disk-cache directory. Index loading supports both the production
+type-first layout and legacy date-first uploads.
 """
 
 import logging
@@ -586,27 +587,146 @@ def load_tick_data(folder_or_path, instrument="NIFTY"):
     return pd.DataFrame(columns=["datetime", "value"])
 
 
+def _index_prefix_candidates(
+    folder,
+    date_str,
+):
+    """
+    Return possible index prefixes in priority order.
+
+    Preferred production layout:
+        <week>/IDX_TICK/<YYYYMMDD>/
+
+    Supported legacy layouts:
+        <week>/<YYYYMMDD>/IDX_TICK/
+        <week>/IDX_TICK/
+        <week>/
+    """
+    normalized_folder = (
+        str(folder)
+        .replace("\\", "/")
+        .strip("/")
+    )
+
+    normalized_date = (
+        str(date_str)
+        .replace("-", "")
+        .replace("/", "")
+        .strip()
+    )
+
+    candidates = [
+        _join_storage_path(
+            normalized_folder,
+            "IDX_TICK",
+            normalized_date,
+        ),
+        _join_storage_path(
+            normalized_folder,
+            normalized_date,
+            "IDX_TICK",
+        ),
+        _join_storage_path(
+            normalized_folder,
+            "IDX_TICK",
+        ),
+        normalized_folder,
+    ]
+
+    result = []
+
+    for candidate in candidates:
+        if candidate and candidate not in result:
+            result.append(candidate)
+
+    return result
+
+
+def _match_index_blob_name(
+    blob_name,
+    symbol_name,
+    date_str,
+):
+    """
+    Return True when a blob name looks like the requested index file.
+    """
+    normalized_blob = (
+        str(blob_name)
+        .replace("\\", "/")
+        .strip("/")
+    )
+
+    filename = normalized_blob.rsplit("/", 1)[-1]
+    stem = os.path.splitext(filename)[0].upper()
+
+    symbol = str(symbol_name).upper().strip()
+    normalized_date = str(date_str).replace("-", "").strip()
+
+    accepted_stems = {
+        symbol,
+        f"{symbol}_{normalized_date}",
+        f"{symbol}{normalized_date}",
+        normalized_date,
+    }
+
+    if stem not in accepted_stems:
+        return False
+
+    # Prefer files whose full path contains the requested trading date.
+    # Files without a date token are still accepted for legacy weekly files.
+    path_tokens = normalized_blob.split("/")
+
+    return (
+        normalized_date in path_tokens
+        or normalized_date in stem
+        or stem == symbol
+    )
+
+
 def load_index_data_by_symbol(
     folder,
     date_str,
     symbol_name="INDIAVIX",
 ):
     """
-    Load index ticks from:
+    Load index ticks for a selected trading day.
 
-        <week-folder>/IDX_TICK/<YYYYMMDD>/<SYMBOL>.parquet
+    Preferred Azure/local layout:
+        <week>/IDX_TICK/<YYYYMMDD>/<SYMBOL>.parquet
+
+    The loader also supports legacy layouts and performs a final recursive
+    lookup under the week folder so a small upload-layout difference does not
+    make the API fail immediately.
     """
-    normalized_date = str(date_str).replace("-", "").strip()
-    symbol_name = str(symbol_name).upper().strip()
+    normalized_date = (
+        str(date_str)
+        .replace("-", "")
+        .replace("/", "")
+        .strip()
+    )
+
+    symbol_name = (
+        str(symbol_name)
+        .upper()
+        .strip()
+    )
+
+    empty = pd.DataFrame(
+        columns=["datetime", "value"]
+    )
 
     if not re.fullmatch(r"\d{8}", normalized_date):
-        logger.warning("Invalid index date: %r", date_str)
-        return pd.DataFrame(columns=["datetime", "value"])
+        logger.warning(
+            "Invalid index date: %r",
+            date_str,
+        )
+        return empty
 
-    idx_folder = _get_idx_folder(
-        folder,
-        normalized_date,
-    )
+    if not symbol_name:
+        logger.warning(
+            "Index symbol cannot be empty."
+        )
+        return empty
 
     candidate_names = [
         f"{symbol_name}.parquet",
@@ -616,32 +736,143 @@ def load_index_data_by_symbol(
         f"{normalized_date}.parquet",
     ]
 
-    logger.info(
-        "Searching index data symbol=%s date=%s prefix=%s",
-        symbol_name,
+    prefixes = _index_prefix_candidates(
+        folder,
         normalized_date,
-        idx_folder,
     )
 
-    for filename in candidate_names:
-        try:
-            path = _find_parquet_file(
-                idx_folder,
-                filename,
+    logger.info(
+        "Searching index data symbol=%s date=%s prefixes=%s",
+        symbol_name,
+        normalized_date,
+        prefixes,
+    )
+
+    # ---------------------------------------------------------
+    # 1. Fast exact-name search under all supported prefixes
+    # ---------------------------------------------------------
+    for prefix in prefixes:
+        for filename in candidate_names:
+            try:
+                path = _find_parquet_file(
+                    prefix,
+                    filename,
+                )
+            except Exception as exc:
+                logger.exception(
+                    "Index search failed prefix=%s filename=%s error=%s",
+                    prefix,
+                    filename,
+                    exc,
+                )
+                continue
+
+            if not path:
+                continue
+
+            logger.info(
+                "Using index source path=%s",
+                path,
             )
-        except Exception as exc:
-            logger.exception(
-                "Index search failed prefix=%s filename=%s error=%s",
-                idx_folder,
-                filename,
-                exc,
+
+            try:
+                result = _read_parquet_normalized(
+                    path,
+                    mode="spot",
+                )
+            except Exception as exc:
+                logger.exception(
+                    "Index read failed path=%s error=%s",
+                    path,
+                    exc,
+                )
+                continue
+
+            if result is None or result.empty:
+                continue
+
+            requested = result[
+                result["datetime"].dt.strftime("%Y%m%d")
+                == normalized_date
+            ]
+
+            if not requested.empty:
+                return (
+                    requested
+                    .sort_values("datetime")
+                    .reset_index(drop=True)
+                )
+
+            logger.warning(
+                "Index source has no rows for date=%s path=%s",
+                normalized_date,
+                path,
             )
+
+    # ---------------------------------------------------------
+    # 2. Recursive fallback under the complete week folder
+    # ---------------------------------------------------------
+    normalized_folder = (
+        str(folder)
+        .replace("\\", "/")
+        .strip("/")
+    )
+
+    try:
+        if STORAGE_MODE == "blob":
+            candidate_paths = list_blob_names(
+                normalized_folder
+            )
+        else:
+            if not os.path.isdir(normalized_folder):
+                candidate_paths = []
+            else:
+                candidate_paths = [
+                    os.path.join(root, filename)
+                    for root, _, files in os.walk(
+                        normalized_folder
+                    )
+                    for filename in files
+                ]
+    except Exception as exc:
+        logger.exception(
+            "Unable to recursively list index files under %s: %s",
+            normalized_folder,
+            exc,
+        )
+        candidate_paths = []
+
+    matched_paths = []
+
+    for candidate_path in candidate_paths:
+        candidate_path = str(candidate_path)
+
+        if not candidate_path.lower().endswith(
+            ".parquet"
+        ):
             continue
 
-        if not path:
-            continue
+        if _match_index_blob_name(
+            candidate_path,
+            symbol_name,
+            normalized_date,
+        ):
+            matched_paths.append(candidate_path)
 
-        logger.info("Using index source path=%s", path)
+    # Prefer paths explicitly containing the date folder.
+    matched_paths.sort(
+        key=lambda value: (
+            normalized_date not in str(value),
+            len(str(value)),
+            str(value),
+        )
+    )
+
+    for path in matched_paths:
+        logger.info(
+            "Using recursive index fallback path=%s",
+            path,
+        )
 
         try:
             result = _read_parquet_normalized(
@@ -650,7 +881,7 @@ def load_index_data_by_symbol(
             )
         except Exception as exc:
             logger.exception(
-                "Index read failed path=%s error=%s",
+                "Recursive index read failed path=%s error=%s",
                 path,
                 exc,
             )
@@ -665,22 +896,22 @@ def load_index_data_by_symbol(
         ]
 
         if not requested.empty:
-            return requested.reset_index(drop=True)
-
-        logger.warning(
-            "Index source has no rows for date=%s path=%s",
-            normalized_date,
-            path,
-        )
+            return (
+                requested
+                .sort_values("datetime")
+                .reset_index(drop=True)
+            )
 
     logger.warning(
-        "Index source not found symbol=%s date=%s prefix=%s",
+        "Index source not found symbol=%s date=%s "
+        "week_folder=%s checked_prefixes=%s",
         symbol_name,
         normalized_date,
-        idx_folder,
+        normalized_folder,
+        prefixes,
     )
 
-    return pd.DataFrame(columns=["datetime", "value"])
+    return empty
 
 
 # =========================================================
@@ -701,7 +932,7 @@ def consolidated_chain_path(
     expiry_str,
     instrument="NIFTY",
 ):
-    """Return <week>/<YYYYMMDD>/OPT_TICK/<SYMBOL>.parquet."""
+    """Return <week>/OPT_TICK/<YYYYMMDD>/<SYMBOL>.parquet."""
     cfg = get_dataset_config(instrument)
     symbol = str(cfg["symbol"]).upper()
     return _join_storage_path(
@@ -801,8 +1032,8 @@ def _load_consolidated_option_source(
         # Production Azure layout:
         #
         # <week-folder>/
-        #     <YYYYMMDD>/
-        #         OPT_TICK/
+        #     OPT_TICK/
+        #         <YYYYMMDD>/
         #             NIFTY.parquet
         #
         path = _join_storage_path(
@@ -1936,6 +2167,86 @@ def get_option_chain_snapshot(
         .sort_values("strike", kind="mergesort")
         .reset_index(drop=True)
     )[["timestamp", "strike", "ce", "pe"]]
+
+
+def diagnose_index_source(
+    folder,
+    date_str,
+    symbol_name="NIFTY",
+):
+    """
+    Return index-search diagnostics without raising an exception.
+
+    Useful from the VM shell:
+
+        from data_engine_for_simulation import diagnose_index_source
+        print(diagnose_index_source(folder, "20260717", "NIFTY"))
+    """
+    normalized_date = (
+        str(date_str)
+        .replace("-", "")
+        .replace("/", "")
+        .strip()
+    )
+
+    symbol_name = (
+        str(symbol_name)
+        .upper()
+        .strip()
+    )
+
+    prefixes = _index_prefix_candidates(
+        folder,
+        normalized_date,
+    )
+
+    result = {
+        "storage_mode": STORAGE_MODE,
+        "folder": str(folder),
+        "date": normalized_date,
+        "symbol": symbol_name,
+        "prefixes": prefixes,
+        "matches": [],
+    }
+
+    try:
+        if STORAGE_MODE == "blob":
+            paths = list_blob_names(
+                str(folder)
+                .replace("\\", "/")
+                .strip("/")
+            )
+        else:
+            root_folder = os.path.abspath(
+                str(folder)
+            )
+
+            paths = (
+                [
+                    os.path.join(root, filename)
+                    for root, _, files in os.walk(
+                        root_folder
+                    )
+                    for filename in files
+                ]
+                if os.path.isdir(root_folder)
+                else []
+            )
+
+        result["matches"] = [
+            str(path)
+            for path in paths
+            if str(path).lower().endswith(".parquet")
+            and _match_index_blob_name(
+                path,
+                symbol_name,
+                normalized_date,
+            )
+        ]
+    except Exception as exc:
+        result["error"] = str(exc)
+
+    return result
 
 
 def runtime_cache_stats():
