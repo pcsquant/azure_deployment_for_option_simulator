@@ -1351,3 +1351,36 @@ tr.atm td:nth-child(4) {
     padding:4px 6px;
     text-align:center;
 }
+
+#refreshBtn {
+  min-width: 88px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+}
+
+#refreshBtn.is-loading {
+  cursor: wait;
+  opacity: 0.8;
+}
+
+#refreshBtn:disabled {
+  cursor: not-allowed;
+}
+
+.button-spinner {
+  width: 14px;
+  height: 14px;
+  display: inline-block;
+  border: 2px solid rgba(0, 0, 0, 0.2);
+  border-top-color: currentColor;
+  border-radius: 50%;
+  animation: refresh-spinner-rotation 0.75s linear infinite;
+}
+
+@keyframes refresh-spinner-rotation {
+  to {
+    transform: rotate(360deg);
+  }
+}
