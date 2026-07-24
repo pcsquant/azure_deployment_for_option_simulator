@@ -440,10 +440,41 @@ def _json_error(message: str, status: int = 400, **extra):
 
 
 def _normalize_dataset(value: Optional[str]) -> str:
-    value = str(value or "NIFTY").strip().upper()
-    if value in {"BSE", "SENSEX"}:
-        return "SENSEX"
-    return "NIFTY"
+    """
+    Normalize frontend instrument names into the names used by
+    data_engine_for_simulation.py and Azure Parquet files.
+    """
+
+    value = (
+        str(value or "NIFTY")
+        .strip()
+        .upper()
+        .replace("-", "")
+        .replace("_", "")
+        .replace(" ", "")
+    )
+
+    aliases = {
+        "NIFTY": "NIFTY",
+        "NIFTY50": "NIFTY",
+
+        "BANKNIFTY": "BANKNIFTY",
+        "NIFTYBANK": "BANKNIFTY",
+        "BANKNIFTYINDEX": "BANKNIFTY",
+
+        "SENSEX": "SENSEX",
+        "BSE": "SENSEX",
+        "BSESENSEX": "SENSEX",
+    }
+
+    normalized = aliases.get(value)
+
+    if normalized is None:
+        raise ValueError(
+            f"Unsupported dataset/instrument: {value}"
+        )
+
+    return normalized
 
 
 def _normalize_date(value: Optional[str]) -> str:
