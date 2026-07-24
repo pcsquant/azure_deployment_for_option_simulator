@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Option Simulator - Exposure Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">◉ Option Simulator</div>
+  <select id="symbol"><option>NIFTY</option><option>BANKNIFTY</option><option>SENSEX</option></select>
+  <input id="queryDate" type="date">
+  <label>Time <input id="queryTime" type="time" value="09:30"></label>
+  <div class="playback-controls" aria-label="Simulation playback controls">
+    <button id="prevIntervalBtn" class="playback-btn" type="button" title="Previous interval" aria-label="Previous interval">&lt;&lt;</button>
+    <button id="playPauseBtn" class="playback-btn play-btn" type="button" title="Play simulation" aria-label="Play simulation">▶</button>
+    <button id="nextIntervalBtn" class="playback-btn" type="button" title="Next interval" aria-label="Next interval">&gt;&gt;</button>
+  </div>
+  <label>Interval <select id="interval"><option value="1">1m</option><option value="3" selected>3m</option><option value="5">5m</option><option value="15">15m</option></select></label>
+  <label>Strikes <input id="strikeCount" type="number" min="3" max="30" value="10"></label>
+  <select id="expirySelect"></select>
+  <button id="refreshBtn">Refresh</button>
+  <div class="ticker"><small>Spot</small><b id="spotValue">-</b></div>
+  <div class="ticker"><small>India VIX</small><b id="vixValue">-</b></div>
+  <div class="ticker"><small>DTE</small><b id="dteValue">-</b></div>
+</header>
+
+<main class="dashboard">
+  <section class="chain-card">
+    <div class="card-tabs">
+      <button class="active">Option Chain</button>
+      <button id="oiChangeBtn">OI Change</button>
+      <label class="greek-select">Greeks
+        <select id="greekMetric">
+          <option value="delta">Delta</option><option value="gamma">Gamma</option>
+          <option value="vega">Vega</option><option value="theta">Theta</option>
+          <option value="iv">IV</option>
+        </select>
+      </label>
+    </div>
+    <div class="chain-with-levels">
+      <div class="table-wrap">
+        <table class="chain-table">
+          <thead>
+            <tr class="group-row"><th colspan="5" class="calls">CALLS</th><th>STRIKE</th><th colspan="5" class="puts">PUTS</th></tr>
+            <tr><th>OI (L)</th><th>Chg OI</th><th>LTP</th><th>IV %</th><th id="ceGreekHead">Delta</th><th>Strike</th><th id="peGreekHead">Delta</th><th>IV %</th><th>LTP</th><th>Chg OI</th><th>OI (L)</th></tr>
+          </thead>
+          <tbody id="chainBody"></tbody>
+          <tfoot><tr><td colspan="5" id="callTotals">Call OI: -</td><td></td><td colspan="5" id="putTotals">Put OI: -</td></tr></tfoot>
+        </table>
+      </div>
+      <aside class="level-rail" id="levelRail">
+        <div class="level resistance" id="r2Marker">R2</div>
+        <div class="level resistance" id="r1Marker">R1</div>
+        <div class="level spot" id="spotMarker">Spot</div>
+        <div class="level support" id="s1Marker">S1</div>
+        <div class="level support" id="s2Marker">S2</div>
+      </aside>
+    </div>
+    <div class="footnote">OI is shown in lakhs · GEX uses available open interest and Black–Scholes gamma.</div>
+  </section>
+
+  <section class="analytics-card">
+    <div class="exposure-tabs">
+      <button class="active" data-view="gex">GEX</button>
+      <button data-view="dex">DEX</button>
+      <button data-view="vex">VEX</button>
+      <button data-view="tex">TEX</button>
+    </div>
+    <div class="chart-header"><div><h2 id="chartTitle">Gamma Exposure (GEX)</h2><small id="chartSubtitle">Net exposure by strike</small></div></div>
+    <div class="chart-box"><canvas id="exposureChart"></canvas></div>
+    <div class="info-grid">
+      <article><h3>Key Levels</h3><p>Resistance 2 <b id="r2Value">-</b></p><p>Resistance 1 <b id="r1Value">-</b></p><p>Spot <b id="spotLevel">-</b></p><p>Support 1 <b id="s1Value">-</b></p><p>Support 2 <b id="s2Value">-</b></p></article>
+      <article><h3>Gamma Levels</h3><p>Gamma Flip <b id="gammaFlip">-</b></p><p>Zero Gamma <b id="zeroGamma">-</b></p><p>Max +GEX <b id="maxPositive">-</b></p><p>Max -GEX <b id="maxNegative">-</b></p></article>
+      <article><h3>Wall Levels</h3><p>Call Wall <b id="callWall">-</b></p><p>Put Wall <b id="putWall">-</b></p><p>Total GEX <b id="totalGex">-</b></p><p>Bias <b id="marketBias">-</b></p></article>
+    </div>
+  </section>
+</main>
+<script src="/static/simulator.js"></script>
+</body>
+</html>
