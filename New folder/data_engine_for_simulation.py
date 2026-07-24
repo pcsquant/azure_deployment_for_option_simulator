@@ -1268,128 +1268,339 @@ def load_consolidated_option_chain(
     expiry_str,
     instrument="NIFTY",
 ):
-    """Normalize a consolidated underlying Parquet into timestamp/strike/ce/pe."""
-    path = consolidated_chain_path(folder, date_str, expiry_str, instrument)
+    """
+    Load and normalize consolidated option data.
+
+    Returns:
+        timestamp
+        strike
+        ce
+        pe
+        ce_oi
+        pe_oi
+    """
+    path = consolidated_chain_path(
+        folder,
+        date_str,
+        expiry_str,
+        instrument,
+    )
+
     cache_key = (
-        f"schema-{CONSOLIDATED_SCHEMA_VERSION}|{STORAGE_MODE}|{path}|"
+        f"schema-oi-v1|{STORAGE_MODE}|{path}|"
         f"{date_str}|{expiry_str}|{str(instrument).upper()}"
     )
 
     with _OPTION_CHAIN_CACHE_LOCK:
         cached = _OPTION_CHAIN_CACHE.get(cache_key)
+
     if cached is not None:
         return cached.copy()
 
     if STORAGE_MODE == "blob":
         try:
             if not blob_exists(path):
-                logger.warning("Option Parquet not found: %s", path)
+                logger.warning(
+                    "Option Parquet not found: %s",
+                    path,
+                )
                 return None
         except Exception as exc:
-            logger.exception("Unable to check option blob %s: %s", path, exc)
+            logger.exception(
+                "Unable to check option blob %s: %s",
+                path,
+                exc,
+            )
             return None
+
     elif not os.path.isfile(path):
-        logger.warning("Option Parquet not found: %s", path)
-        return None
-
-    source = _load_consolidated_option_source(path)
-    if source is None or source.empty:
-        return None
-
-    lower = {str(c).strip().lower(): c for c in source.columns}
-    required = {"date", "time", "price", "contract_name"}
-    if not required.issubset(lower):
-        logger.error(
-            "Unsupported option schema in %s. Required=%s Available=%s",
-            path, sorted(required), list(source.columns),
+        logger.warning(
+            "Option Parquet not found: %s",
+            path,
         )
         return None
 
-    work = source[[
-        lower["date"], lower["time"], lower["price"], lower["contract_name"]
-    ]].copy()
-    work.columns = ["date", "time", "price", "contract_name"]
+    source = _load_consolidated_option_source(path)
 
-    requested_date = pd.to_numeric(str(date_str), errors="coerce")
+    if source is None or source.empty:
+        return None
+
+    lower = {
+        str(column).strip().lower(): column
+        for column in source.columns
+    }
+
+    required = {
+        "date",
+        "time",
+        "price",
+        "contract_name",
+    }
+
+    if not required.issubset(lower):
+        logger.error(
+            "Unsupported option schema in %s. "
+            "Required=%s Available=%s",
+            path,
+            sorted(required),
+            list(source.columns),
+        )
+        return None
+
+    selected_columns = [
+        lower["date"],
+        lower["time"],
+        lower["price"],
+        lower["contract_name"],
+    ]
+
+    has_oi = "oi" in lower
+
+    if has_oi:
+        selected_columns.append(lower["oi"])
+
+    work = source[selected_columns].copy()
+
+    if has_oi:
+        work.columns = [
+            "date",
+            "time",
+            "price",
+            "contract_name",
+            "oi",
+        ]
+    else:
+        work.columns = [
+            "date",
+            "time",
+            "price",
+            "contract_name",
+        ]
+        work["oi"] = np.nan
+
+    requested_date = pd.to_numeric(
+        str(date_str),
+        errors="coerce",
+    )
+
     if pd.isna(requested_date):
         return None
-    work["date"] = pd.to_numeric(work["date"], errors="coerce")
-    work = work[work["date"] == int(requested_date)]
+
+    work["date"] = pd.to_numeric(
+        work["date"],
+        errors="coerce",
+    )
+
+    work = work[
+        work["date"] == int(requested_date)
+    ]
+
     if work.empty:
-        logger.warning("No option rows for date=%s in %s", date_str, path)
+        logger.warning(
+            "No option rows for date=%s in %s",
+            date_str,
+            path,
+        )
         return None
 
     contract = (
-        work["contract_name"].astype(str).str.strip().str.upper()
+        work["contract_name"]
+        .astype(str)
+        .str.strip()
+        .str.upper()
         .str.replace(".PARQUET", "", regex=False)
         .str.replace(".CSV", "", regex=False)
     )
+
     extracted = contract.str.extract(
-        r"^(?P<symbol>[A-Z]+)(?P<expiry>\d{6})"
-        r"(?P<strike>\d+(?:\.\d+)?)(?P<option_type>CE|PE)$"
+        r"^(?P<symbol>[A-Z]+)"
+        r"(?P<expiry>\d{6})"
+        r"(?P<strike>\d+(?:\.\d+)?)"
+        r"(?P<option_type>CE|PE)$"
     )
+
     work = work.join(extracted)
+
     cfg = get_dataset_config(instrument)
     symbol = str(cfg["symbol"]).upper()
-    work["price"] = pd.to_numeric(work["price"], errors="coerce")
-    work["strike"] = pd.to_numeric(work["strike"], errors="coerce")
-    work = work.dropna(subset=["price", "strike"])
+
+    work["price"] = pd.to_numeric(
+        work["price"],
+        errors="coerce",
+    )
+
+    work["oi"] = pd.to_numeric(
+        work["oi"],
+        errors="coerce",
+    )
+
+    work["strike"] = pd.to_numeric(
+        work["strike"],
+        errors="coerce",
+    )
+
+    work = work.dropna(
+        subset=[
+            "price",
+            "strike",
+        ]
+    )
+
     work = work[
         work["symbol"].eq(symbol)
         & work["expiry"].eq(str(expiry_str).strip())
         & work["option_type"].isin(["CE", "PE"])
     ]
+
     if work.empty:
         logger.warning(
-            "No option contracts matched instrument=%s date=%s expiry=%s in %s",
-            symbol, date_str, expiry_str, path,
+            "No option contracts matched "
+            "instrument=%s date=%s expiry=%s path=%s",
+            symbol,
+            date_str,
+            expiry_str,
+            path,
         )
         return None
 
     work["timestamp"] = pd.to_datetime(
-        work["date"].astype("Int64").astype(str) + " " + work["time"].astype(str),
+        work["date"].astype("Int64").astype(str)
+        + " "
+        + work["time"].astype(str),
         errors="coerce",
     )
+
     work = work.dropna(subset=["timestamp"])
-    if getattr(work["timestamp"].dt, "tz", None) is None:
-        work["timestamp"] = work["timestamp"].dt.tz_localize(
-            IST, ambiguous="NaT", nonexistent="NaT"
+
+    if work["timestamp"].dt.tz is None:
+        work["timestamp"] = (
+            work["timestamp"]
+            .dt.tz_localize(
+                IST,
+                ambiguous="NaT",
+                nonexistent="NaT",
+            )
         )
     else:
-        work["timestamp"] = work["timestamp"].dt.tz_convert(IST)
+        work["timestamp"] = (
+            work["timestamp"]
+            .dt.tz_convert(IST)
+        )
+
     work = work.dropna(subset=["timestamp"])
+
     work = work[
         (work["timestamp"].dt.time >= SESSION_START)
         & (work["timestamp"].dt.time <= SESSION_END)
     ]
+
     if work.empty:
         return None
 
-    work["strike"] = work["strike"].round().astype("int32")
-    work["timestamp"] = work["timestamp"].dt.floor("min")
-    work = (
-        work.sort_values("timestamp", kind="mergesort")
-        .drop_duplicates(["timestamp", "strike", "option_type"], keep="last")
+    work["strike"] = (
+        work["strike"]
+        .round()
+        .astype("int32")
     )
 
-    out = (
+    work["timestamp"] = (
+        work["timestamp"]
+        .dt.floor("min")
+    )
+
+    work = (
+        work
+        .sort_values("timestamp", kind="mergesort")
+        .drop_duplicates(
+            [
+                "timestamp",
+                "strike",
+                "option_type",
+            ],
+            keep="last",
+        )
+    )
+
+    price_pivot = (
         work.pivot_table(
-            index=["timestamp", "strike"],
+            index=[
+                "timestamp",
+                "strike",
+            ],
             columns="option_type",
             values="price",
             aggfunc="last",
         )
         .reset_index()
-        .rename(columns={"CE": "ce", "PE": "pe"})
+        .rename(
+            columns={
+                "CE": "ce",
+                "PE": "pe",
+            }
+        )
     )
-    out.columns.name = None
-    if "ce" not in out.columns:
-        out["ce"] = np.nan
-    if "pe" not in out.columns:
-        out["pe"] = np.nan
-    out = out[["timestamp", "strike", "ce", "pe"]].sort_values(
-        ["timestamp", "strike"], kind="mergesort"
-    ).reset_index(drop=True)
+
+    oi_pivot = (
+        work.pivot_table(
+            index=[
+                "timestamp",
+                "strike",
+            ],
+            columns="option_type",
+            values="oi",
+            aggfunc="last",
+        )
+        .reset_index()
+        .rename(
+            columns={
+                "CE": "ce_oi",
+                "PE": "pe_oi",
+            }
+        )
+    )
+
+    price_pivot.columns.name = None
+    oi_pivot.columns.name = None
+
+    out = price_pivot.merge(
+        oi_pivot,
+        on=[
+            "timestamp",
+            "strike",
+        ],
+        how="left",
+    )
+
+    for column in [
+        "ce",
+        "pe",
+        "ce_oi",
+        "pe_oi",
+    ]:
+        if column not in out.columns:
+            out[column] = np.nan
+
+    out = (
+        out[
+            [
+                "timestamp",
+                "strike",
+                "ce",
+                "pe",
+                "ce_oi",
+                "pe_oi",
+            ]
+        ]
+        .sort_values(
+            [
+                "timestamp",
+                "strike",
+            ],
+            kind="mergesort",
+        )
+        .reset_index(drop=True)
+    )
+
     if out.empty:
         return None
 
@@ -1397,9 +1608,16 @@ def load_consolidated_option_chain(
         _OPTION_CHAIN_CACHE[cache_key] = out.copy()
 
     logger.info(
-        "Loaded option chain instrument=%s date=%s expiry=%s rows=%d strikes=%d",
-        symbol, date_str, expiry_str, len(out), out["strike"].nunique(),
+        "Loaded option chain with OI "
+        "instrument=%s date=%s expiry=%s "
+        "rows=%d strikes=%d",
+        symbol,
+        date_str,
+        expiry_str,
+        len(out),
+        out["strike"].nunique(),
     )
+
     return out.copy()
 
 
