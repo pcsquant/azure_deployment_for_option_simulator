@@ -253,30 +253,60 @@ function addMinutesToTime(timeValue, minutesToAdd) {
 async function moveNextInterval() {
   const btn = getEl("nextIntervalBtn");
   const timeInput = getEl("queryTime");
+  const dateInput = getEl("queryDate");
 
-  if (!timeInput) return;
-
-  const currentTime = timeInput.value || DEFAULT_TIME;
-
-  // Do not allow the simulator to move beyond the market close.
-  if (currentTime >= MARKET_CLOSE_TIME) {
-    timeInput.value = MARKET_CLOSE_TIME;
-    return;
-  }
-
-  const calculatedNextTime = addMinutesToTime(
-    currentTime,
-    getInterval()
-  );
-
-  timeInput.value = calculatedNextTime > MARKET_CLOSE_TIME
-    ? MARKET_CLOSE_TIME
-    : calculatedNextTime;
-
+  if (!timeInput || !dateInput) return;
   if (btn) btn.disabled = true;
 
   try {
-    await loadChain(true);
+    const currentTime = timeInput.value || DEFAULT_TIME;
+    const calculatedNextTime = addMinutesToTime(
+      currentTime,
+      getInterval()
+    );
+
+    /*
+     * Normal intraday movement. Positions are intentionally preserved so
+     * their current premium, P&L and live Greeks can be recalculated using
+     * the newly loaded option-chain snapshot.
+     */
+    if (
+      currentTime < MARKET_CLOSE_TIME &&
+      calculatedNextTime <= MARKET_CLOSE_TIME
+    ) {
+      timeInput.value = calculatedNextTime;
+      await loadChain(true, false);
+      return;
+    }
+
+    /*
+     * At or beyond 15:30, move to the next available trading session instead
+     * of stopping. The backend skips weekends, holidays and missing datasets.
+     * Do NOT reset `legs`: open positions must continue into the next day.
+     */
+    const params = new URLSearchParams({
+      dataset: getDataset(),
+      date: getQueryDate(),
+      _: String(Date.now())
+    });
+
+    const data = await fetchJson(
+      `/api/next-trading-session?${params.toString()}`
+    );
+
+    dateInput.value = data.date;
+    timeInput.value = data.time || MARKET_OPEN_TIME;
+
+    /*
+     * Preserve the selected expiry and all open legs. This is essential for
+     * overnight positions because changing to a new "nearest expiry" would
+     * value a different contract.
+     */
+    await loadChain(true, false);
+
+  } catch (err) {
+    console.error("Next-interval error:", err);
+    alert(err.message || "Next trading day not found");
   } finally {
     if (btn) btn.disabled = false;
   }
