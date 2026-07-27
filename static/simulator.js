@@ -54,6 +54,8 @@ const DEFAULT_DATASET = "NIFTY";
 const DEFAULT_TIME = "09:15";
 const DEFAULT_INTERVAL = 1;
 const DEFAULT_STRIKE_COUNT = 10;
+const MARKET_OPEN_TIME = "09:15";
+const MARKET_CLOSE_TIME = "15:30";
 
 function fmtMoney(x) {
   if (typeof x === "string") return x;
@@ -64,6 +66,33 @@ function fmtMoney(x) {
 
 function getEl(id) {
   return document.getElementById(id);
+}
+
+function setTextContent(id, value) {
+  const element = getEl(id);
+  if (element) element.textContent = value;
+}
+
+function resetStrategyPositions() {
+  // A position is valid only for the date, dataset and expiry on which it
+  // was entered. Never carry it into another trading session.
+  legs = [];
+
+  renderLegs();
+  calculateLivePositionGreeks();
+
+  // Reset all position-dependent summary values immediately. loadChain()
+  // will recalculate them after the new market data has been loaded.
+  setTextContent("netCredit", fmtMoney(0));
+  setTextContent("pnlNow", fmtMoney(0));
+  setTextContent("tradeCost", fmtMoney(0));
+  setTextContent("netProfitAfterCost", fmtMoney(0));
+  setTextContent("marginRequired", fmtMoney(0));
+  setTextContent("maxProfit", fmtMoney(0));
+  setTextContent("maxLoss", fmtMoney(0));
+  setTextContent("breakevens", "-");
+
+  renderChart([], [], []);
 }
 
 function getDataset() {
@@ -221,16 +250,36 @@ function addMinutesToTime(timeValue, minutesToAdd) {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
-function moveNextInterval() {
+async function moveNextInterval() {
+  const btn = getEl("nextIntervalBtn");
   const timeInput = getEl("queryTime");
+
   if (!timeInput) return;
 
-  timeInput.value = addMinutesToTime(
-    timeInput.value || DEFAULT_TIME,
+  const currentTime = timeInput.value || DEFAULT_TIME;
+
+  // Do not allow the simulator to move beyond the market close.
+  if (currentTime >= MARKET_CLOSE_TIME) {
+    timeInput.value = MARKET_CLOSE_TIME;
+    return;
+  }
+
+  const calculatedNextTime = addMinutesToTime(
+    currentTime,
     getInterval()
   );
 
-  loadChain(true);
+  timeInput.value = calculatedNextTime > MARKET_CLOSE_TIME
+    ? MARKET_CLOSE_TIME
+    : calculatedNextTime;
+
+  if (btn) btn.disabled = true;
+
+  try {
+    await loadChain(true);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 async function movePreviousInterval() {
@@ -267,11 +316,9 @@ async function movePreviousInterval() {
     dateInput.value = data.date;
     timeInput.value = data.time || "15:30";
 
-    legs = [];
-    renderLegs();
-    calculate();
+    resetStrategyPositions();
 
-    await loadChain(true);
+    await loadChain(true, true);
 
   } catch (err) {
     alert(err.message || "Previous trading day not found");
@@ -4132,11 +4179,8 @@ async function initSimulator() {
     ensurePositionsHeaders();
 
     await loadDefaults();
+    resetStrategyPositions();
     await loadChain();
-
-    if (chain.length) {
-      loadTemplate("short_straddle");
-    }
   } catch (err) {
     console.error("initSimulator error:", err);
     alert(err.message || "Simulator failed to initialize");
@@ -4209,9 +4253,7 @@ window.addEventListener("DOMContentLoaded", () => {
            * Clear all existing strategy positions because
            * premiums and Greeks belong to the old date.
            */
-          legs = [];
-          renderLegs();
-          calculateLivePositionGreeks();
+          resetStrategyPositions();
 
           /*
            * The second argument is true.
@@ -4442,9 +4484,7 @@ window.addEventListener("DOMContentLoaded", () => {
         try {
           setRefreshLoading(true);
 
-          legs = [];
-          renderLegs();
-          calculateLivePositionGreeks();
+          resetStrategyPositions();
 
           /*
            * Dataset changed, so the previous expiry must not
@@ -4487,9 +4527,7 @@ window.addEventListener("DOMContentLoaded", () => {
         try {
           setRefreshLoading(true);
 
-          legs = [];
-          renderLegs();
-          calculateLivePositionGreeks();
+          resetStrategyPositions();
 
           /*
            * The user manually selected an expiry.
