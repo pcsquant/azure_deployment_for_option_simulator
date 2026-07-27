@@ -1,4685 +1,3118 @@
-let chain = [];
-let legs = [];
-let chart = null;
+"""
+StockMock-style Options Simulator Flask app.
 
-let appDefaults = null;
+Place this file at:
+    agent_for_production/app.py
 
-let fullscreenChart = null;
-let fullscreenSeries = null;
+This version adds:
+- interval-aware RAM window caching
+- only 10 candles before + current + 10 candles after are kept per option leg
+- works for 1m, 2m, 3m, 5m, 10m, 15m, etc.
+- keeps existing API contract unchanged
+- uses Redis + ThreadPoolExecutor for asynchronous IV-surface jobs
 
-let futureChart = null;
-let futureSeries = null;
+It uses your existing modules:
+    agent_for_data/config_for_simulation.py
+    agent_for_data/data_engine_for_simulation.py
+    agent_for_data/black_scholes_iv.py
 
-let vixChart = null;
-let vixSeries = null;
-let volSmileChart = null;
-let ivSurfaceChart = null;
-let pinnedIvPoint = null;
-let ivSurfaceRequestGeneration = 0;
+Frontend files expected:
+    templates/simulator.html
+    static/simulator.js
+    static/style.css
+"""
 
+from __future__ import annotations
 
-let activeIndicatorChart = null;
+import copy
+import json
+import logging
+import math
+import os
+import threading
+import time
+import uuid
+from collections import OrderedDict
+from datetime import date, datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 
-const advancedCharts = {
-  index: {
-    chart: null,
-    candleSeries: null,
-    rows: [],
-    indicators: []
-  },
+import numpy as np
+import pandas as pd
+from data_engine_for_simulation import (
+    load_raw_option_contract_ticks,
+)
+from flask import Flask, g, jsonify, render_template, request
+from flask.json.provider import JSONProvider
+from werkzeug.middleware.proxy_fix import ProxyFix
 
-  future: {
-    chart: null,
-    candleSeries: null,
-    rows: [],
-    indicators: []
-  },
-
-  vix: {
-    chart: null,
-    candleSeries: null,
-    rows: [],
-    indicators: []
-  },
-
-  option: {
-    chart: null,
-    candleSeries: null,
-    rows: [],
-    indicators: []
-  }
-};
-
-const DEFAULT_DATASET = "NIFTY";
-const DEFAULT_TIME = "09:15";
-const DEFAULT_INTERVAL = 1;
-const DEFAULT_STRIKE_COUNT = 10;
-const MARKET_OPEN_TIME = "09:15";
-const MARKET_CLOSE_TIME = "15:30";
-
-function fmtMoney(x) {
-  if (typeof x === "string") return x;
-  return "₹" + Number(x || 0).toLocaleString("en-IN", {
-    maximumFractionDigits: 0
-  });
-}
-
-function getEl(id) {
-  return document.getElementById(id);
-}
-
-function setTextContent(id, value) {
-  const element = getEl(id);
-  if (element) element.textContent = value;
-}
-
-function resetStrategyPositions() {
-  // Use this only when the user intentionally starts a new strategy,
-  // changes the underlying dataset, or changes the strategy expiry.
-  legs = [];
-
-  renderLegs();
-  calculateLivePositionGreeks();
-
-  // Reset all position-dependent summary values immediately. loadChain()
-  // will recalculate them after the new market data has been loaded.
-  setTextContent("netCredit", fmtMoney(0));
-  setTextContent("pnlNow", fmtMoney(0));
-  setTextContent("tradeCost", fmtMoney(0));
-  setTextContent("netProfitAfterCost", fmtMoney(0));
-  setTextContent("marginRequired", fmtMoney(0));
-  setTextContent("maxProfit", fmtMoney(0));
-  setTextContent("maxLoss", fmtMoney(0));
-  setTextContent("breakevens", "-");
-
-  renderChart([], [], []);
-}
-
-function getDataset() {
-  const select = getEl("dataset") || getEl("underlying") || getEl("symbol");
-  const value = select ? select.value : DEFAULT_DATASET;
-  const text = String(value || DEFAULT_DATASET).toUpperCase();
-
-  if (text === "BSE" || text === "SENSEX") return "SENSEX";
-  if (text === "BANKNIFTY" || text === "BANK NIFTY") return "BANKNIFTY";
-
-  return "NIFTY";
-}
-
-function getFixedQty() {
-  return getDataset() === "SENSEX" ? 20 : 65;
-}
-
-function getSpot() {
-  return Number(getEl("spot")?.value || 0);
-}
-
-function getIV() {
-  return Number(getEl("iv")?.value || 20);
-}
-
-function getDays() {
-  return Number(getEl("days")?.value || 1);
-}
-
-function getQueryDate() {
-  const dateInput = getEl("queryDate") || getEl("date") || getEl("query_date");
-  if (dateInput && dateInput.value) return dateInput.value;
-  if (appDefaults && appDefaults.query_date) return appDefaults.query_date;
-  return "2026-03-30";
-}
-
-function getQueryTime() {
-  const timeInput = getEl("queryTime") || getEl("time") || getEl("query_time");
-  if (timeInput && timeInput.value) return timeInput.value;
-  if (appDefaults && appDefaults.query_time) return appDefaults.query_time;
-  return DEFAULT_TIME;
-}
+try:
+    import redis
+except ImportError:  # pragma: no cover - dependency validation happens at startup
+    redis = None
 
 
-function getInterval() {
-  const intervalInput = getEl("interval") || getEl("candleInterval");
-  const value = Number(intervalInput?.value || DEFAULT_INTERVAL);
-  return value > 0 ? value : DEFAULT_INTERVAL;
-}
-function getStrikeCount() {
-  const input = getEl("strikeCount");
-  const value = Number(input?.value || DEFAULT_STRIKE_COUNT);
-  return value > 0 ? Math.floor(value) : DEFAULT_STRIKE_COUNT;
-}
+try:
+    import orjson
+except ImportError:  # pragma: no cover
+    orjson = None
 
-function parseExpiryValue(expiryValue) {
-  const value = String(expiryValue || "").trim();
+from black_scholes_iv_for_simulation import append_black_scholes_iv
 
-  if (!/^\d{6}$/.test(value)) {
-    return null;
-  }
+try:
+    from black_scholes_iv_for_simulation import clear_iv_cache, iv_cache_stats
+except ImportError:  # Backward compatibility with an older IV module.
+    def clear_iv_cache() -> None:
+        return None
 
-  const year = 2000 + Number(value.slice(0, 2));
-  const month = Number(value.slice(2, 4)) - 1;
-  const day = Number(value.slice(4, 6));
+    def iv_cache_stats() -> dict:
+        return {"enabled": False}
+from chart import build_chart_payload
+from config_for_simulation import (
+    CANDLE_INTERVAL_MINUTES,
+    DATA_LAYOUT,
+    IST,
+    STORAGE_MODE,
+    get_dataset_config,
+    log_configuration,
+    validate_configuration,
+)
+from data_engine_for_simulation import (
+    create_candles,
+    get_dates_for_week_folder,
+    get_nearest_strike,
+    get_option_chain_snapshot,
+    get_upcoming_expiry_np,
+    get_week_folders,
+    load_consolidated_option_chain,
+    load_future_data_for_date,
+    load_index_data_by_symbol,
+    load_required_option_data_for_date,
+    runtime_cache_stats,
+)
 
-  const expiryDate = new Date(year, month, day);
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger(__name__)
 
-  return Number.isNaN(expiryDate.getTime())
-    ? null
-    : expiryDate;
-}
+logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(logging.WARNING)
+logging.getLogger("azure.storage.blob").setLevel(logging.WARNING)
 
 
-function isNiftyMonthlyExpiry(expiryValue) {
-  const selectedDate = parseExpiryValue(expiryValue);
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
-  if (!selectedDate) {
-    return false;
-  }
 
-  const expirySelect = getEl("expirySelect");
 
-  if (!expirySelect) {
-    return false;
-  }
+class _OrjsonProvider(JSONProvider):
+    """Fast Flask JSON provider with safe fallback-compatible behavior."""
 
-  const sameMonthExpiries = Array.from(expirySelect.options)
-    .map(option => ({
-      value: option.value,
-      date: parseExpiryValue(option.value)
-    }))
-    .filter(item =>
-      item.date &&
-      item.date.getFullYear() === selectedDate.getFullYear() &&
-      item.date.getMonth() === selectedDate.getMonth()
+    def dumps(self, obj: Any, **kwargs) -> str:
+        if orjson is None:
+            return json.dumps(obj, default=str, separators=(",", ":"))
+        return orjson.dumps(
+            obj,
+            option=orjson.OPT_NON_STR_KEYS | orjson.OPT_SERIALIZE_NUMPY,
+            default=str,
+        ).decode("utf-8")
+
+    def loads(self, value: Any, **kwargs) -> Any:
+        if orjson is None:
+            return json.loads(value)
+        return orjson.loads(value)
+
+
+def create_app() -> Flask:
+    flask_app = Flask(__name__)
+    flask_app.json = _OrjsonProvider(flask_app)
+    flask_app.config.update(
+        JSON_SORT_KEYS=False,
+        MAX_CONTENT_LENGTH=int(os.getenv("MAX_CONTENT_LENGTH", str(2 * 1024 * 1024))),
+        PROPAGATE_EXCEPTIONS=False,
     )
-    .sort((a, b) => a.date - b.date);
-
-  if (!sameMonthExpiries.length) {
-    return false;
-  }
-
-  const monthlyExpiry =
-    sameMonthExpiries[sameMonthExpiries.length - 1].value;
-
-  return String(expiryValue) === String(monthlyExpiry);
-}
-
-
-function getStrikeStep(expiryValue = null) {
-  const dataset = getDataset();
-
-  if (dataset === "BANKNIFTY" || dataset === "SENSEX") {
-    return 100;
-  }
-
-  if (
-    dataset === "NIFTY" &&
-    isNiftyMonthlyExpiry(expiryValue)
-  ) {
-    return 100;
-  }
-
-  return 50;
-}
-
-
-function normalizeStrike(strike, expiryValue = null) {
-  const value = Number(strike);
-
-  if (!Number.isFinite(value)) {
-    return 0;
-  }
-
-  const step = getStrikeStep(expiryValue);
-
-  return Math.round(value / step) * step;
-}
-
-function setSpot(value) {
-  const spotInput = getEl("spot");
-  if (spotInput && Number.isFinite(Number(value))) {
-    spotInput.value = Number(value).toFixed(0);
-  }
-}
-
-function addMinutesToTime(timeValue, minutesToAdd) {
-  const [hh, mm] = String(timeValue || DEFAULT_TIME).split(":").map(Number);
-  const d = new Date();
-
-  d.setHours(Number.isFinite(hh) ? hh : 9, Number.isFinite(mm) ? mm : 30, 0, 0);
-  d.setMinutes(d.getMinutes() + minutesToAdd);
-
-  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
-}
-
-async function moveNextInterval() {
-  const btn = getEl("nextIntervalBtn");
-  const timeInput = getEl("queryTime");
-  const dateInput = getEl("queryDate");
-
-  if (!timeInput || !dateInput) return;
-  if (btn) btn.disabled = true;
-
-  try {
-    const currentTime = timeInput.value || DEFAULT_TIME;
-    const calculatedNextTime = addMinutesToTime(
-      currentTime,
-      getInterval()
-    );
-
-    /*
-     * Normal intraday movement. Positions are intentionally preserved so
-     * their current premium, P&L and live Greeks can be recalculated using
-     * the newly loaded option-chain snapshot.
-     */
-    if (
-      currentTime < MARKET_CLOSE_TIME &&
-      calculatedNextTime <= MARKET_CLOSE_TIME
-    ) {
-      timeInput.value = calculatedNextTime;
-      await loadChain(true, false);
-      return;
-    }
-
-    /*
-     * At or beyond 15:30, move to the next available trading session instead
-     * of stopping. The backend skips weekends, holidays and missing datasets.
-     * Do NOT reset `legs`: open positions must continue into the next day.
-     */
-    const params = new URLSearchParams({
-      dataset: getDataset(),
-      date: getQueryDate(),
-      _: String(Date.now())
-    });
-
-    const data = await fetchJson(
-      `/api/next-trading-session?${params.toString()}`
-    );
-
-    dateInput.value = data.date;
-    timeInput.value = data.time || MARKET_OPEN_TIME;
-
-    /*
-     * Preserve the selected expiry and all open legs. This is essential for
-     * overnight positions because changing to a new "nearest expiry" would
-     * value a different contract.
-     */
-    await loadChain(true, false);
-
-  } catch (err) {
-    console.error("Next-interval error:", err);
-    alert(err.message || "Next trading day not found");
-  } finally {
-    if (btn) btn.disabled = false;
-  }
-}
-
-async function movePreviousInterval() {
-  const btn = getEl("prevIntervalBtn");
-  const timeInput = getEl("queryTime");
-  const dateInput = getEl("queryDate");
-
-  if (!timeInput || !dateInput) return;
-  if (btn) btn.disabled = true;
-
-  try {
-    const currentTime = timeInput.value || DEFAULT_TIME;
-    const nextTime = addMinutesToTime(currentTime, -getInterval());
-
-    if (nextTime >= "09:15") {
-      timeInput.value = nextTime;
-      await loadChain(true);
-      return;
-    }
-
-    const params = new URLSearchParams({
-      dataset: getDataset(),
-      date: getEl("indexChartStartDate")?.value || getQueryDate(),
-      end_date: getEl("indexChartEndDate")?.value || getQueryDate(),
-      time: getEl("indexChartEndTime")?.value || getQueryTime(),
-      interval: getEl("indexChartInterval")?.value || String(getInterval()),
-      _: String(Date.now())
-    });
-
-    const data = await fetchJson(
-      `/api/previous-trading-session?${params.toString()}`
-    );
-
-    dateInput.value = data.date;
-    timeInput.value = data.time || MARKET_CLOSE_TIME;
-
-    // Preserve open positions and their original entry premiums while moving
-    // between trading sessions. Revalue them using the newly loaded snapshot.
-    await loadChain(true, false);
-
-  } catch (err) {
-    alert(err.message || "Previous trading day not found");
-  } finally {
-    if (btn) btn.disabled = false;
-  }
-}
-
-async function fetchJson(url, options = {}) {
-  const res = await fetch(url, options);
-  const data = await res.json().catch(() => null);
-
-  if (!res.ok) {
-    throw new Error(data?.error || `Request failed: ${res.status}`);
-  }
-
-  return data;
-}
-
-function ensureExpiryWarning() {
-  const simPanel = document.querySelector(".sim-panel");
-  const tabs = document.querySelector(".sim-panel .tabs");
-
-  if (!simPanel || !tabs || getEl("expiryWarning")) return;
-
-  const warning = document.createElement("div");
-  warning.id = "expiryWarning";
-  warning.className = "expiry-warning";
-  warning.textContent =
-    "⚠ Payoff analysis is for same-expiry strategies only and is valid only at the time of expiry only. Calendar and diagonal spreads are not supported.";
-
-  tabs.insertAdjacentElement("afterend", warning);
-}
-
-function ensureMetricsCards() {
-  const metrics = document.querySelector(".metrics");
-  if (!metrics) return;
-
-  if (!getEl("tradeCost")) {
-    const div = document.createElement("div");
-    div.innerHTML = `<span>Charges</span><b id="tradeCost">₹0</b>`;
-    metrics.insertBefore(div, getEl("maxProfit")?.closest("div") || null);
-  }
-
-  if (!getEl("netProfitAfterCost")) {
-    const div = document.createElement("div");
-    div.innerHTML = `<span>Net P&L After Charges</span><b id="netProfitAfterCost">₹0</b>`;
-    metrics.insertBefore(div, getEl("maxProfit")?.closest("div") || null);
-  }
-
-  if (!getEl("marginRequired")) {
-    const div = document.createElement("div");
-    div.innerHTML = `<span>Margin</span><b id="marginRequired">₹0</b>`;
-    metrics.insertBefore(div, getEl("maxProfit")?.closest("div") || null);
-  }
-}
-
-function ensurePositionsHeaders() {
-  const legsBody = getEl("legsBody");
-  if (!legsBody) return;
-
-  const table = legsBody.closest("table");
-  if (!table) return;
-
-  const headerRow = table.querySelector("thead tr");
-  if (!headerRow) return;
-
-  headerRow.innerHTML = `
-    <th>Side</th>
-    <th>Type</th>
-    <th>Strike</th>
-    <th>Expiry</th>
-    <th>Entry Time</th>
-    <th>Premium</th>
-    <th>Lots</th>
-    <th>Qty</th>
-    <th></th>
-  `;
-}
-
-async function loadDefaults() {
-  ensureExpiryWarning();
-  ensureMetricsCards();
-  ensurePositionsHeaders();
-
-  const data = await fetchJson(`/api/defaults?dataset=${encodeURIComponent(getDataset())}`);
-
-  if (!data.ok) {
-    throw new Error(data.error || "Could not load defaults");
-  }
-
-  appDefaults = data;
-
-  const dateInput = getEl("queryDate");
-  if (dateInput && !dateInput.value) dateInput.value = data.query_date;
-
-  const timeInput = getEl("queryTime");
-  if (timeInput && !timeInput.value) timeInput.value = data.query_time || DEFAULT_TIME;
-
-  return data;
-}
-
-function setRefreshLoading(isLoading) {
-  const refreshBtn = getEl("refreshBtn");
-
-  if (!refreshBtn) return;
-
-  if (!refreshBtn.dataset.originalText) {
-    refreshBtn.dataset.originalText =
-      refreshBtn.innerHTML || "Refresh";
-  }
-
-  refreshBtn.disabled = Boolean(isLoading);
-
-  if (isLoading) {
-    refreshBtn.classList.add("is-loading");
-    refreshBtn.innerHTML = `
-      <span class="button-spinner"></span>
-      Loading...
-    `;
-  } else {
-    refreshBtn.classList.remove("is-loading");
-    refreshBtn.innerHTML =
-      refreshBtn.dataset.originalText || "Refresh";
-  }
-}
-
-async function loadChain(
-  forceReload = false,
-  selectNearestExpiry = false
-) {
-  try {
-    ensureExpiryWarning();
-    ensureMetricsCards();
-    ensurePositionsHeaders();
-
-    const expirySelect = getEl("expirySelect");
-
-    /*
-     * When selectNearestExpiry is true, do not send the
-     * previously selected expiry. This allows the backend
-     * to select the nearest valid expiry for the new date.
-     */
-    const requestedExpiry = selectNearestExpiry
-      ? ""
-      : expirySelect?.value || "";
-
-    const params = new URLSearchParams({
-      dataset: getDataset(),
-      date: getQueryDate(),
-      time: getQueryTime(),
-      interval: String(getInterval()),
-      strike_count: String(getStrikeCount()),
-      expiry_rule: "current expiry",
-      expiry: requestedExpiry,
-      _: String(Date.now())
-    });
-
-    const data = await fetchJson(
-      `/api/chain?${params.toString()}`
-    );
-
-    if (!data.ok) {
-      throw new Error(
-        data.error || "Option chain failed"
-      );
-    }
-
-    chain = Array.isArray(data.rows)
-      ? data.rows
-      : [];
-
-    const warning = getEl("expiryWarning");
-
-    if (
-      warning &&
-      data.query_date &&
-      data.expiry_label
-    ) {
-      const expiryType =
-        getDataset() === "BANKNIFTY"
-          ? "Monthly expiry"
-          : "Selected expiry";
-
-      warning.textContent =
-        `⚠ ${expiryType} payoff is calculated for ` +
-        `${data.expiry_label}. Payoff is valid only at ` +
-        `expiry. Calendar and diagonal spreads are not supported.`;
-    }
-
-    if (Number.isFinite(Number(data.spot))) {
-      setSpot(data.spot);
-    }
-
-    if (
-      Number.isFinite(
-        Number(data.india_vix)
-      )
-    ) {
-      const ivInput = getEl("iv");
-
-      if (ivInput) {
-        ivInput.value =
-          Number(data.india_vix).toFixed(1);
-      }
-    }
-
-    const dteInput = getEl("days");
-
-    if (
-      dteInput &&
-      Number.isFinite(Number(data.dte))
-    ) {
-      dteInput.value = Number(data.dte);
-    }
-
-    const expiryInput =
-      getEl("expiryLabel");
-
-    if (expiryInput) {
-      expiryInput.value =
-        data.expiry_label || "";
-    }
-
-    /*
-     * Update expiry dropdown.
-     *
-     * Normal refresh:
-     *   preserve the user's selected expiry when it is
-     *   still available.
-     *
-     * Date change:
-     *   select the expiry returned by the backend,
-     *   which should be the nearest valid expiry.
-     */
-    if (
-      expirySelect &&
-      Array.isArray(data.available_expiries)
-    ) {
-      const previousExpiry =
-        expirySelect.value || "";
-
-      expirySelect.innerHTML = "";
-
-      data.available_expiries.forEach(
-        expiry => {
-          const option =
-            document.createElement("option");
-
-          option.value =
-            String(expiry.value || "");
-
-          option.textContent =
-            expiry.label ||
-            expiry.value ||
-            "";
-
-          expirySelect.appendChild(option);
-        }
-      );
-
-      const availableValues =
-        Array.from(expirySelect.options)
-          .map(option => option.value);
-
-      if (
-        !selectNearestExpiry &&
-        previousExpiry &&
-        availableValues.includes(
-          previousExpiry
+    if _env_bool("TRUST_PROXY_HEADERS", True):
+        flask_app.wsgi_app = ProxyFix(
+            flask_app.wsgi_app,
+            x_for=1,
+            x_proto=1,
+            x_host=1,
+            x_port=1,
         )
-      ) {
-        /*
-         * Manual refresh:
-         * keep the previously selected expiry.
-         */
-        expirySelect.value =
-          previousExpiry;
-      } else if (
-        data.expiry &&
-        availableValues.includes(
-          String(data.expiry)
+    return flask_app
+
+
+app = create_app()
+
+# Validate static configuration at process startup. Historical paths are checked
+# lazily because Blob mode does not require local data directories.
+validate_configuration(require_data_paths=False)
+log_configuration()
+logger.info(
+    "Options Simulator startup: storage_mode=%s data_layout=%s",
+    STORAGE_MODE,
+    DATA_LAYOUT,
+)
+
+
+@app.before_request
+def _before_request():
+    g.request_started_at = time.monotonic()
+    g.request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+
+
+@app.after_request
+def add_response_headers(response):
+    response.headers["X-Request-ID"] = getattr(g, "request_id", uuid.uuid4().hex)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "SAMEORIGIN"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    if request.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    started = getattr(g, "request_started_at", None)
+    if started is not None:
+        response.headers["Server-Timing"] = f'app;dur={(time.monotonic() - started) * 1000:.2f}'
+    return response
+
+
+@app.errorhandler(404)
+def _not_found(_error):
+    if request.path.startswith("/api/"):
+        return jsonify({"ok": False, "error": "Endpoint not found."}), 404
+    return render_template("simulator.html"), 404
+
+
+@app.errorhandler(500)
+def _internal_error(error):
+    logger.exception("Unhandled application error", exc_info=error)
+    return jsonify({"ok": False, "error": "Internal server error."}), 500
+
+
+
+
+def _slice_consolidated_option_data(chain, strike):
+    """Return the standard CE/PE option-data shape for one strike.
+
+    The consolidated chain stores timestamp/strike/ce/pe columns.  Downstream
+    code expects datetime/price/volume frames, so normalize the fast-path
+    result to exactly the same interface as the per-contract fallback loader.
+    """
+    empty = pd.DataFrame(columns=["datetime", "price", "volume"])
+
+    if chain is None or chain.empty:
+        return {"CE": empty.copy(), "PE": empty.copy()}
+
+    required = {"timestamp", "strike"}
+    if not required.issubset(chain.columns):
+        return {"CE": empty.copy(), "PE": empty.copy()}
+
+    strike_value = int(strike)
+    strike_rows = chain.loc[
+        pd.to_numeric(chain["strike"], errors="coerce") == strike_value
+    ]
+
+    result = {}
+    for side, price_column in (("CE", "ce"), ("PE", "pe")):
+        if price_column not in strike_rows.columns:
+            result[side] = empty.copy()
+            continue
+
+        frame = strike_rows[["timestamp", price_column]].rename(
+            columns={"timestamp": "datetime", price_column: "price"}
+        ).copy()
+        frame["datetime"] = pd.to_datetime(frame["datetime"], errors="coerce")
+        frame["price"] = pd.to_numeric(frame["price"], errors="coerce")
+        frame["volume"] = 0
+        frame = (
+            frame.dropna(subset=["datetime", "price"])
+            .sort_values("datetime")
+            .reset_index(drop=True)
         )
-      ) {
-        /*
-         * Date changed:
-         * select the nearest expiry chosen by backend.
-         */
-        expirySelect.value =
-          String(data.expiry);
-      } else if (
-        expirySelect.options.length > 0
-      ) {
-        /*
-         * Fallback:
-         * first available expiry.
-         */
-        expirySelect.selectedIndex = 0;
-      }
-    }
+        result[side] = frame[["datetime", "price", "volume"]]
 
-    /*
-     * Keep the existing positions, but update the fixed
-     * quantity according to the currently selected dataset.
-     */
-    legs = legs.map(leg => ({
-      ...leg,
-      qty: getFixedQty()
-    }));
+    return result
 
-    renderChain();
-    renderVolSmile();
-    renderLegs();
 
-    await calculate();
+def _load_option_data_fast(folder, date_str, expiry_str, strike, dataset, chain=None):
+    """Use the consolidated chain first and fall back to contract files.
 
-    return data;
+    Passing ``chain`` lets callers processing many strikes load the consolidated
+    file only once.  A missing consolidated file preserves the existing
+    per-contract behavior.
+    """
+    consolidated = chain
+    if consolidated is None:
+        consolidated = load_consolidated_option_chain(
+            folder=folder,
+            date_str=date_str,
+            expiry_str=expiry_str,
+            instrument=dataset,
+        )
 
-  } catch (err) {
-    console.error(
-      "loadChain error:",
-      err
-    );
+    if consolidated is not None:
+        return _slice_consolidated_option_data(consolidated, strike)
 
-    chain = [];
+    return load_required_option_data_for_date(
+        folder=folder,
+        date_str=date_str,
+        expiry_str=expiry_str,
+        strike=int(strike),
+        instrument=dataset,
+    )
 
-    renderChain();
 
-    alert(
-      err.message ||
-      "Failed to load option chain"
-    );
-
-    return null;
-  }
+LOT_SIZE_BY_INSTRUMENT = {
+    "NIFTY": 65,
+    "SENSEX": 20,
 }
 
+DEFAULT_QUERY_TIME = "09:30"
 
-let optionMetricChart = null;
-let optionMetricSeries = null;
 
-async function openOptionMetricChart(event, strike, metric) {
-  event.preventDefault();
+MAX_ALLOWED_QUERY_DATE = date.max
 
-  const modal = getEl("chartModal");
-  const container = getEl("fullscreenIndexChart");
+# Number of candles to keep before and after selected candle.
+WINDOW_CANDLES_BEFORE = max(0, int(os.getenv("WINDOW_CANDLES_BEFORE", "10")))
+WINDOW_CANDLES_AFTER = max(0, int(os.getenv("WINDOW_CANDLES_AFTER", "10")))
 
-  if (!modal || !container || typeof LightweightCharts === "undefined") {
-    alert("Chart modal not found");
-    return;
-  }
+# Max option-window entries kept in RAM.
+# One entry is for one instrument/date/expiry/strike/CE-or-PE/interval/target-time.
+MAX_OPTION_WINDOW_CACHE_SIZE = max(1, int(os.getenv("OPTION_WINDOW_CACHE_SIZE", "500")))
 
-    modal.style.display = "block";
+# Max spot candle-day entries kept in RAM.
+MAX_SPOT_CANDLE_CACHE_SIZE = max(1, int(os.getenv("SPOT_CANDLE_CACHE_SIZE", "50")))
 
-    const startDate = getEl("indexChartStartDate");
-    const startTime = getEl("indexChartStartTime");
-    const endDate = getEl("indexChartEndDate");
-    const endTime = getEl("indexChartEndTime");
-    const intervalSelect = getEl("indexChartInterval");
+OPTION_WINDOW_CACHE: "OrderedDict[Tuple[Any, ...], pd.DataFrame]" = OrderedDict()
+SPOT_CANDLE_CACHE: "OrderedDict[Tuple[Any, ...], pd.DataFrame]" = OrderedDict()
+OPTION_WINDOW_CACHE_LOCK = threading.RLock()
+SPOT_CANDLE_CACHE_LOCK = threading.RLock()
 
-    const applyBtn = getEl("indexChartApplyBtn");
+# Complete option-chain payload cache. This avoids repeating spot resolution,
+# chain lookup, IV solving and JSON preparation for identical historical requests.
+MAX_CHAIN_SNAPSHOT_CACHE_SIZE = max(
+    1,
+    int(os.getenv("CHAIN_SNAPSHOT_CACHE_SIZE", "256")),
+)
+CHAIN_SNAPSHOT_CACHE_TTL_SECONDS = max(
+    0.0,
+    float(os.getenv("CHAIN_SNAPSHOT_CACHE_TTL_SECONDS", "900")),
+)
+CHAIN_SNAPSHOT_CACHE: "OrderedDict[Tuple[Any, ...], Tuple[float, Dict[str, Any]]]" = OrderedDict()
+CHAIN_SNAPSHOT_CACHE_LOCK = threading.RLock()
 
-    if (applyBtn) {
-      applyBtn.dataset.chart = "option";
-      applyBtn.dataset.strike = String(strike);
-      applyBtn.dataset.metric = metric;
+
+def _get_chain_snapshot_cache(key: Tuple[Any, ...]) -> Optional[Dict[str, Any]]:
+    now = time.monotonic()
+    with CHAIN_SNAPSHOT_CACHE_LOCK:
+        item = CHAIN_SNAPSHOT_CACHE.get(key)
+        if item is None:
+            return None
+
+        created_at, payload = item
+        if (
+            CHAIN_SNAPSHOT_CACHE_TTL_SECONDS > 0
+            and now - created_at >= CHAIN_SNAPSHOT_CACHE_TTL_SECONDS
+        ):
+            CHAIN_SNAPSHOT_CACHE.pop(key, None)
+            return None
+
+        CHAIN_SNAPSHOT_CACHE.move_to_end(key)
+        return copy.deepcopy(payload)
+
+
+def _put_chain_snapshot_cache(
+    key: Tuple[Any, ...],
+    payload: Dict[str, Any],
+) -> None:
+    with CHAIN_SNAPSHOT_CACHE_LOCK:
+        CHAIN_SNAPSHOT_CACHE[key] = (time.monotonic(), copy.deepcopy(payload))
+        CHAIN_SNAPSHOT_CACHE.move_to_end(key)
+        while len(CHAIN_SNAPSHOT_CACHE) > MAX_CHAIN_SNAPSHOT_CACHE_SIZE:
+            CHAIN_SNAPSHOT_CACHE.popitem(last=False)
+
+
+def _clear_chain_snapshot_cache() -> None:
+    with CHAIN_SNAPSHOT_CACHE_LOCK:
+        CHAIN_SNAPSHOT_CACHE.clear()
+
+
+# Completed option-metric chart payloads are cached separately because a chart
+# request can involve full-session resampling plus IV/Greek calculation.
+MAX_METRIC_CHART_CACHE_SIZE = max(
+    1,
+    int(os.getenv("METRIC_CHART_CACHE_SIZE", "256")),
+)
+METRIC_CHART_CACHE_TTL_SECONDS = max(
+    0.0,
+    float(os.getenv("METRIC_CHART_CACHE_TTL_SECONDS", "900")),
+)
+METRIC_CHART_CACHE: "OrderedDict[Tuple[Any, ...], Tuple[float, Dict[str, Any]]]" = OrderedDict()
+METRIC_CHART_CACHE_LOCK = threading.RLock()
+
+
+def _get_metric_chart_cache(key: Tuple[Any, ...]) -> Optional[Dict[str, Any]]:
+    now = time.monotonic()
+    with METRIC_CHART_CACHE_LOCK:
+        item = METRIC_CHART_CACHE.get(key)
+        if item is None:
+            return None
+        created_at, payload = item
+        if (
+            METRIC_CHART_CACHE_TTL_SECONDS > 0
+            and now - created_at >= METRIC_CHART_CACHE_TTL_SECONDS
+        ):
+            METRIC_CHART_CACHE.pop(key, None)
+            return None
+        METRIC_CHART_CACHE.move_to_end(key)
+        return copy.deepcopy(payload)
+
+
+def _put_metric_chart_cache(key: Tuple[Any, ...], payload: Dict[str, Any]) -> None:
+    with METRIC_CHART_CACHE_LOCK:
+        METRIC_CHART_CACHE[key] = (time.monotonic(), copy.deepcopy(payload))
+        METRIC_CHART_CACHE.move_to_end(key)
+        while len(METRIC_CHART_CACHE) > MAX_METRIC_CHART_CACHE_SIZE:
+            METRIC_CHART_CACHE.popitem(last=False)
+
+
+def _clear_metric_chart_cache() -> None:
+    with METRIC_CHART_CACHE_LOCK:
+        METRIC_CHART_CACHE.clear()
+
+
+
+# Speed mode: IV/Greeks calculation is expensive.
+# Default OFF for faster simulation. Set ENABLE_IV_CALC=true to enable it.
+ENABLE_IV_CALC = _env_bool("ENABLE_IV_CALC", True)
+
+# Redis configuration
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+REDIS_REQUIRED = _env_bool("REDIS_REQUIRED", False)
+
+redis_client = None
+if redis is not None:
+    try:
+        redis_client = redis.Redis.from_url(
+            REDIS_URL,
+            decode_responses=True,
+            socket_connect_timeout=float(
+                os.getenv("REDIS_CONNECT_TIMEOUT_SECONDS", "2")
+            ),
+            socket_timeout=float(
+                os.getenv("REDIS_SOCKET_TIMEOUT_SECONDS", "3")
+            ),
+            health_check_interval=30,
+            retry_on_timeout=True,
+        )
+        redis_client.ping()
+        logger.info("Redis connection established.")
+    except Exception as exc:
+        redis_client = None
+        if REDIS_REQUIRED:
+            raise RuntimeError(
+                f"Redis is required but unavailable: {exc}"
+            ) from exc
+        logger.warning(
+            "Redis unavailable; async IV-surface routes will return 503: %s",
+            exc,
+        )
+elif REDIS_REQUIRED:
+    raise RuntimeError("redis package is required but not installed.")
+
+
+
+# =========================================================
+# BASIC HELPERS
+# =========================================================
+
+def _json_error(message: str, status: int = 400, **extra):
+    payload = {"ok": False, "error": message}
+    payload.update(extra)
+    return jsonify(payload), status
+
+
+def _normalize_dataset(value: Optional[str]) -> str:
+    """
+    Normalize frontend instrument names into the names used by
+    data_engine_for_simulation.py and Azure Parquet files.
+    """
+
+    value = (
+        str(value or "NIFTY")
+        .strip()
+        .upper()
+        .replace("-", "")
+        .replace("_", "")
+        .replace(" ", "")
+    )
+
+    aliases = {
+        "NIFTY": "NIFTY",
+        "NIFTY50": "NIFTY",
+
+        "BANKNIFTY": "BANKNIFTY",
+        "NIFTYBANK": "BANKNIFTY",
+        "BANKNIFTYINDEX": "BANKNIFTY",
+
+        "SENSEX": "SENSEX",
+        "BSE": "SENSEX",
+        "BSESENSEX": "SENSEX",
     }
 
-  if (startDate && !startDate.value) startDate.value = getQueryDate();
-  if (startTime && !startTime.value) startTime.value = "09:15";
+    normalized = aliases.get(value)
 
-  if (endDate && !endDate.dataset.userChanged) endDate.value = getQueryDate();
-  if (endTime && !endTime.dataset.userChanged) endTime.value = getQueryTime();
+    if normalized is None:
+        raise ValueError(
+            f"Unsupported dataset/instrument: {value}"
+        )
 
-  if (startTime && !startTime.dataset.changeAttached) {
-    startTime.addEventListener("change", () => {
-      startTime.dataset.userChanged = "true";
-    });
-    startTime.dataset.changeAttached = "true";
-  }
+    return normalized
 
-  if (endDate && !endDate.dataset.changeAttached) {
-    endDate.addEventListener("change", () => {
-      endDate.dataset.userChanged = "true";
-    });
-    endDate.dataset.changeAttached = "true";
-  }
 
-  if (endTime && !endTime.dataset.changeAttached) {
-    endTime.addEventListener("change", () => {
-      endTime.dataset.userChanged = "true";
-    });
-    endTime.dataset.changeAttached = "true";
-  }
+def _normalize_date(value: Optional[str]) -> str:
+    if not value:
+        raise ValueError("date/query_date is required.")
 
-  const isLtp = metric === "ce_ltp" || metric === "pe_ltp";
-  const side = metric === "ce_ltp" ? "CE" : "PE";
+    text = str(value).strip()
 
-  const chartTitle = modal.querySelector("h2");
-  const expiryText =
-    getEl("expirySelect")?.selectedOptions?.[0]?.textContent ||
-    getEl("expirySelect")?.value ||
-    "";
+    formats = [
+        "%Y-%m-%d",
+        "%Y%m%d",
+        "%d-%b-%Y",
+        "%d %b %Y",
+        "%d-%B-%Y",
+        "%d %B %Y",
+        "%d/%m/%Y",
+        "%d-%m-%Y",
+    ]
 
-  if (chartTitle) {
-    if (metric === "ce_ltp") {
-      chartTitle.textContent = `CE ${strike} ${expiryText} LTP Chart`;
-    } else if (metric === "pe_ltp") {
-      chartTitle.textContent = `PE ${strike} ${expiryText} LTP Chart`;
-    } else {
-      chartTitle.textContent = `${String(metric).toUpperCase()} ${strike} Chart`;
-    }
-  }
+    for fmt in formats:
+        try:
+            return datetime.strptime(text, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
 
-  let data;
+    raise ValueError(f"Unsupported date format: {value}")
 
-  if (isLtp) {
-    const candleParams = new URLSearchParams({
-      dataset: getDataset(),
-      date: startDate?.value || getQueryDate(),
-      start_time: startTime?.value || "09:15",
-      end_date: endDate?.value || getQueryDate(),
-      end_time: endTime?.value || getQueryTime(),
-      interval: intervalSelect?.value || String(getInterval()),
-      strike: String(strike),
-      side: side,
-      expiry: getEl("expirySelect")?.value || "",
-      _: String(Date.now())
-    });
 
-    data = await fetchJson(`/api/option-ltp-candle-chart?${candleParams.toString()}`);
-  } else {
-    const params = new URLSearchParams({
-      dataset: getDataset(),
-      date: startDate?.value || getQueryDate(),
-      start_time: startTime?.value || "09:15",
-      end_date: endDate?.value || getQueryDate(),
-      end_time: endTime?.value || getQueryTime(),
-      interval: intervalSelect?.value || String(getInterval()),
-      strike: String(strike),
-      metric: metric,
-      expiry: getEl("expirySelect")?.value || "",
-      _: String(Date.now())
-    });
+def _normalize_time(value: Optional[str], default: str = DEFAULT_QUERY_TIME) -> str:
+    if not value:
+        return default
 
-    data = await fetchJson(`/api/option-metric-chart?${params.toString()}`);
-  }
+    text = str(value).strip().lower()
 
-  if (!data.ok || !data.rows || !data.rows.length) {
-    alert("No chart data found");
-    return;
-  }
+    formats = [
+        "%H:%M",
+        "%H:%M:%S",
+        "%H",
+        "%I:%M%p",
+        "%I:%M %p",
+        "%I%p",
+        "%I %p",
+    ]
 
-  if (fullscreenChart) {
-    fullscreenChart.remove();
-    fullscreenChart = null;
-    fullscreenSeries = null;
-  }
+    for fmt in formats:
+        try:
+            return datetime.strptime(text, fmt).strftime("%H:%M")
+        except ValueError:
+            pass
 
-  container.innerHTML = "";
+    raise ValueError(f"Unsupported time format: {value}")
 
-  fullscreenChart = LightweightCharts.createChart(container, {
-    width: container.clientWidth,
-    height: container.clientHeight,
-    layout: {
-      background: { color: "#ffffff" },
-      textColor: "#222"
-    },
-    grid: {
-      vertLines: { color: "#eef2f7" },
-      horzLines: { color: "#eef2f7" }
-    },
-    crosshair: {
-      mode: LightweightCharts.CrosshairMode.Normal
-    },
-    timeScale: {
-      timeVisible: true,
-      secondsVisible: false
-    }
-  });
 
-  if (isLtp) {
-    fullscreenSeries = fullscreenChart.addCandlestickSeries({
-      upColor: "#16a34a",
-      downColor: "#dc2626",
-      borderUpColor: "#16a34a",
-      borderDownColor: "#dc2626",
-      wickUpColor: "#16a34a",
-      wickDownColor: "#dc2626"
-    });
+def _safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
+    try:
+        if value is None or pd.isna(value):
+            return default
+        value = float(value)
+        if not np.isfinite(value):
+            return default
+        return value
+    except Exception:
+        return default
 
-    fullscreenSeries.setData(data.rows || []);
 
-    advancedCharts.option.chart = fullscreenChart;
-    advancedCharts.option.candleSeries = fullscreenSeries;
-    advancedCharts.option.rows = data.rows || [];
+def _safe_int(value: Any, default: Optional[int] = None) -> Optional[int]:
+    try:
+        if value is None or pd.isna(value):
+            return default
+        return int(float(value))
+    except Exception:
+        return default
 
-    if (!Array.isArray(advancedCharts.option.indicators)) {
-      advancedCharts.option.indicators = [];
-    }
-    advancedCharts.option.indicators.forEach(indicator => { indicator.series = []; });
-    redrawChartIndicators("option");
 
-    attachOhlcBox(
-      fullscreenChart,
-      fullscreenSeries,
-      container,
-      "optionOhlcBox"
-    );
-  } else {
-    fullscreenSeries = fullscreenChart.addLineSeries({
-      lineWidth: 2
-    });
+def _round_or_none(value: Any, digits: int = 2):
+    value = _safe_float(value)
+    if value is None:
+        return None
+    return round(value, digits)
 
-    fullscreenSeries.setData(
-      data.rows.map(r => ({
-        time: r.time,
-        value: r.value
-      }))
-    );
-  }
 
-  fullscreenChart.timeScale().fitContent();
-}
-function renderChain() {
-  const body = getEl("chainBody");
-  if (!body) return;
+def _fmt_expiry_label(expiry_yyMMdd: str) -> str:
+    try:
+        return datetime.strptime(str(expiry_yyMMdd), "%y%m%d").strftime("%d %b %Y")
+    except Exception:
+        return str(expiry_yyMMdd)
 
-  body.innerHTML = "";
 
-  if (!chain.length) {
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td colspan="7" style="text-align:center;padding:14px;color:#777;">
-        No option chain data loaded
-      </td>
-    `;
-    body.appendChild(tr);
-    return;
-  }
+def _to_ist_timestamp(value: Any) -> pd.Timestamp:
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is None:
+        return ts.tz_localize(IST)
+    return ts.tz_convert(IST)
 
-  for (const row of chain) {
-    const ceLtp = Number(row.ce_ltp || 0);
-    const peLtp = Number(row.pe_ltp || 0);
 
-    const tr = document.createElement("tr");
-    if (row.atm) tr.classList.add("atm");
+def _cache_lock(cache: OrderedDict) -> threading.RLock:
+    return OPTION_WINDOW_CACHE_LOCK if cache is OPTION_WINDOW_CACHE else SPOT_CANDLE_CACHE_LOCK
 
-    tr.innerHTML = `
-  <td class="clickable"
-      onclick="addLeg('BUY','CE',${row.strike},${ceLtp})"
-      oncontextmenu="openOptionMetricChart(event, ${row.strike}, 'ce_ltp')">
-      ${row.ce_ltp ?? "-"}
-  </td>
 
-  <td class="clickable"
-      oncontextmenu="openOptionMetricChart(event, ${row.strike}, 'ce_delta')">
-      ${row.ce_delta ?? "-"}
-  </td>
+def _touch_cache(cache: OrderedDict, key: Tuple[Any, ...], value: pd.DataFrame, max_size: int) -> None:
+    with _cache_lock(cache):
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > max_size:
+            cache.popitem(last=False)
 
-  <td class="clickable"
-      oncontextmenu="openOptionMetricChart(event, ${row.strike}, 'ce_iv')">
-      ${row.ce_iv ?? "-"}
-  </td>
 
-  <td>
-    <b>${row.strike}</b>
-    ${row.atm ? '<span class="atm-badge">ATM</span>' : ""}
-  </td>
+def _get_cache(cache: OrderedDict, key: Tuple[Any, ...]) -> Optional[pd.DataFrame]:
+    with _cache_lock(cache):
+        value = cache.get(key)
+        if value is not None:
+            cache.move_to_end(key)
+        return value
 
-  <td class="clickable"
-      oncontextmenu="openOptionMetricChart(event, ${row.strike}, 'pe_iv')">
-      ${row.pe_iv ?? "-"}
-  </td>
 
-  <td class="clickable"
-      oncontextmenu="openOptionMetricChart(event, ${row.strike}, 'pe_delta')">
-      ${row.pe_delta ?? "-"}
-  </td>
+# =========================================================
+# DATA RESOLUTION CACHE
+# =========================================================
 
-  <td class="clickable"
-      onclick="addLeg('BUY','PE',${row.strike},${peLtp})"
-      oncontextmenu="openOptionMetricChart(event, ${row.strike}, 'pe_ltp')">
-      ${row.pe_ltp ?? "-"}
-  </td>
-`;
+MAX_DATA_RESOLUTION_CACHE_SIZE = max(1, int(os.getenv("DATA_RESOLUTION_CACHE_SIZE", "256")))
+DATA_RESOLUTION_CACHE_TTL_SECONDS = max(0.0, float(os.getenv("DATA_RESOLUTION_CACHE_TTL_SECONDS", "3600")))
+DATA_RESOLUTION_CACHE: "OrderedDict[Tuple[Any, ...], Tuple[float, Tuple[Any, ...]]]" = OrderedDict()
+DATA_RESOLUTION_CACHE_LOCK = threading.RLock()
 
-    body.appendChild(tr);
-  }
-}
+def _get_data_resolution_cache(key: Tuple[Any, ...]) -> Optional[Tuple[Any, ...]]:
+    now = time.monotonic()
+    with DATA_RESOLUTION_CACHE_LOCK:
+        item = DATA_RESOLUTION_CACHE.get(key)
+        if item is None:
+            return None
+        created_at, value = item
+        if DATA_RESOLUTION_CACHE_TTL_SECONDS > 0 and now - created_at >= DATA_RESOLUTION_CACHE_TTL_SECONDS:
+            DATA_RESOLUTION_CACHE.pop(key, None)
+            return None
+        DATA_RESOLUTION_CACHE.move_to_end(key)
+        return tuple(value)
 
-function renderVolSmile() {
-  const canvas = getEl("volSmileChart");
-  const body = getEl("volSmileBody");
+def _put_data_resolution_cache(key: Tuple[Any, ...], value: Tuple[Any, ...]) -> None:
+    with DATA_RESOLUTION_CACHE_LOCK:
+        DATA_RESOLUTION_CACHE[key] = (time.monotonic(), tuple(value))
+        DATA_RESOLUTION_CACHE.move_to_end(key)
+        while len(DATA_RESOLUTION_CACHE) > MAX_DATA_RESOLUTION_CACHE_SIZE:
+            DATA_RESOLUTION_CACHE.popitem(last=False)
 
-  if (!canvas || !body || typeof Chart === "undefined") return;
+def _clear_data_resolution_cache() -> None:
+    with DATA_RESOLUTION_CACHE_LOCK:
+        DATA_RESOLUTION_CACHE.clear()
 
-  const normalizeIv = value => {
-    const n = Number(value);
-    if (!Number.isFinite(n)) return null;
+# =========================================================
+# DATA RESOLUTION
+# =========================================================
 
-    // Backend may send IV as 0.1925 or 19.25
-    return n <= 1 ? n * 100 : n;
-  };
+def _resolve_week_folder_for_date(
+    query_date: str,
+    dataset: str,
+    week_number: Optional[int] = None,
+) -> Tuple[int, str, str]:
+    """Resolve dataset/date metadata once and reuse it for later time clicks."""
+    query_date = _normalize_date(query_date)
+    dataset = _normalize_dataset(dataset)
+    normalized_week = int(week_number) if week_number is not None else None
+    cache_key = ("date", dataset, query_date, normalized_week)
+    cached = _get_data_resolution_cache(cache_key)
+    if cached is not None:
+        return int(cached[0]), str(cached[1]), str(cached[2])
 
-  const atmFromChain = chain.find(r => r.atm);
-  const atmStrike = atmFromChain ? Number(atmFromChain.strike) : null;
+    target_date = datetime.strptime(query_date, "%Y-%m-%d").date()
+    if target_date > MAX_ALLOWED_QUERY_DATE:
+        raise ValueError(
+            f"Selected date {query_date} is after allowed cutoff "
+            f"{MAX_ALLOWED_QUERY_DATE.strftime('%Y-%m-%d')}."
+        )
+    target_key = target_date.strftime("%Y%m%d")
+    for num, folder in get_week_folders(instrument=dataset):
+        if normalized_week is not None and int(num) != normalized_week:
+            continue
+        available_dates = get_dates_for_week_folder(num, folder, instrument=dataset)
+        if target_key in {str(x) for x in available_dates}:
+            result = (int(num), str(folder), target_key)
+            _put_data_resolution_cache(cache_key, result)
+            return result
+    if normalized_week is not None:
+        raise ValueError(f"{dataset} date {query_date} not found in week {normalized_week}.")
+    raise ValueError(f"{dataset} date {query_date} not found in historical data folders.")
 
-  const getSmileIv = row => {
-    const ce = normalizeIv(row.ce_iv);
-    const pe = normalizeIv(row.pe_iv);
-    const strike = Number(row.strike);
+def _resolve_default_week_date(dataset: str) -> Tuple[int, str, str, str]:
+    """Resolve and cache the latest available trading date."""
+    dataset = _normalize_dataset(dataset)
+    cache_key = ("default", dataset)
+    cached = _get_data_resolution_cache(cache_key)
+    if cached is not None:
+        return int(cached[0]), str(cached[1]), str(cached[2]), str(cached[3])
 
-    if (!atmStrike || !Number.isFinite(strike)) return null;
+    latest_item = None
+    for num, folder in get_week_folders(instrument=dataset):
+        for date_str in get_dates_for_week_folder(num, folder, instrument=dataset):
+            try:
+                dt = datetime.strptime(str(date_str), "%Y%m%d").date()
+            except Exception:
+                continue
+            if dt > MAX_ALLOWED_QUERY_DATE:
+                continue
+            item = (dt, int(num), str(folder), str(date_str))
+            if latest_item is None or item[0] > latest_item[0]:
+                latest_item = item
+    if latest_item is None:
+        raise ValueError(
+            f"No available historical dates found for {dataset} on or before "
+            f"{MAX_ALLOWED_QUERY_DATE.strftime('%Y-%m-%d')}."
+        )
+    dt, week_number, folder, date_str = latest_item
+    result = (week_number, folder, date_str, dt.strftime("%Y-%m-%d"))
+    _put_data_resolution_cache(cache_key, result)
+    return result
 
-    // OTM put side
-    if (strike < atmStrike) {
-      return pe;
-    }
+def get_available_expiries_for_date(query_date, dataset="NIFTY", max_months=4):
+    cfg = get_dataset_config(dataset)
+    expiries = pd.to_datetime(cfg["combined_expiry"])
 
-    // OTM call side
-    if (strike > atmStrike) {
-      return ce;
-    }
+    q = pd.Timestamp(query_date).normalize()
+    max_date = q + pd.DateOffset(months=max_months)
 
-    // ATM = average of CE IV and PE IV
-    if (ce !== null && pe !== null) {
-      return (ce + pe) / 2;
-    }
+    valid = expiries[(expiries >= q) & (expiries <= max_date)]
 
-    return ce ?? pe;
-  };
-
-  const rows = chain
-    .filter(r => r.strike && getSmileIv(r) !== null)
-    .sort((a, b) => Number(a.strike) - Number(b.strike));
-
-  body.innerHTML = "";
-
-  rows.forEach(row => {
-    const cePct = normalizeIv(row.ce_iv);
-    const pePct = normalizeIv(row.pe_iv);
-    const smilePct = getSmileIv(row);
-
-    const tr = document.createElement("tr");
-    if (row.atm) tr.classList.add("atm");
-
-    tr.innerHTML = `
-      <td><b>${row.strike}</b>${row.atm ? ' <span class="atm-badge">ATM</span>' : ""}</td>
-      <td>${cePct !== null ? cePct.toFixed(2) : "-"}</td>
-      <td>${pePct !== null ? pePct.toFixed(2) : "-"}</td>
-      <td>${smilePct !== null ? smilePct.toFixed(2) : "-"}</td>
-    `;
-
-    body.appendChild(tr);
-  });
-
-  if (volSmileChart) volSmileChart.destroy();
-
-  const atmLinePlugin = {
-    id: "atmLine",
-    afterDraw(chart) {
-      if (!atmStrike) return;
-
-      const xScale = chart.scales.x;
-      const yScale = chart.scales.y;
-
-      const atmIndex = rows.findIndex(
-        r => Number(r.strike) === atmStrike
-      );
-
-      if (atmIndex < 0) return;
-
-      const x = xScale.getPixelForValue(atmIndex);
-      const ctx = chart.ctx;
-
-      ctx.save();
-
-      ctx.beginPath();
-      ctx.strokeStyle = "#111827";
-      ctx.lineWidth = 2.5;
-      ctx.setLineDash([]);
-
-      ctx.moveTo(x, yScale.top);
-      ctx.lineTo(x, yScale.bottom);
-      ctx.stroke();
-
-      ctx.fillStyle = "#111827";
-      ctx.font = "bold 12px Arial";
-      ctx.textAlign = "left";
-      ctx.fillText(`ATM ${atmStrike}`, x + 8, yScale.top + 16);
-
-      ctx.restore();
-    }
-  };
-
-  volSmileChart = new Chart(canvas.getContext("2d"), {
-    type: "line",
-    plugins: [atmLinePlugin],
-    data: {
-      labels: rows.map(r => r.strike),
-      datasets: [
+    return [
         {
-          label: "OTM IV Smile",
-          data: rows.map(r => getSmileIv(r)),
-          borderWidth: 3,
-          tension: 0.35,
-          spanGaps: true,
-          pointRadius: 4,
-          pointHoverRadius: 6
+            "value": pd.Timestamp(x).strftime("%y%m%d"),
+            "label": pd.Timestamp(x).strftime("%d %b %Y"),
         }
-      ]
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      spanGaps: true,
-      plugins: {
-        legend: {
-          position: "top",
-          align: "start"
-        }
-      },
-      scales: {
-        y: {
-          title: {
-            display: true,
-            text: "Implied Volatility (%)"
-          }
-        },
-        x: {
-          title: {
-            display: true,
-            text: "Strike"
-          }
-        }
-      }
-    }
-  });
-}
+        for x in valid
+    ]
 
-async function renderIvSurface() {
-  const container = getEl("ivSurfaceChart");
+# =========================================================
+# WINDOW / RAM CACHE HELPERS
+# =========================================================
 
-  if (!container) {
-    console.error("IV Surface container not found: #ivSurfaceChart");
-    return;
-  }
+def _window_time_bounds(
+    target_ts: pd.Timestamp,
+    candle_interval_minutes: int,
+    before: int = WINDOW_CANDLES_BEFORE,
+    after: int = WINDOW_CANDLES_AFTER,
+) -> Tuple[pd.Timestamp, pd.Timestamp]:
+    """
+    Returns a time range wide enough to build:
+        before candles + target candle + after candles.
 
-  if (typeof Plotly === "undefined") {
-    container.innerHTML = "<p>Plotly library is not loaded.</p>";
-    console.error("Plotly is not loaded.");
-    return;
-  }
+    We add a small buffer of one interval on both sides so resampling has enough ticks.
+    """
+    target_ts = _to_ist_timestamp(target_ts)
+    interval = int(candle_interval_minutes)
 
-  /*
-   * Every invocation gets its own generation number. If the user changes the
-   * date/time and starts another request, an older response is ignored instead
-   * of replacing the newer chart.
-   */
-  const requestGeneration = ++ivSurfaceRequestGeneration;
-  const isCurrentRequest = () =>
-    requestGeneration === ivSurfaceRequestGeneration;
+    start_ts = target_ts - timedelta(minutes=(before + 1) * interval)
+    end_ts = target_ts + timedelta(minutes=(after + 1) * interval)
 
-  const sleep = milliseconds =>
-    new Promise(resolve => setTimeout(resolve, milliseconds));
+    return start_ts, end_ts
 
-  const readyStatuses = new Set([
-    "ready",
-    "ready_with_errors"
-  ]);
 
-  const pendingStatuses = new Set([
-    "queued",
-    "processing",
-    "pending",
-    "running"
-  ]);
+def _prepare_tick_df(raw_df: pd.DataFrame) -> pd.DataFrame:
+    if raw_df is None or raw_df.empty:
+        return pd.DataFrame()
 
-  const renderStatus = message => {
-    if (isCurrentRequest()) {
-      container.innerHTML = `<p>${message}</p>`;
-    }
-  };
+    if "datetime" not in raw_df.columns or "price" not in raw_df.columns:
+        return pd.DataFrame()
 
-  try {
-    const params = new URLSearchParams({
-      dataset: getDataset(),
-      date: getQueryDate(),
-      time: getQueryTime(),
-      interval: String(getInterval()),
-      strike_count: String(getStrikeCount()),
-      max_months: "4",
-      _: String(Date.now())
-    });
+    df = raw_df[["datetime", "price"]].copy()
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    df = df.dropna(subset=["datetime", "price"])
 
-    renderStatus("Building IV surface...");
+    if df.empty:
+        return pd.DataFrame()
 
-    let finalData = await fetchJson(
-      `/api/iv-surface?${params.toString()}`
-    );
+    df = df.sort_values("datetime")
 
-    if (!isCurrentRequest()) return;
+    if getattr(df["datetime"].dt, "tz", None) is None:
+        df["datetime"] = df["datetime"].dt.tz_localize(IST)
+    else:
+        df["datetime"] = df["datetime"].dt.tz_convert(IST)
 
-    /*
-     * The ThreadPool backend normally returns:
-     *   status = "queued" on the initial request,
-     *   status = "processing" while calculating,
-     *   status = "ready" or "ready_with_errors" when complete.
-     *
-     * The old code only polled when the initial status was "processing".
-     * Therefore a normal "queued" response was treated as the final response,
-     * causing the false "No IV surface data returned" error.
-     */
-    if (
-      pendingStatuses.has(String(finalData?.status || "").toLowerCase()) &&
-      finalData?.job_id
-    ) {
-      const jobId = encodeURIComponent(String(finalData.job_id));
-      const maximumAttempts = 120;
-      const pollIntervalMs = 1000;
+    return df
 
-      let completed = false;
 
-      for (let attempt = 1; attempt <= maximumAttempts; attempt += 1) {
-        if (!isCurrentRequest()) return;
+def _build_option_candle_window(
+    raw_df: pd.DataFrame,
+    target_ts: pd.Timestamp,
+    candle_interval_minutes: int,
+    before: int = WINDOW_CANDLES_BEFORE,
+    after: int = WINDOW_CANDLES_AFTER,
+) -> pd.DataFrame:
+    """
+    Converts raw option ticks into a small OHLC candle window only.
 
-        renderStatus(
-          `Building IV surface... (${attempt}/${maximumAttempts})`
-        );
+    Output keeps at most:
+        before + current + after candles
+    around target_ts.
+    """
+    df = _prepare_tick_df(raw_df)
+    if df.empty:
+        return pd.DataFrame()
 
-        await sleep(pollIntervalMs);
+    target_ts = _to_ist_timestamp(target_ts)
+    start_ts, end_ts = _window_time_bounds(
+        target_ts=target_ts,
+        candle_interval_minutes=candle_interval_minutes,
+        before=before,
+        after=after,
+    )
 
-        if (!isCurrentRequest()) return;
+    df = df[(df["datetime"] >= start_ts) & (df["datetime"] <= end_ts)]
+    if df.empty:
+        return pd.DataFrame()
 
-        const statusData = await fetchJson(
-          `/api/iv-surface/status/${jobId}?_=${Date.now()}`
-        );
+    df = df.set_index("datetime")
 
-        if (!isCurrentRequest()) return;
+    ohlc = df["price"].resample(f"{int(candle_interval_minutes)}min").ohlc()
+    ohlc.columns = ["open", "high", "low", "close"]
+    ohlc = ohlc.dropna(subset=["close"])
 
-        const status = String(statusData?.status || "").toLowerCase();
+    if ohlc.empty:
+        return pd.DataFrame()
 
-        if (readyStatuses.has(status)) {
-          finalData = statusData;
-          completed = true;
-          break;
-        }
+    # Select nearest candle index at or before target timestamp.
+    earlier = ohlc[ohlc.index <= target_ts]
+    if earlier.empty:
+        center_pos = 0
+    else:
+        center_label = earlier.index[-1]
+        center_pos = int(ohlc.index.get_loc(center_label))
 
-        if (status === "failed") {
-          throw new Error(
-            statusData?.error ||
-            statusData?.detail ||
-            "IV surface job failed."
-          );
-        }
+    start_pos = max(center_pos - before, 0)
+    end_pos = min(center_pos + after + 1, len(ohlc))
 
-        /*
-         * A cached result may be returned without a status transition that the
-         * frontend recognizes. Treat a complete payload as ready.
-         */
-        if (
-          statusData?.ok &&
-          Array.isArray(statusData?.rows) &&
-          statusData.rows.length > 0 &&
-          Array.isArray(statusData?.expiries) &&
-          statusData.expiries.length > 0
-        ) {
-          finalData = statusData;
-          completed = true;
-          break;
-        }
+    window = ohlc.iloc[start_pos:end_pos].copy()
+    window["timestamp"] = window.index
+    return window
 
-        if (!pendingStatuses.has(status) && status !== "done") {
-          throw new Error(
-            statusData?.error ||
-            `Unexpected IV surface job status: ${status || "unknown"}`
-          );
-        }
-      }
 
-      if (!completed) {
-        throw new Error(
-          "IV surface calculation timed out. Please try again."
-        );
-      }
-    }
+def _option_ltp_from_window(
+    window_df: pd.DataFrame,
+    target_ts: pd.Timestamp,
+) -> Optional[float]:
+    if window_df is None or window_df.empty:
+        return None
 
-    if (!isCurrentRequest()) return;
+    target_ts = _to_ist_timestamp(target_ts)
 
-    const hasSurfaceData =
-      finalData &&
-      finalData.ok &&
-      Array.isArray(finalData.strikes) &&
-      finalData.strikes.length > 0 &&
-      Array.isArray(finalData.expiries) &&
-      finalData.expiries.length > 0 &&
-      Array.isArray(finalData.rows) &&
-      finalData.rows.length > 0;
+    df = window_df.copy()
+    if not isinstance(df.index, pd.DatetimeIndex):
+        if "timestamp" not in df.columns:
+            return None
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        df = df.dropna(subset=["timestamp"])
+        df = df.set_index("timestamp")
 
-    if (!hasSurfaceData) {
-      console.error("IV Surface response:", finalData);
-      throw new Error(
-        finalData?.error ||
-        finalData?.detail ||
-        "No IV surface data returned from backend."
-      );
-    }
+    if getattr(df.index, "tz", None) is None:
+        df.index = df.index.tz_localize(IST)
+    else:
+        df.index = df.index.tz_convert(IST)
 
-    const expiries = finalData.expiries
-      .filter(expiry => expiry && (expiry.value || expiry.label))
-      .map(expiry => ({
-        value: String(expiry.value || ""),
-        label: String(expiry.label || expiry.value || "")
-      }));
+    earlier = df[df.index <= target_ts]
+    if earlier.empty:
+        return None
 
-    const normalizedStrikes = [...new Set(
-      finalData.strikes
-        .map(strike => Number(strike))
-        .filter(Number.isFinite)
-    )].sort((left, right) => left - right);
+    return _safe_float(earlier.iloc[-1].get("close"))
 
-    const rows = finalData.rows.filter(row =>
-      row &&
-      row.error === undefined &&
-      row.iv !== undefined &&
-      row.iv !== null &&
-      row.strike !== undefined &&
-      Number.isFinite(Number(row.iv)) &&
-      Number.isFinite(Number(row.strike))
-    );
 
-    if (
-      !normalizedStrikes.length ||
-      !expiries.length ||
-      !rows.length
-    ) {
-      renderStatus("No IV surface data found.");
-      return;
-    }
+def _option_ltp_at_time_cached(
+    raw_df: pd.DataFrame,
+    target_ts: pd.Timestamp,
+    candle_interval_minutes: int,
+    cache_key: Tuple[Any, ...],
+) -> Optional[float]:
+    cached_window = _get_cache(OPTION_WINDOW_CACHE, cache_key)
 
-    /*
-     * Build an O(1) lookup map instead of repeatedly scanning all rows for
-     * every expiry/strike grid point.
-     */
-    const rowLookup = new Map();
-
-    rows.forEach(row => {
-      const expiry = String(row.expiry || "");
-      const strike = Number(row.strike);
-      const iv = Number(row.iv);
-
-      if (!expiry || !Number.isFinite(strike) || !Number.isFinite(iv)) {
-        return;
-      }
-
-      rowLookup.set(`${expiry}|${strike}`, {
-        ...row,
-        expiry,
-        strike,
-        iv
-      });
-    });
-
-    const expiryLabels = expiries.map(expiry => expiry.label);
-
-    const z = expiries.map(expiry =>
-      normalizedStrikes.map(strike => {
-        const row = rowLookup.get(`${expiry.value}|${strike}`);
-        return row ? row.iv : null;
-      })
-    );
-
-    const validGridPoints = z.reduce(
-      (count, values) =>
-        count + values.filter(value => Number.isFinite(Number(value))).length,
-      0
-    );
-
-    if (!validGridPoints) {
-      renderStatus("No valid IV values were available for plotting.");
-      return;
-    }
-
-    const hoverText = expiries.map((expiry, expiryIndex) =>
-      normalizedStrikes.map((strike, strikeIndex) => {
-        const iv = z[expiryIndex][strikeIndex];
-
-        if (!Number.isFinite(Number(iv))) {
-          return "";
-        }
-
-        return (
-          `Strike: ${strike}<br>` +
-          `Expiry: ${expiry.label}<br>` +
-          `IV: ${Number(iv).toFixed(2)}%`
-        );
-      })
-    );
-
-    const surfaceTrace = {
-      type: "surface",
-      name: "IV Surface",
-      x: normalizedStrikes,
-      y: expiryLabels,
-      z,
-      text: hoverText,
-      hoverinfo: "text",
-      colorscale: [
-        [0, "#440154"],
-        [0.25, "#31688e"],
-        [0.5, "#35b779"],
-        [0.75, "#fde725"],
-        [1, "#ffff00"]
-      ],
-      opacity: 0.78,
-      showscale: true,
-      colorbar: {
-        title: "IV %",
-        thickness: 18,
-        len: 0.75
-      },
-      connectgaps: true
-    };
-
-    const lineTraces = expiries
-      .map((expiry, expiryIndex) => {
-        const lineX = [];
-        const lineY = [];
-        const lineZ = [];
-        const lineText = [];
-
-        normalizedStrikes.forEach((strike, strikeIndex) => {
-          const iv = z[expiryIndex][strikeIndex];
-
-          if (Number.isFinite(Number(iv))) {
-            lineX.push(strike);
-            lineY.push(expiry.label);
-            lineZ.push(Number(iv) + 0.05);
-            lineText.push(
-              `Strike: ${strike}<br>` +
-              `Expiry: ${expiry.label}<br>` +
-              `IV: ${Number(iv).toFixed(2)}%`
-            );
-          }
-        });
-
-        if (!lineX.length) return null;
-
-        return {
-          type: "scatter3d",
-          mode: "lines+markers",
-          name: expiry.label,
-          x: lineX,
-          y: lineY,
-          z: lineZ,
-          text: lineText,
-          hoverinfo: "text",
-          line: { width: 10 },
-          marker: { size: 4 }
-        };
-      })
-      .filter(Boolean);
-
-    let pinnedTrace = null;
-
-    if (pinnedIvPoint) {
-      const matched = rows.find(row =>
-        Number(row.strike) === Number(pinnedIvPoint.strike) &&
-        (
-          String(row.expiry_label || "") ===
-            String(pinnedIvPoint.expiryLabel || "") ||
-          String(row.expiry || "") ===
-            String(pinnedIvPoint.expiry || "")
+    if cached_window is None:
+        cached_window = _build_option_candle_window(
+            raw_df=raw_df,
+            target_ts=target_ts,
+            candle_interval_minutes=candle_interval_minutes,
+            before=WINDOW_CANDLES_BEFORE,
+            after=WINDOW_CANDLES_AFTER,
         )
-      );
+        _touch_cache(
+            OPTION_WINDOW_CACHE,
+            cache_key,
+            cached_window,
+            MAX_OPTION_WINDOW_CACHE_SIZE,
+        )
 
-      if (matched) {
-        const expiryLabel =
-          matched.expiry_label ||
-          expiries.find(
-            expiry => String(expiry.value) === String(matched.expiry)
-          )?.label ||
-          matched.expiry ||
-          pinnedIvPoint.expiryLabel;
+    return _option_ltp_from_window(cached_window, target_ts)
 
-        pinnedIvPoint = {
-          strike: Number(matched.strike),
-          expiry: String(matched.expiry || ""),
-          expiryLabel: String(expiryLabel),
-          iv: Number(matched.iv)
-        };
 
-        pinnedTrace = {
-          type: "scatter3d",
-          mode: "markers+text",
-          name: "Pinned Point",
-          x: [Number(matched.strike)],
-          y: [String(expiryLabel)],
-          z: [Number(matched.iv) + 0.35],
-          text: [
-            `Tracking<br>${matched.strike}<br>` +
-            `${Number(matched.iv).toFixed(2)}%`
-          ],
-          textposition: "top center",
-          marker: {
-            size: 9,
-            color: "black",
-            symbol: "circle"
-          },
-          showlegend: false,
-          hoverinfo: "text"
-        };
-      } else {
-        pinnedIvPoint = null;
-      }
-    }
+# =========================================================
+# SPOT CANDLES
+# =========================================================
 
-    const layout = {
-      autosize: true,
-      height: 420,
-      hovermode: "closest",
-      showlegend: true,
-      legend: {
-        orientation: "h",
-        x: 0,
-        y: 1.15,
-        xanchor: "left",
-        yanchor: "bottom"
-      },
-      margin: {
-        l: 0,
-        r: 0,
-        b: 0,
-        t: 50
-      },
-      scene: {
-        xaxis: { title: "Strike" },
-        yaxis: {
-          title: "Expiry",
-          type: "category"
-        },
-        zaxis: { title: "IV (%)" },
-        camera: {
-          eye: {
-            x: 1.7,
-            y: 1.7,
-            z: 1.1
-          }
+def _get_spot_candles_for_day(
+    folder: str,
+    date_str: str,
+    dataset: str,
+    candle_interval_minutes: int,
+) -> pd.DataFrame:
+    """
+    Load and cache spot/index candles for a trading day.
+
+    The resolved week folder must be passed directly to load_tick_data().
+    load_tick_data() internally resolves the IDX_TICK directory and the
+    instrument Parquet file for both local and Azure Blob storage.
+    """
+
+    folder = str(folder).strip()
+    date_str = str(date_str).strip()
+    dataset = str(dataset).strip().upper()
+    candle_interval_minutes = int(candle_interval_minutes)
+
+    if not folder:
+        raise ValueError("folder cannot be empty")
+
+    if not date_str:
+        raise ValueError("date_str cannot be empty")
+
+    if not dataset:
+        raise ValueError("dataset cannot be empty")
+
+    if candle_interval_minutes <= 0:
+        raise ValueError(
+            "candle_interval_minutes must be greater than zero"
+        )
+
+    cache_key = (
+        "spot",
+        dataset,
+        date_str,
+        candle_interval_minutes,
+        folder,
+    )
+
+    cached = _get_cache(SPOT_CANDLE_CACHE, cache_key)
+
+    if cached is not None:
+        return cached.copy()
+
+    try:
+        # Date-aware loader supports the production layout:
+        #
+        #   <week_folder>/IDX_TICK/<YYYYMMDD>/<SYMBOL>.parquet
+        #
+        # It also preserves compatibility with older flat layouts through the
+        # path-resolution logic inside data_engine_for_simulation.py.
+        tick_df = load_index_data_by_symbol(
+            folder=folder,
+            date_str=date_str,
+            symbol_name=dataset,
+        )
+
+    except Exception:
+        logger.exception(
+            "Failed to load spot tick data: "
+            "dataset=%s date=%s folder=%s",
+            dataset,
+            date_str,
+            folder,
+        )
+        return pd.DataFrame()
+
+    if tick_df is None or tick_df.empty:
+        logger.warning(
+            "No spot tick data found: "
+            "dataset=%s date=%s folder=%s",
+            dataset,
+            date_str,
+            folder,
+        )
+        return pd.DataFrame()
+
+    try:
+        candles = create_candles(
+            tick_df,
+            candle_interval_minutes,
+        )
+
+    except Exception:
+        logger.exception(
+            "Failed to create spot candles: "
+            "dataset=%s date=%s interval=%s",
+            dataset,
+            date_str,
+            candle_interval_minutes,
+        )
+        return pd.DataFrame()
+
+    if candles is None or candles.empty:
+        logger.warning(
+            "Spot candle creation returned no rows: "
+            "dataset=%s date=%s interval=%s",
+            dataset,
+            date_str,
+            candle_interval_minutes,
+        )
+        return pd.DataFrame()
+
+    candles = candles.copy()
+
+    _touch_cache(
+        SPOT_CANDLE_CACHE,
+        cache_key,
+        candles,
+        MAX_SPOT_CANDLE_CACHE_SIZE,
+    )
+
+    return candles.copy()
+
+def _nearest_candle_row(
+    candles: pd.DataFrame,
+    date_str: str,
+    query_time: str,
+):
+    target_ts = IST.localize(
+        datetime.strptime(
+            f"{date_str} {query_time}:00",
+            "%Y%m%d %H:%M:%S",
+        )
+    )
+
+    if candles.empty:
+        raise ValueError("No spot candles available.")
+
+    candles = candles.copy()
+    if getattr(candles.index, "tz", None) is None:
+        candles.index = candles.index.tz_localize(IST)
+    else:
+        candles.index = candles.index.tz_convert(IST)
+
+    if target_ts in candles.index:
+        return target_ts, candles.loc[target_ts]
+
+    earlier = candles[candles.index <= target_ts]
+
+    if earlier.empty:
+        raise ValueError(f"No spot candle found at or before {query_time}.")
+
+    ts = earlier.index[-1]
+    return ts, candles.loc[ts]
+
+
+def _resample_option_close_for_session(
+    raw_df: pd.DataFrame,
+    interval_minutes: int,
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+) -> pd.Series:
+    """Return a full-session option close series aligned to session candles.
+
+    Unlike the small UI window helper, this function does not truncate the
+    morning session. That truncation was the reason early times such as 09:48
+    produced an empty PE_DELTA chart when the window was centered at 15:30.
+    """
+    if raw_df is None or raw_df.empty:
+        return pd.Series(dtype="float64")
+    if "datetime" not in raw_df.columns or "price" not in raw_df.columns:
+        return pd.Series(dtype="float64")
+
+    frame = raw_df.loc[:, ["datetime", "price"]].copy()
+    frame["datetime"] = pd.to_datetime(frame["datetime"], errors="coerce")
+    frame["price"] = pd.to_numeric(frame["price"], errors="coerce")
+    frame = frame.dropna(subset=["datetime", "price"])
+    if frame.empty:
+        return pd.Series(dtype="float64")
+
+    if getattr(frame["datetime"].dt, "tz", None) is None:
+        frame["datetime"] = frame["datetime"].dt.tz_localize(
+            IST, ambiguous="NaT", nonexistent="NaT"
+        )
+    else:
+        frame["datetime"] = frame["datetime"].dt.tz_convert(IST)
+    frame = frame.dropna(subset=["datetime"])
+    frame = frame[
+        (frame["datetime"] >= _to_ist_timestamp(start_ts))
+        & (frame["datetime"] <= _to_ist_timestamp(end_ts))
+    ]
+    if frame.empty:
+        return pd.Series(dtype="float64")
+
+    session_offset = pd.Timedelta(hours=9, minutes=15)
+    return (
+        frame.set_index("datetime")["price"]
+        .sort_index()
+        .resample(
+            f"{int(interval_minutes)}min",
+            origin="start_day",
+            offset=session_offset,
+            label="left",
+            closed="left",
+        )
+        .last()
+        .dropna()
+    )
+
+
+# =========================================================
+# OPTION CHAIN BUILDER
+# =========================================================
+
+def build_option_chain_snapshot(
+    query_date: Optional[str] = None,
+    query_time: str = DEFAULT_QUERY_TIME,
+    dataset: str = "NIFTY",
+    week_number: Optional[int] = None,
+    expiry_rule: str = "current expiry",
+    strike_count_each_side: int = 14,
+    candle_interval_minutes: int = CANDLE_INTERVAL_MINUTES,
+    spot_price_field: str = "close",
+    selected_expiry: Optional[str] = None,
+    compute_greeks: bool = True,
+) -> Dict[str, Any]:
+    """Build one historical option-chain snapshot with profiling and caching."""
+
+    total_started = time.perf_counter()
+    timings: Dict[str, float] = {}
+
+    dataset = _normalize_dataset(dataset)
+    query_time = _normalize_time(query_time)
+    candle_interval_minutes = int(candle_interval_minutes)
+    strike_count_each_side = int(strike_count_each_side)
+
+    if candle_interval_minutes <= 0:
+        raise ValueError("interval must be greater than zero.")
+    if strike_count_each_side < 0 or strike_count_each_side > 100:
+        raise ValueError("strike_count_each_side must be between 0 and 100.")
+
+    cfg = get_dataset_config(dataset)
+    strike_step = int(cfg["strike_step"])
+
+    stage = time.perf_counter()
+    if query_date:
+        query_date = _normalize_date(query_date)
+        resolved_week, folder, date_str = _resolve_week_folder_for_date(
+            query_date=query_date,
+            dataset=dataset,
+            week_number=week_number,
+        )
+    else:
+        resolved_week, folder, date_str, query_date = _resolve_default_week_date(
+            dataset=dataset,
+        )
+    timings["resolve_data_ms"] = round((time.perf_counter() - stage) * 1000, 3)
+
+    expiry_str = selected_expiry or get_upcoming_expiry_np(
+        datetime.strptime(date_str, "%Y%m%d").date(),
+        instrument=dataset,
+        expiry_rule=expiry_rule,
+    )
+    if expiry_str is None:
+        raise ValueError("No upcoming expiry found.")
+    expiry_str = str(expiry_str).strip()
+
+    cache_key = (
+        dataset,
+        date_str,
+        expiry_str,
+        query_time,
+        candle_interval_minutes,
+        strike_count_each_side,
+        spot_price_field,
+        bool(compute_greeks),
+    )
+    cached_payload = _get_chain_snapshot_cache(cache_key)
+    if cached_payload is not None:
+        cached_payload["cache_hit"] = True
+        cached_payload["performance"] = {
+            "cache_lookup_ms": round((time.perf_counter() - total_started) * 1000, 3),
+            "total_ms": round((time.perf_counter() - total_started) * 1000, 3),
         }
-      }
-    };
+        return cached_payload
 
-    try {
-      if (container.data) {
-        Plotly.purge(container);
-      }
-    } catch (purgeError) {
-      console.warn("Plotly purge warning:", purgeError);
-    }
+    stage = time.perf_counter()
+    spot_candles = _get_spot_candles_for_day(
+        folder=folder,
+        date_str=date_str,
+        dataset=dataset,
+        candle_interval_minutes=candle_interval_minutes,
+    )
+    timings["spot_candles_ms"] = round((time.perf_counter() - stage) * 1000, 3)
 
-    if (!isCurrentRequest()) return;
+    if spot_candles.empty:
+        raise ValueError("No spot candles found for selected date.")
 
-    container.innerHTML = "";
-    container.style.position = "relative";
+    target_ts, spot_row = _nearest_candle_row(
+        candles=spot_candles,
+        date_str=date_str,
+        query_time=query_time,
+    )
+    target_ts = _to_ist_timestamp(target_ts)
 
-    await Plotly.newPlot(
-      container,
-      [
-        surfaceTrace,
-        ...lineTraces,
-        ...(pinnedTrace ? [pinnedTrace] : [])
-      ],
-      layout,
-      {
-        responsive: true,
-        displaylogo: false
-      }
-    );
+    if spot_price_field not in {"open", "high", "low", "close"}:
+        spot_price_field = "close"
 
-    if (!isCurrentRequest()) {
-      try {
-        Plotly.purge(container);
-      } catch (error) {
-        console.warn("Plotly stale-request purge warning:", error);
-      }
-      return;
-    }
+    spot = _safe_float(spot_row.get(spot_price_field))
+    if spot is None:
+        raise ValueError(f"Spot candle field '{spot_price_field}' is missing or invalid.")
 
-    let pinnedBox = container.querySelector(".iv-pinned-box");
+    day_open = _safe_float(spot_candles.iloc[0].get("open"), spot)
+    atm = int(
+        get_nearest_strike(
+            spot,
+            instrument=dataset,
+            expiry_rule=expiry_rule,
+        )
+    )
 
-    if (!pinnedBox) {
-      pinnedBox = document.createElement("div");
-      pinnedBox.className = "iv-pinned-box";
-      pinnedBox.style.position = "absolute";
-      pinnedBox.style.left = "14px";
-      pinnedBox.style.top = "14px";
-      pinnedBox.style.zIndex = "100";
-      pinnedBox.style.background = "#ffffff";
-      pinnedBox.style.border = "1px solid #111827";
-      pinnedBox.style.borderRadius = "6px";
-      pinnedBox.style.padding = "8px 10px";
-      pinnedBox.style.fontSize = "12px";
-      pinnedBox.style.fontWeight = "600";
-      pinnedBox.style.boxShadow = "0 4px 12px rgba(0,0,0,0.15)";
-      pinnedBox.style.display = "none";
-      pinnedBox.style.pointerEvents = "none";
-      container.appendChild(pinnedBox);
-    }
+    strikes = [
+        atm + offset * strike_step
+        for offset in range(-strike_count_each_side, strike_count_each_side + 1)
+    ]
 
-    if (pinnedIvPoint) {
-      pinnedBox.innerHTML =
-        `Tracking<br>` +
-        `Strike: ${pinnedIvPoint.strike}<br>` +
-        `Expiry: ${pinnedIvPoint.expiryLabel}<br>` +
-        `IV: ${Number(pinnedIvPoint.iv).toFixed(2)}%`;
+    # India VIX is best-effort and must not fail the main chain request.
+    stage = time.perf_counter()
+    india_vix_value = None
+    try:
+        vix_df = load_index_data_by_symbol(
+            folder=folder,
+            date_str=date_str,
+            symbol_name="INDIAVIX",
+        )
+        if vix_df is not None and not vix_df.empty:
+            vix_ts = pd.to_datetime(vix_df["datetime"], errors="coerce")
+            vix_values = pd.to_numeric(vix_df["value"], errors="coerce")
+            vix_work = pd.DataFrame({"datetime": vix_ts, "value": vix_values}).dropna()
+            if not vix_work.empty:
+                if getattr(vix_work["datetime"].dt, "tz", None) is None:
+                    vix_work["datetime"] = vix_work["datetime"].dt.tz_localize(
+                        IST,
+                        ambiguous="NaT",
+                        nonexistent="NaT",
+                    )
+                else:
+                    vix_work["datetime"] = vix_work["datetime"].dt.tz_convert(IST)
+                values_before = vix_work.loc[vix_work["datetime"] <= target_ts, "value"]
+                if not values_before.empty:
+                    india_vix_value = _safe_float(values_before.iloc[-1])
+    except Exception as exc:
+        logger.warning("INDIA VIX load error: %s", exc)
+    timings["vix_ms"] = round((time.perf_counter() - stage) * 1000, 3)
 
-      pinnedBox.style.display = "block";
-    }
+    # Fast path: data_engine performs one indexed lookup and binary-searches the
+    # latest timestamp at or before target_ts. This avoids scanning the full chain
+    # once for every strike.
+    stage = time.perf_counter()
+    snapshot = get_option_chain_snapshot(
+        folder=folder,
+        date_str=date_str,
+        expiry_str=expiry_str,
+        target_timestamp=target_ts,
+        instrument=dataset,
+    )
+    timings["chain_snapshot_ms"] = round((time.perf_counter() - stage) * 1000, 3)
 
-    let lastIvClickTime = 0;
+    rows: List[Dict[str, Any]] = []
+    chain_source = "consolidated"
 
-    container.removeAllListeners?.("plotly_click");
+    if snapshot is not None and not snapshot.empty:
+        snapshot = snapshot.loc[:, ["timestamp", "strike", "ce", "pe"]].copy(deep=False)
+        strike_values = pd.to_numeric(snapshot["strike"], errors="coerce")
+        snapshot = snapshot.loc[strike_values.notna()].copy()
+        snapshot["strike"] = strike_values.loc[strike_values.notna()].astype(int)
+        by_strike = snapshot.drop_duplicates("strike", keep="last").set_index("strike")
 
-    container.on("plotly_click", clickData => {
-      try {
-        if (
-          !clickData ||
-          !Array.isArray(clickData.points) ||
-          !clickData.points.length
-        ) {
-          return;
-        }
+        for strike in strikes:
+            ce_ltp = pe_ltp = None
+            if int(strike) in by_strike.index:
+                strike_row = by_strike.loc[int(strike)]
+                if isinstance(strike_row, pd.DataFrame):
+                    strike_row = strike_row.iloc[-1]
+                ce_ltp = _safe_float(strike_row.get("ce"))
+                pe_ltp = _safe_float(strike_row.get("pe"))
 
-        const point = clickData.points[0];
-        const clickedStrike = Number(point.x);
-        const clickedExpiryLabel = String(point.y || "");
-
-        const matchingExpiry = expiries.find(
-          expiry =>
-            expiry.label === clickedExpiryLabel ||
-            expiry.value === clickedExpiryLabel
-        );
-
-        const clicked =
-          rowLookup.get(
-            `${matchingExpiry?.value || ""}|${clickedStrike}`
-          ) ||
-          rows.find(row =>
-            Number(row.strike) === clickedStrike &&
-            (
-              String(row.expiry_label || "") === clickedExpiryLabel ||
-              String(row.expiry || "") === clickedExpiryLabel
+            rows.append({
+                "timestamp": target_ts.tz_convert(IST).tz_localize(None),
+                "trade_date": datetime.strptime(date_str, "%Y%m%d").date(),
+                "instrument": dataset,
+                "expiry": expiry_str,
+                "nearest_strike": int(strike),
+                "strike": int(strike),
+                "close": float(spot),
+                "ce": ce_ltp,
+                "pe": pe_ltp,
+            })
+    else:
+        # Backward-compatible fallback for dates without a consolidated file.
+        chain_source = "contracts"
+        for strike in strikes:
+            option_data = load_required_option_data_for_date(
+                folder=folder,
+                date_str=date_str,
+                expiry_str=expiry_str,
+                strike=int(strike),
+                instrument=dataset,
             )
-          );
 
-        if (!clicked) return;
-
-        const expiryLabel =
-          clicked.expiry_label ||
-          matchingExpiry?.label ||
-          clickedExpiryLabel ||
-          clicked.expiry;
-
-        const ivValue = Number(clicked.iv);
-
-        pinnedBox.innerHTML =
-          `Point Details<br>` +
-          `Strike: ${clicked.strike}<br>` +
-          `Expiry: ${expiryLabel}<br>` +
-          `IV: ${ivValue.toFixed(2)}%`;
-
-        pinnedBox.style.display = "block";
-
-        const now = Date.now();
-
-        if (now - lastIvClickTime < 350) {
-          pinnedIvPoint = {
-            strike: Number(clicked.strike),
-            expiry: String(clicked.expiry || ""),
-            expiryLabel: String(expiryLabel),
-            iv: ivValue
-          };
-
-          renderIvSurface();
-        }
-
-        lastIvClickTime = now;
-      } catch (clickError) {
-        console.error(
-          "IV surface click handler error:",
-          clickError
-        );
-      }
-    });
-
-    container.oncontextmenu = event => {
-      event.preventDefault();
-
-      pinnedIvPoint = null;
-
-      const box = container.querySelector(".iv-pinned-box");
-      if (box) {
-        box.style.display = "none";
-      }
-
-      renderIvSurface();
-      return false;
-    };
-
-  } catch (error) {
-    if (!isCurrentRequest()) return;
-
-    console.error("renderIvSurface error:", error);
-    container.innerHTML =
-      "<p>Failed to load IV surface. Check console for details.</p>";
-
-    alert(error.message || "Failed to load IV surface");
-  }
-}
-
-function getCurrentLtpForLeg(leg) {
-  const currentTime = getQueryTime();
-  const entryTime = leg.entry_time || currentTime;
-
-  if (entryTime === currentTime) {
-    return Number(leg.premium || 0);
-  }
-
-  const strike = Number(leg.strike);
-  const type = String(leg.type || "").toUpperCase();
-  const row = chain.find(r => Number(r.strike) === strike);
-
-  if (!row) return Number(leg.premium || 0);
-
-  if (type === "CE") return Number(row.ce_ltp ?? leg.premium ?? 0);
-  if (type === "PE") return Number(row.pe_ltp ?? leg.premium ?? 0);
-
-  return Number(leg.premium || 0);
-}
-
-function getGreeksForLeg(type, strike) {
-  const row = chain.find(r => Number(r.strike) === Number(strike));
-  const optType = String(type || "").toUpperCase();
-
-  return {
-    delta: optType === "CE" ? Number(row?.ce_delta || 0) : Number(row?.pe_delta || 0),
-    gamma: optType === "CE" ? Number(row?.ce_gamma || 0) : Number(row?.pe_gamma || 0),
-    vega: optType === "CE" ? Number(row?.ce_vega || 0) : Number(row?.pe_vega || 0),
-    theta: optType === "CE" ? Number(row?.ce_theta || 0) : Number(row?.pe_theta || 0)
-  };
-}
-
-function createLeg(side, type, strike, premium, lots = 1) {
-  const expiry =
-    getEl("expirySelect")?.value || "current expiry";
-
-  const normalizedStrike = normalizeStrike(
-    strike,
-    expiry
-  );
-
-  const g = getGreeksForLeg(
-    type,
-    normalizedStrike
-  );
-
-  return {
-    side,
-    type,
-    strike: normalizedStrike,
-    expiry,
-    entry_time: getQueryTime(),
-    premium: Number(premium || 0),
-    lots: Number(lots || 1),
-    qty: getFixedQty(),
-
-    entry_delta: g.delta,
-    entry_gamma: g.gamma,
-    entry_vega: g.vega,
-    entry_theta: g.theta
-  };
-}
-
-function addLeg(side, type, strike, premium) {
-  legs.push(createLeg(side, type, strike, premium, 1));
-  renderLegs();
-  calculate();
-}
-
-function addEmptyLeg() {
-  const expiry =
-    getEl("expirySelect")?.value || "current expiry";
-
-  const atmRow = chain.find(row => row.atm);
-
-  const atm = atmRow
-    ? normalizeStrike(atmRow.strike, expiry)
-    : normalizeStrike(getSpot(), expiry);
-
-  addLeg("BUY", "CE", atm, 100);
-}
-
-function removeLeg(index) {
-  legs.splice(index, 1);
-
-  renderLegs();
-  calculate();
-}
-
-function updateLeg(index, field, value) {
-  if (!legs[index]) return;
-
-  if (field === "qty") {
-    legs[index].qty = getFixedQty();
-  }
-
-  else if (field === "strike") {
-    legs[index].strike = normalizeStrike(
-      value,
-      legs[index].expiry
-    );
-
-    // Show the corrected strike immediately
-    renderLegs();
-  }
-
-  else if (field === "expiry") {
-    legs[index].expiry = value;
-
-    legs[index].strike = normalizeStrike(
-      legs[index].strike,
-      value
-    );
-
-    renderLegs();
-  }
-
-  else {
-    legs[index][field] = value;
-  }
-
-  calculate();
-}
-
-function renderLegs() {
-  ensurePositionsHeaders();
-
-  const body = getEl("legsBody");
-  if (!body) return;
-
-  body.innerHTML = "";
-
-  legs.forEach((leg, i) => {
-    if (!leg.expiry) {
-      leg.expiry =
-        getEl("expirySelect")?.value || "current expiry";
-    }
-
-    if (!leg.entry_time) {
-      leg.entry_time = getQueryTime();
-    }
-
-    leg.qty = getFixedQty();
-
-    const tr = document.createElement("tr");
-
-    tr.innerHTML = `
-      <td>
-        <select
-          onchange="updateLeg(${i}, 'side', this.value)"
-        >
-          <option
-            value="BUY"
-            ${leg.side === "BUY" ? "selected" : ""}
-          >
-            BUY
-          </option>
-
-          <option
-            value="SELL"
-            ${leg.side === "SELL" ? "selected" : ""}
-          >
-            SELL
-          </option>
-        </select>
-      </td>
-
-      <td>
-        <select
-          onchange="updateLeg(${i}, 'type', this.value)"
-        >
-          <option
-            value="CE"
-            ${leg.type === "CE" ? "selected" : ""}
-          >
-            CE
-          </option>
-
-          <option
-            value="PE"
-            ${leg.type === "PE" ? "selected" : ""}
-          >
-            PE
-          </option>
-        </select>
-      </td>
-
-      <td>
-        <input
-          class="leg-input"
-          type="number"
-          value="${leg.strike}"
-          step="${getStrikeStep(leg.expiry)}"
-          onchange="updateLeg(
-            ${i},
-            'strike',
-            Number(this.value)
-          )"
-        >
-      </td>
-
-      <td>
-        <select
-          class="leg-input"
-          onchange="updateLeg(
-            ${i},
-            'expiry',
-            this.value
-          )"
-        >
-          ${
-            getEl("expirySelect")
-              ? Array.from(
-                  getEl("expirySelect").options
-                )
-                  .map(
-                    option => `
-                      <option
-                        value="${option.value}"
-                        ${
-                          leg.expiry === option.value
-                            ? "selected"
-                            : ""
-                        }
-                      >
-                        ${option.textContent}
-                      </option>
-                    `
-                  )
-                  .join("")
-              : `
-                  <option value="${leg.expiry}">
-                    ${leg.expiry}
-                  </option>
-                `
-          }
-        </select>
-      </td>
-
-      <td>
-        <input
-          class="leg-input leg-entry-time"
-          type="time"
-          value="${leg.entry_time}"
-          onchange="updateLeg(
-            ${i},
-            'entry_time',
-            this.value
-          )"
-        >
-      </td>
-
-      <td>
-        <input
-          class="leg-input"
-          type="number"
-          value="${leg.premium}"
-          step="0.05"
-          min="0"
-          onchange="updateLeg(
-            ${i},
-            'premium',
-            Number(this.value)
-          )"
-        >
-      </td>
-
-      <td>
-        <input
-          class="leg-input"
-          type="number"
-          value="${leg.lots}"
-          step="1"
-          min="1"
-          onchange="updateLeg(
-            ${i},
-            'lots',
-            Number(this.value)
-          )"
-        >
-      </td>
-
-      <td>
-        <input
-          class="leg-input"
-          type="number"
-          value="${getFixedQty()}"
-          readonly
-        >
-      </td>
-
-      <td>
-        <button
-          class="delete-leg-btn"
-          type="button"
-          onclick="removeLeg(${i})"
-        >
-          Delete
-        </button>
-      </td>
-    `;
-
-    body.appendChild(tr);
-  });
-}
-
-function loadTemplate(name) {
-  const expiry =
-    getEl("expirySelect")?.value || "current expiry";
-
-  const atmRow = chain.find(row => row.atm);
-
-  const atm = atmRow
-    ? normalizeStrike(atmRow.strike, expiry)
-    : normalizeStrike(getSpot(), expiry);
-
-  const find = (strike, type) => {
-    const row = chain.find(
-      item => Number(item.strike) === Number(strike)
-    );
-
-    if (!row) return 100;
-
-    return Number(
-      (type === "CE" ? row.ce_ltp : row.pe_ltp) || 100
-    );
-  };
-
-  if (name === "short_straddle") {
-    legs = [
-      createLeg("SELL", "CE", atm, find(atm, "CE")),
-      createLeg("SELL", "PE", atm, find(atm, "PE"))
-    ];
-  } else if (name === "short_strangle") {
-    legs = [
-      createLeg("SELL", "CE", atm + 200, find(atm + 200, "CE")),
-      createLeg("SELL", "PE", atm - 200, find(atm - 200, "PE"))
-    ];
-  } else if (name === "iron_condor") {
-    legs = [
-      createLeg("BUY", "PE", atm - 400, find(atm - 400, "PE")),
-      createLeg("SELL", "PE", atm - 200, find(atm - 200, "PE")),
-      createLeg("SELL", "CE", atm + 200, find(atm + 200, "CE")),
-      createLeg("BUY", "CE", atm + 400, find(atm + 400, "CE"))
-    ];
-  } else {
-    console.warn(`Unknown strategy template: ${name}`);
-    return;
-  }
-
-  renderLegs();
-  calculate();
-}
-
-function calculateLivePositionGreeks() {
-  let liveDelta = 0;
-  let liveGamma = 0;
-  let liveVega = 0;
-  let liveTheta = 0;
-
-  let entryDelta = 0;
-  let entryGamma = 0;
-  let entryVega = 0;
-  let entryTheta = 0;
-
-  for (const leg of legs) {
-    const row = chain.find(r => Number(r.strike) === Number(leg.strike));
-    if (!row) continue;
-
-    const type = String(leg.type || "").toUpperCase();
-    const side = String(leg.side || "").toUpperCase();
-    const lots = Number(leg.lots || 1);
-    const sign = side === "SELL" ? -1 : 1;
-
-    const d = type === "CE" ? Number(row.ce_delta || 0) : Number(row.pe_delta || 0);
-    const g = type === "CE" ? Number(row.ce_gamma || 0) : Number(row.pe_gamma || 0);
-    const v = type === "CE" ? Number(row.ce_vega || 0) : Number(row.pe_vega || 0);
-    const t = type === "CE" ? Number(row.ce_theta || 0) : Number(row.pe_theta || 0);
-
-    liveDelta += sign * d * lots;
-    liveGamma += sign * g * lots;
-    liveVega += sign * v * lots;
-    liveTheta += sign * t * lots;
-
-    entryDelta += sign * Number(leg.entry_delta || 0) * lots;
-    entryGamma += sign * Number(leg.entry_gamma || 0) * lots;
-    entryVega += sign * Number(leg.entry_vega || 0) * lots;
-    entryTheta += sign * Number(leg.entry_theta || 0) * lots;
-  }
-
-  const set = (id, value, decimals) => {
-    const el = getEl(id);
-    if (el) el.textContent = Number(value || 0).toFixed(decimals);
-  };
-
-  set("entryDelta", entryDelta, 2);
-  set("liveDelta", liveDelta, 2);
-  set("entryGamma", entryGamma, 4);
-  set("liveGamma", liveGamma, 4);
-  set("entryVega", entryVega, 2);
-  set("liveVega", liveVega, 2);
-  set("entryTheta", entryTheta, 2);
-  set("liveTheta", liveTheta, 2);
-}
-
-async function calculate() {
-  try {
-    ensureMetricsCards();
-    const uniqueExpiries = [...new Set(legs.map(l => l.expiry).filter(Boolean))];
-    const warning = getEl("expiryWarning");
-
-    if (uniqueExpiries.length > 1) {
-      renderChart([], [], []);
-
-      if (warning) {
-        warning.textContent =
-          "⚠ Diagonal / calendar strategy payoff is not possible because legs have different expiries.";
-      }
-
-      return;
-    }
-
-    if (warning) {
-      warning.textContent =
-        "⚠ Payoff analysis is for same-expiry strategies only and is valid only at the time of expiry only. Calendar and diagonal spreads are not supported.";
-    }
-
-    const fixedQty = getFixedQty();
-
-    const payloadLegs = legs.map(leg => ({
-      ...leg,
-      qty: fixedQty,
-      current_price: getCurrentLtpForLeg(leg)
-    }));
-
-    const res = await fetch("/api/calculate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        dataset: getDataset(),
-        spot: getSpot(),
-        iv: getIV(),
-        days: getDays(),
-        legs: payloadLegs
-      })
-    });
-
-    const data = await res.json();
-
-    if (!res.ok || data.ok === false) {
-      throw new Error(data.error || "Calculation failed");
-    }
-
-    const s = data.summary || {};
-    const charges = Number(s.charges || s.trade_cost || 0);
-    const pnlNow = Number(s.pnl_now || 0);
-
-    getEl("netCredit").textContent = fmtMoney(s.net_credit);
-    getEl("pnlNow").textContent = fmtMoney(pnlNow);
-    getEl("tradeCost").textContent = fmtMoney(charges);
-    getEl("netProfitAfterCost").textContent = fmtMoney(pnlNow - charges);
-    getEl("marginRequired").textContent = fmtMoney(s.margin_required || s.margin || 0);
-    getEl("maxProfit").textContent = fmtMoney(s.max_profit);
-    getEl("maxLoss").textContent = fmtMoney(s.max_loss);
-    getEl("breakevens").textContent = s.breakevens?.length ? s.breakevens.join(", ") : "-";
-
-    calculateLivePositionGreeks();
-
-    renderChart(data.spots || [], data.payoff || [], data.current || []);
-
-  } catch (err) {
-    console.error("calculate error:", err);
-  }
-}
-
-function renderChart(labels, payoff, current) {
-  const canvas = getEl("payoffChart");
-
-  if (!canvas || typeof Chart === "undefined") {
-    return;
-  }
-
-  const ctx = canvas.getContext("2d");
-
-  if (chart) {
-    chart.destroy();
-  }
-
-  const currentSpotPlugin = {
-    id: "currentSpotPlugin",
-
-    afterDatasetsDraw(chartInstance) {
-      const currentSpot = Number(getSpot());
-
-      if (
-        !Number.isFinite(currentSpot) ||
-        !Array.isArray(labels) ||
-        labels.length === 0
-      ) {
-        return;
-      }
-
-      const numericLabels = labels.map(Number);
-      const xScale = chartInstance.scales.x;
-      const yScale = chartInstance.scales.y;
-
-      if (!xScale || !yScale) {
-        return;
-      }
-
-      let xPixel = null;
-      const exactIndex = numericLabels.findIndex(
-        value => value === currentSpot
-      );
-
-      if (exactIndex >= 0) {
-        xPixel = xScale.getPixelForValue(exactIndex);
-      } else {
-        for (let index = 1; index < numericLabels.length; index += 1) {
-          const previousValue = numericLabels[index - 1];
-          const nextValue = numericLabels[index];
-
-          if (
-            currentSpot >= previousValue &&
-            currentSpot <= nextValue &&
-            nextValue !== previousValue
-          ) {
-            const previousPixel = xScale.getPixelForValue(index - 1);
-            const nextPixel = xScale.getPixelForValue(index);
-            const ratio =
-              (currentSpot - previousValue) /
-              (nextValue - previousValue);
-
-            xPixel =
-              previousPixel +
-              ratio * (nextPixel - previousPixel);
-            break;
-          }
-        }
-      }
-
-      if (!Number.isFinite(xPixel)) {
-        return;
-      }
-
-      const chartContext = chartInstance.ctx;
-      const label = `${getDataset()} Spot : ${currentSpot.toFixed(2)}`;
-
-      chartContext.save();
-
-      // Current-spot vertical line.
-      chartContext.beginPath();
-      chartContext.setLineDash([]);
-      chartContext.strokeStyle = "#16a34a";
-      chartContext.lineWidth = 2;
-      chartContext.moveTo(xPixel, yScale.top);
-      chartContext.lineTo(xPixel, yScale.bottom);
-      chartContext.stroke();
-
-      // Label is placed in the reserved space above the plotting area.
-      chartContext.font = "bold 12px Arial";
-      chartContext.textAlign = "center";
-      chartContext.textBaseline = "bottom";
-      chartContext.fillStyle = "#111827";
-      chartContext.fillText(
-        label,
-        xPixel,
-        yScale.top - 8
-      );
-
-      chartContext.restore();
-    }
-  };
-
-  chart = new Chart(ctx, {
-    type: "line",
-    plugins: [currentSpotPlugin],
-
-    data: {
-      labels,
-      datasets: [
+            ce_ltp = _option_ltp_at_time_cached(
+                raw_df=option_data.get("CE"),
+                target_ts=target_ts,
+                candle_interval_minutes=candle_interval_minutes,
+                cache_key=(
+                    "option_window", dataset, date_str, expiry_str, int(strike),
+                    "CE", candle_interval_minutes,
+                    target_ts.strftime("%Y-%m-%d %H:%M:%S%z"),
+                ),
+            )
+            pe_ltp = _option_ltp_at_time_cached(
+                raw_df=option_data.get("PE"),
+                target_ts=target_ts,
+                candle_interval_minutes=candle_interval_minutes,
+                cache_key=(
+                    "option_window", dataset, date_str, expiry_str, int(strike),
+                    "PE", candle_interval_minutes,
+                    target_ts.strftime("%Y-%m-%d %H:%M:%S%z"),
+                ),
+            )
+
+            rows.append({
+                "timestamp": target_ts.tz_convert(IST).tz_localize(None),
+                "trade_date": datetime.strptime(date_str, "%Y%m%d").date(),
+                "instrument": dataset,
+                "expiry": expiry_str,
+                "nearest_strike": int(strike),
+                "strike": int(strike),
+                "close": float(spot),
+                "ce": ce_ltp,
+                "pe": pe_ltp,
+            })
+
+    chain_df = pd.DataFrame.from_records(rows)
+
+    stage = time.perf_counter()
+    if ENABLE_IV_CALC:
+        try:
+            chain_df = append_black_scholes_iv(
+                chain_df,
+                compute_greeks=compute_greeks,
+                inplace=True,
+            )
+        except TypeError:
+            # Backward compatibility with an older function signature.
+            chain_df = append_black_scholes_iv(
+                chain_df,
+                compute_greeks=compute_greeks,
+            )
+        except Exception as exc:
+            logger.exception("IV calculation failed")
+            chain_df["_iv_error"] = str(exc)
+
+    for column in (
+        "iv", "ce_iv", "pe_iv",
+        "ce_delta", "pe_delta",
+        "ce_gamma", "pe_gamma",
+        "ce_vega", "pe_vega",
+        "ce_theta", "pe_theta",
+    ):
+        if column not in chain_df.columns:
+            chain_df[column] = np.nan
+    timings["iv_greeks_ms"] = round((time.perf_counter() - stage) * 1000, 3)
+
+    stage = time.perf_counter()
+    chain_rows = [
         {
-          // The payoff curve remains, but its legend/title is hidden.
-          label: "",
-          data: payoff,
-          borderWidth: 2,
-          pointRadius: 0,
-          pointHoverRadius: 4,
-          tension: 0,
-          spanGaps: true,
-          segment: {
-            borderColor: context => {
-              const y0 = Number(context.p0?.parsed?.y);
-              const y1 = Number(context.p1?.parsed?.y);
-              return y0 >= 0 && y1 >= 0 ? "#16a34a" : "#ef4444";
-            }
-          },
-          fill: {
-            target: "origin",
-            above: "rgba(22, 163, 74, 0.18)",
-            below: "rgba(239, 68, 68, 0.14)"
-          }
+            "strike": _safe_int(row.strike),
+            "atm": _safe_int(row.strike) == atm,
+            "ce_ltp": _round_or_none(row.ce, 2),
+            "pe_ltp": _round_or_none(row.pe, 2),
+            "iv": _round_or_none(row.iv, 4),
+            "ce_iv": _round_or_none(row.ce_iv, 4),
+            "pe_iv": _round_or_none(row.pe_iv, 4),
+            "ce_delta": _round_or_none(row.ce_delta, 4),
+            "pe_delta": _round_or_none(row.pe_delta, 4),
+            "ce_gamma": _round_or_none(row.ce_gamma, 6),
+            "pe_gamma": _round_or_none(row.pe_gamma, 6),
+            "ce_vega": _round_or_none(row.ce_vega, 4),
+            "pe_vega": _round_or_none(row.pe_vega, 4),
+            "ce_theta": _round_or_none(row.ce_theta, 4),
+            "pe_theta": _round_or_none(row.pe_theta, 4),
         }
-      ]
-    },
-
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      interaction: {
-        mode: "index",
-        intersect: false
-      },
-      layout: {
-        padding: {
-          top: 36,
-          right: 10,
-          bottom: 4,
-          left: 4
-        }
-      },
-      plugins: {
-        legend: {
-          display: false
-        },
-        tooltip: {
-          enabled: true
-        }
-      },
-      scales: {
-        y: {
-          grace: "8%",
-          title: {
-            display: true,
-            text: "P&L"
-          },
-          ticks: {
-            maxTicksLimit: 7
-          },
-          grid: {
-            color: "rgba(148, 163, 184, 0.28)"
-          }
-        },
-        x: {
-          offset: false,
-          title: {
-            display: true,
-            text: "Spot"
-          },
-          ticks: {
-            autoSkip: true,
-            maxTicksLimit: 12,
-            maxRotation: 45,
-            minRotation: 45
-          },
-          grid: {
-            color: "rgba(148, 163, 184, 0.22)"
-          }
-        }
-      }
-    }
-  });
-}
-
-function attachOhlcBox(chartInstance, series, container, boxId) {
-  let box = document.getElementById(boxId);
-
-  if (!box) {
-    box = document.createElement("div");
-    box.id = boxId;
-
-    box.style.position = "absolute";
-    box.style.top = "10px";
-    box.style.left = "10px";
-    box.style.zIndex = "100";
-    box.style.fontSize = "14px";
-    box.style.fontWeight = "600";
-    box.style.background = "transparent";
-    box.style.pointerEvents = "none";
-
-    container.style.position = "relative";
-    container.appendChild(box);
-  }
-
-  chartInstance.subscribeCrosshairMove(param => {
-    if (!param?.time) return;
-
-    const candle = param.seriesData.get(series);
-    if (!candle) return;
-
-    if (
-      candle.open === undefined ||
-      candle.high === undefined ||
-      candle.low === undefined ||
-      candle.close === undefined
-    ) {
-      return;
-    }
-
-    box.innerHTML =
-      `O ${Number(candle.open).toFixed(2)} ` +
-      `H ${Number(candle.high).toFixed(2)} ` +
-      `L ${Number(candle.low).toFixed(2)} ` +
-      `C ${Number(candle.close).toFixed(2)}`;
-  });
-}
-
-async function openChartPopup() {
-  try {
-    const modal = getEl("chartModal");
-    const container = getEl("fullscreenIndexChart");
-
-    if (
-      !modal ||
-      !container ||
-      typeof LightweightCharts === "undefined"
-    ) {
-      throw new Error("Index chart modal or chart library is missing");
-    }
-
-    const startDate = getEl("indexChartStartDate");
-    const startTime = getEl("indexChartStartTime");
-    const endDate = getEl("indexChartEndDate");
-    const endTime = getEl("indexChartEndTime");
-    const intervalSelect = getEl("indexChartInterval");
-    const applyBtn = getEl("indexChartApplyBtn");
-
-    modal.style.display = "block";
-
-    const chartTitle = modal.querySelector("h2");
-
-    if (chartTitle) {
-      chartTitle.textContent = `${getDataset()} Index Chart`;
-    }
-
-    if (applyBtn) {
-      applyBtn.dataset.chart = "index";
-      delete applyBtn.dataset.strike;
-      delete applyBtn.dataset.metric;
-    }
-
-    if (startDate && !startDate.value) {
-      startDate.value = getQueryDate();
-    }
-
-    if (startTime && !startTime.value) {
-      startTime.value = "09:15";
-    }
-
-    if (endDate && !endDate.dataset.userChanged) {
-      endDate.value = getQueryDate();
-    }
-
-    if (endTime && !endTime.dataset.userChanged) {
-      endTime.value = getQueryTime();
-    }
-
-    const params = new URLSearchParams({
-      dataset: getDataset(),
-      date: startDate?.value || getQueryDate(),
-      start_time: startTime?.value || "09:15",
-      end_date: endDate?.value || getQueryDate(),
-      end_time: endTime?.value || getQueryTime(),
-      interval: intervalSelect?.value || String(getInterval()),
-      _: String(Date.now())
-    });
-
-    const data = await fetchJson(
-      `/api/index-chart?${params.toString()}`
-    );
-
-    if (!data.ok || !Array.isArray(data.rows) || !data.rows.length) {
-      throw new Error("No index chart data found");
-    }
-
-    if (fullscreenChart) {
-      fullscreenChart.remove();
-      fullscreenChart = null;
-      fullscreenSeries = null;
-    }
-
-    container.innerHTML = "";
-
-    fullscreenChart = LightweightCharts.createChart(container, {
-      width: container.clientWidth,
-      height: container.clientHeight || 700,
-
-      layout: {
-        background: { color: "#ffffff" },
-        textColor: "#222222"
-      },
-
-      grid: {
-        vertLines: { color: "#eef2f7" },
-        horzLines: { color: "#eef2f7" }
-      },
-
-      crosshair: {
-        mode: LightweightCharts.CrosshairMode.Normal
-      },
-
-      timeScale: {
-        timeVisible: true,
-        secondsVisible: false,
-        borderColor: "#dddddd"
-      },
-
-      rightPriceScale: {
-        borderColor: "#dddddd"
-      }
-    });
-
-    fullscreenSeries = fullscreenChart.addCandlestickSeries({
-      upColor: "#16a34a",
-      downColor: "#dc2626",
-      borderUpColor: "#16a34a",
-      borderDownColor: "#dc2626",
-      wickUpColor: "#16a34a",
-      wickDownColor: "#dc2626"
-    });
-
-    fullscreenSeries.setData(data.rows);
-
-    advancedCharts.index.chart = fullscreenChart;
-    advancedCharts.index.candleSeries = fullscreenSeries;
-    advancedCharts.index.rows = data.rows;
-
-    if (!Array.isArray(advancedCharts.index.indicators)) {
-      advancedCharts.index.indicators = [];
-    }
-
-    advancedCharts.index.indicators.forEach(indicator => {
-      indicator.series = [];
-    });
-
-    redrawChartIndicators("index");
-
-    attachOhlcBox(
-      fullscreenChart,
-      fullscreenSeries,
-      container,
-      "indexOhlcBox"
-    );
-
-    fullscreenChart.timeScale().fitContent();
-
-    const resizeHandler = () => {
-      if (!fullscreenChart || !container) return;
-
-      fullscreenChart.applyOptions({
-        width: container.clientWidth,
-        height: container.clientHeight || 700
-      });
-    };
-
-    window.addEventListener("resize", resizeHandler, {
-      once: true
-    });
-
-  } catch (err) {
-    console.error("openChartPopup error:", err);
-    alert(err.message || "Failed to load index chart");
-  }
-}
-
-function closeChartPopup() {
-  const modal = getEl("chartModal");
-
-  if (modal) {
-    modal.style.display = "none";
-  }
-
-  if (fullscreenChart) {
-    fullscreenChart.remove();
-    fullscreenChart = null;
-    fullscreenSeries = null;
-  }
-
-  const container = getEl("fullscreenIndexChart");
-  if (container) {
-    container.innerHTML = "";
-  }
-}
-
-async function openFutureChartPopup() {
-  try {
-    const modal = getEl("futureChartModal");
-    const container = getEl("fullscreenFutureChart");
-    const monthSelect = getEl("futureMonthSelect");
-
-    const startDate = getEl("futureChartStartDate");
-    const startTime = getEl("futureChartStartTime");
-    const endDate = getEl("futureChartEndDate");
-    const endTime = getEl("futureChartEndTime");
-    const intervalSelect = getEl("futureChartInterval");
-
-    if (!modal || !container || typeof LightweightCharts === "undefined") return;
-
-    modal.style.display = "block";
-
-    if (startDate && !startDate.value) startDate.value = getQueryDate();
-    if (startTime && !startTime.value) startTime.value = "09:15";
-
-    if (endDate && !endDate.dataset.userChanged) endDate.value = getQueryDate();
-    if (endTime && !endTime.dataset.userChanged) endTime.value = getQueryTime();
-
-    if (startTime && !startTime.dataset.changeAttached) {
-      startTime.addEventListener("change", () => {
-        startTime.dataset.userChanged = "true";
-      });
-      startTime.dataset.changeAttached = "true";
-    }
-
-    if (endDate && !endDate.dataset.changeAttached) {
-      endDate.addEventListener("change", () => {
-        endDate.dataset.userChanged = "true";
-      });
-      endDate.dataset.changeAttached = "true";
-    }
-
-    if (endTime && !endTime.dataset.changeAttached) {
-      endTime.addEventListener("change", () => {
-        endTime.dataset.userChanged = "true";
-      });
-      endTime.dataset.changeAttached = "true";
-    }
-
-    const params = new URLSearchParams({
-      dataset: getDataset(),
-      date: startDate?.value || getQueryDate(),
-      start_time: startTime?.value || "09:15",
-      end_date: endDate?.value || getQueryDate(),
-      end_time: endTime?.value || getQueryTime(),
-      interval: intervalSelect?.value || String(getInterval()),
-      month: monthSelect ? monthSelect.value : "current",
-      _: String(Date.now())
-    });
-
-    const data = await fetchJson(`/api/future-chart?${params.toString()}`);
-
-    if (!data.ok || !data.rows || !data.rows.length) {
-      alert("No future chart data found");
-      return;
-    }
-
-    if (!futureChart) {
-      futureChart = LightweightCharts.createChart(container, {
-        width: container.clientWidth,
-        height: container.clientHeight,
-        layout: {
-          background: { color: "#ffffff" },
-          textColor: "#222"
-        },
-        grid: {
-          vertLines: { color: "#eef2f7" },
-          horzLines: { color: "#eef2f7" }
-        },
-        crosshair: {
-          mode: LightweightCharts.CrosshairMode.Normal
-        },
-        timeScale: {
-          timeVisible: true,
-          secondsVisible: false,
-          borderColor: "#ddd"
-        },
-        rightPriceScale: {
-          borderColor: "#ddd"
-        }
-      });
-
-      futureSeries = futureChart.addCandlestickSeries({
-        upColor: "#16a34a",
-        downColor: "#dc2626",
-        borderUpColor: "#16a34a",
-        borderDownColor: "#dc2626",
-        wickUpColor: "#16a34a",
-        wickDownColor: "#dc2626"
-      });
-    }
-
-    futureSeries.setData(data.rows || []);
-
-    advancedCharts.future.chart = futureChart;
-    advancedCharts.future.candleSeries = futureSeries;
-    advancedCharts.future.rows = data.rows || [];
-
-    if (!Array.isArray(advancedCharts.future.indicators)) {
-      advancedCharts.future.indicators = [];
-    }
-    redrawChartIndicators("future");
-
-    attachOhlcBox(
-      futureChart,
-      futureSeries,
-      container,
-      "futureOhlcBox"
-    );
-
-    futureChart.timeScale().fitContent();
-
-  } catch (err) {
-    console.error("openFutureChartPopup error:", err);
-    alert(err.message || "Failed to load future chart");
-  }
-}
-
-function closeFutureChartPopup() {
-  const modal = getEl("futureChartModal");
-  if (modal) modal.style.display = "none";
-}
-
-async function openIndiaVixChartPopup() {
-  try {
-    const modal = getEl("vixChartModal");
-    const container = getEl("fullscreenVixChart");
-
-    const startDate = getEl("vixChartStartDate");
-    const startTime = getEl("vixChartStartTime");
-    const endDate = getEl("vixChartEndDate");
-    const endTime = getEl("vixChartEndTime");
-    const intervalSelect = getEl("vixChartInterval");
-
-    if (!modal || !container || typeof LightweightCharts === "undefined") return;
-
-    modal.style.display = "block";
-
-    if (startDate && !startDate.value) startDate.value = getQueryDate();
-    if (startTime && !startTime.value) startTime.value = "09:15";
-
-    if (endDate && !endDate.dataset.userChanged) endDate.value = getQueryDate();
-    if (endTime && !endTime.dataset.userChanged) endTime.value = getQueryTime();
-
-    if (startTime && !startTime.dataset.changeAttached) {
-      startTime.addEventListener("change", () => {
-        startTime.dataset.userChanged = "true";
-      });
-      startTime.dataset.changeAttached = "true";
-    }
-
-    if (endDate && !endDate.dataset.changeAttached) {
-      endDate.addEventListener("change", () => {
-        endDate.dataset.userChanged = "true";
-      });
-      endDate.dataset.changeAttached = "true";
-    }
-
-    if (endTime && !endTime.dataset.changeAttached) {
-      endTime.addEventListener("change", () => {
-        endTime.dataset.userChanged = "true";
-      });
-      endTime.dataset.changeAttached = "true";
-    }
-
-    const params = new URLSearchParams({
-      dataset: getDataset(),
-      date: startDate?.value || getQueryDate(),
-      start_time: startTime?.value || "09:15",
-      end_date: endDate?.value || getQueryDate(),
-      end_time: endTime?.value || getQueryTime(),
-      interval: intervalSelect?.value || String(getInterval()),
-      _: String(Date.now())
-    });
-
-    const data = await fetchJson(`/api/india-vix-chart?${params.toString()}`);
-
-    if (!data.ok || !data.rows || !data.rows.length) {
-      alert("No India VIX chart data found");
-      return;
-    }
-
-    if (!vixChart) {
-      vixChart = LightweightCharts.createChart(container, {
-        width: container.clientWidth,
-        height: container.clientHeight,
-        layout: {
-          background: { color: "#ffffff" },
-          textColor: "#222"
-        },
-        grid: {
-          vertLines: { color: "#eef2f7" },
-          horzLines: { color: "#eef2f7" }
-        },
-        crosshair: {
-          mode: LightweightCharts.CrosshairMode.Normal
-        },
-        timeScale: {
-          timeVisible: true,
-          secondsVisible: false,
-          borderColor: "#ddd"
-        },
-        rightPriceScale: {
-          borderColor: "#ddd"
-        }
-      });
-
-      vixSeries = vixChart.addCandlestickSeries({
-        upColor: "#16a34a",
-        downColor: "#dc2626",
-        borderUpColor: "#16a34a",
-        borderDownColor: "#dc2626",
-        wickUpColor: "#16a34a",
-        wickDownColor: "#dc2626"
-      });
-    }
-
-    vixSeries.setData(data.rows || []);
-
-    advancedCharts.vix.chart = vixChart;
-    advancedCharts.vix.candleSeries = vixSeries;
-    advancedCharts.vix.rows = data.rows || [];
-
-    if (!Array.isArray(advancedCharts.vix.indicators)) {
-      advancedCharts.vix.indicators = [];
-    }
-    redrawChartIndicators("vix");
-
-    attachOhlcBox(
-      vixChart,
-      vixSeries,
-      container,
-      "vixOhlcBox"
-    );
-
-    vixChart.timeScale().fitContent();
-
-  } catch (err) {
-    console.error("openIndiaVixChartPopup error:", err);
-    alert(err.message || "Failed to load India VIX chart");
-  }
-}
-
-function closeIndiaVixChartPopup() {
-  const modal = getEl("vixChartModal");
-  if (modal) modal.style.display = "none";
-}
-
-function openGreeksPopup() {
-  const modal = getEl("greeksModal");
-  const body = getEl("greeksBody");
-
-  if (!modal || !body) return;
-
-  body.innerHTML = "";
-
-  if (!chain.length) {
-    body.innerHTML = `
-      <tr>
-        <td colspan="13" style="padding:20px;text-align:center;">
-          No Greeks data available
-        </td>
-      </tr>
-    `;
-  } else {
-    chain.forEach(row => {
-      const tr = document.createElement("tr");
-      if (row.atm) tr.classList.add("atm");
-
-      tr.innerHTML = `
-        <td>
-          <b>${row.strike}</b>
-          ${row.atm ? '<span class="atm-badge">ATM</span>' : ""}
-        </td>
-        <td>${row.ce_ltp ?? "-"}</td>
-        <td>${row.ce_delta ?? "-"}</td>
-        <td>${row.ce_gamma ?? "-"}</td>
-        <td>${row.ce_vega ?? "-"}</td>
-        <td>${row.ce_theta ?? "-"}</td>
-        <td>${row.ce_iv ?? "-"}</td>
-        <td>${row.pe_iv ?? "-"}</td>
-        <td>${row.pe_theta ?? "-"}</td>
-        <td>${row.pe_vega ?? "-"}</td>
-        <td>${row.pe_gamma ?? "-"}</td>
-        <td>${row.pe_delta ?? "-"}</td>
-        <td>${row.pe_ltp ?? "-"}</td>
-      `;
-
-      body.appendChild(tr);
-    });
-  }
-
-  modal.style.display = "block";
-}
-
-function closeGreeksPopup() {
-  const modal = getEl("greeksModal");
-  if (modal) modal.style.display = "none";
-}
-
-/* =========================================================
-   INDICATOR MODAL
-========================================================= */
-
-function openIndicatorModal(chartName) {
-  const modal = getEl("indicatorModal");
-
-  if (!modal) {
-    console.error("Indicator modal not found: #indicatorModal");
-    return;
-  }
-
-  activeIndicatorChart = chartName;
-
-  modal.classList.add("open");
-  modal.setAttribute("aria-hidden", "false");
-
-  refreshIndicatorModalState();
-
-  const searchInput = getEl("indicatorSearchInput");
-
-  if (searchInput) {
-    searchInput.value = "";
-    filterIndicatorList();
-    searchInput.focus();
-  }
-}
-
-function closeIndicatorModal() {
-  const modal = getEl("indicatorModal");
-
-  if (!modal) return;
-
-  modal.classList.remove("open");
-  modal.setAttribute("aria-hidden", "true");
-}
-
-function refreshIndicatorModalState() {
-  const chartState = advancedCharts[activeIndicatorChart];
-
-  document.querySelectorAll(".indicator-list-item").forEach(button => {
-    const indicatorType = button.dataset.indicator;
-    const status = button.querySelector(".indicator-status");
-
-    let isAdded = false;
-
-    if (chartState && chartState.indicators) {
-      if (Array.isArray(chartState.indicators)) {
-        isAdded = chartState.indicators.some(
-          indicator => indicator.type === indicatorType
-        );
-      } else {
-        isAdded = Boolean(chartState.indicators[indicatorType]);
-      }
-    }
-
-    button.classList.toggle("selected", isAdded);
-
-    if (status) {
-      status.textContent = isAdded ? "Added" : "Add";
-    }
-  });
-}
-
-function filterIndicatorList() {
-  const searchInput = getEl("indicatorSearchInput");
-  const searchText = String(searchInput?.value || "")
-    .trim()
-    .toLowerCase();
-
-  const activeCategory =
-    document.querySelector(".indicator-category.active")?.dataset.category ||
-    "all";
-
-  document.querySelectorAll(".indicator-list-item").forEach(button => {
-    const buttonCategory = button.dataset.category || "";
-    const buttonText = button.textContent.toLowerCase();
-
-    const matchesSearch =
-      !searchText || buttonText.includes(searchText);
-
-    const matchesCategory =
-      activeCategory === "all" || buttonCategory === activeCategory;
-
-    button.hidden = !(matchesSearch && matchesCategory);
-  });
-}
-
-function initialiseIndicatorModal() {
-  const modal = getEl("indicatorModal");
-  const closeButton = getEl("closeIndicatorModal");
-  const searchInput = getEl("indicatorSearchInput");
-
-  if (!modal) {
-    console.error("Cannot initialise indicators: #indicatorModal not found");
-    return;
-  }
-
-  /*
-   * Connect the indicator button from every chart toolbar.
-   */
-  document
-    .querySelectorAll('.chart-toolbar button[data-tool="indicators"]')
-    .forEach(button => {
-      if (button.dataset.indicatorClickAttached === "true") {
-        return;
-      }
-
-      button.addEventListener("click", event => {
-        event.preventDefault();
-        event.stopPropagation();
-
-        const toolbar = button.closest(".chart-toolbar");
-        const chartName = toolbar?.dataset.chart;
-
-        if (!chartName) {
-          console.error(
-            "The chart toolbar does not contain a data-chart value"
-          );
-          return;
-        }
-
-        openIndicatorModal(chartName);
-      });
-
-      button.dataset.indicatorClickAttached = "true";
-    });
-
-  /*
-   * Close button.
-   */
-  if (closeButton && closeButton.dataset.clickAttached !== "true") {
-    closeButton.addEventListener("click", closeIndicatorModal);
-    closeButton.dataset.clickAttached = "true";
-  }
-
-  /*
-   * Close when clicking the background.
-   */
-  if (modal.dataset.backgroundClickAttached !== "true") {
-    modal.addEventListener("click", event => {
-      if (event.target === modal) {
-        closeIndicatorModal();
-      }
-    });
-
-    modal.dataset.backgroundClickAttached = "true";
-  }
-
-  /*
-   * Indicator search.
-   */
-  if (searchInput && searchInput.dataset.inputAttached !== "true") {
-    searchInput.addEventListener("input", filterIndicatorList);
-    searchInput.dataset.inputAttached = "true";
-  }
-
-  /*
-   * Category buttons: All, Trend, Momentum, etc.
-   */
-  document.querySelectorAll(".indicator-category").forEach(button => {
-    if (button.dataset.clickAttached === "true") return;
-
-    button.addEventListener("click", () => {
-      document.querySelectorAll(".indicator-category").forEach(category => {
-        category.classList.remove("active");
-      });
-
-      button.classList.add("active");
-      filterIndicatorList();
-    });
-
-    button.dataset.clickAttached = "true";
-  });
-
-  /*
-   * Indicator list buttons.
-   * For now, this opens the settings modal.
-   */
-  document.querySelectorAll(".indicator-list-item").forEach(button => {
-    if (button.dataset.clickAttached === "true") return;
-
-    button.addEventListener("click", () => {
-      const indicatorType = button.dataset.indicator;
-
-      if (!indicatorType) {
-        console.error("Indicator type is missing");
-        return;
-      }
-
-      const chartState = advancedCharts[activeIndicatorChart];
-      const existing = Array.isArray(chartState?.indicators)
-        ? chartState.indicators.find(indicator => indicator.type === indicatorType)
-        : null;
-      openIndicatorSettings(indicatorType, existing?.id || null);
-    });
-
-    button.dataset.clickAttached = "true";
-  });
-
-  /*
-   * Escape key closes the modal.
-   */
-  if (document.body.dataset.indicatorEscapeAttached !== "true") {
-    document.addEventListener("keydown", event => {
-      if (event.key === "Escape") {
-        closeIndicatorModal();
-        closeIndicatorSettings();
-      }
-    });
-
-    document.body.dataset.indicatorEscapeAttached = "true";
-  }
-}
-
-/* =========================================================
-   INDICATOR SETTINGS MODAL
-========================================================= */
-
-let currentIndicatorType = null;
-let currentIndicatorId = null;
-
-const INDICATOR_DEFAULTS = {
-  ema: {
-    length: 20,
-    source: "close",
-    color: "#2563eb",
-    secondaryColor: "#dc2626",
-    lineWidth: 2,
-    visible: true
-  },
-
-  sma: {
-    length: 20,
-    source: "close",
-    color: "#7c3aed",
-    secondaryColor: "#dc2626",
-    lineWidth: 2,
-    visible: true
-  },
-
-  vwap: {
-    source: "hlc3",
-    color: "#f59e0b",
-    secondaryColor: "#dc2626",
-    lineWidth: 2,
-    visible: true
-  },
-
-  supertrend: {
-    atrLength: 10,
-    multiplier: 3,
-    color: "#16a34a",
-    secondaryColor: "#dc2626",
-    lineWidth: 2,
-    visible: true
-  },
-
-  bollinger: {
-    length: 20,
-    source: "close",
-    multiplier: 2,
-    color: "#2563eb",
-    secondaryColor: "#94a3b8",
-    lineWidth: 2,
-    visible: true
-  },
-
-  rsi: {
-    length: 14,
-    source: "close",
-    color: "#7c3aed",
-    secondaryColor: "#dc2626",
-    lineWidth: 2,
-    visible: true
-  },
-
-  macd: {
-    fastLength: 12,
-    slowLength: 26,
-    signalLength: 9,
-    source: "close",
-    color: "#2563eb",
-    secondaryColor: "#dc2626",
-    lineWidth: 2,
-    visible: true
-  },
-
-  atr: {
-    length: 14,
-    color: "#f97316",
-    secondaryColor: "#dc2626",
-    lineWidth: 2,
-    visible: true
-  },
-
-  volume: {
-    color: "#16a34a",
-    secondaryColor: "#dc2626",
-    lineWidth: 1,
-    visible: true
-  }
-};
-
-function createIndicatorId(type) {
-  return `${type}-${Date.now()}-${Math.random()
-    .toString(36)
-    .slice(2, 8)}`;
-}
-
-function getIndicatorDefaultSettings(type) {
-  return {
-    ...(INDICATOR_DEFAULTS[type] || {})
-  };
-}
-
-function setIndicatorFieldVisibility(type) {
-  const supportedFields = {
-    ema: ["length", "source"],
-    sma: ["length", "source"],
-    vwap: ["source"],
-    supertrend: ["atrLength", "multiplier"],
-    bollinger: ["length", "source", "multiplier"],
-    rsi: ["length", "source"],
-    macd: [
-      "source",
-      "fastLength",
-      "slowLength",
-      "signalLength"
-    ],
-    atr: ["length"],
-    volume: []
-  };
-
-  const visibleFields = supportedFields[type] || [];
-
-  document
-    .querySelectorAll("[data-setting-field]")
-    .forEach(row => {
-      const fieldName = row.dataset.settingField;
-      row.hidden = !visibleFields.includes(fieldName);
-    });
-}
-
-function fillIndicatorSettingsForm(settings) {
-  const setValue = (id, value) => {
-    const element = getEl(id);
-
-    if (element && value !== undefined && value !== null) {
-      element.value = value;
-    }
-  };
-
-  setValue("indicatorLength", settings.length ?? 20);
-  setValue("indicatorSource", settings.source ?? "close");
-  setValue("indicatorMultiplier", settings.multiplier ?? 2);
-  setValue("indicatorAtrLength", settings.atrLength ?? 10);
-  setValue("indicatorFastLength", settings.fastLength ?? 12);
-  setValue("indicatorSlowLength", settings.slowLength ?? 26);
-  setValue("indicatorSignalLength", settings.signalLength ?? 9);
-  setValue("indicatorColor", settings.color ?? "#2563eb");
-  setValue(
-    "indicatorSecondaryColor",
-    settings.secondaryColor ?? "#dc2626"
-  );
-  setValue("indicatorLineWidth", settings.lineWidth ?? 2);
-
-  const visibleInput = getEl("indicatorVisible");
-
-  if (visibleInput) {
-    visibleInput.checked = settings.visible !== false;
-  }
-}
-
-function readIndicatorSettingsForm() {
-  return {
-    length: Math.max(
-      1,
-      Number(getEl("indicatorLength")?.value || 20)
-    ),
-
-    source: getEl("indicatorSource")?.value || "close",
-
-    multiplier: Math.max(
-      0.1,
-      Number(getEl("indicatorMultiplier")?.value || 2)
-    ),
-
-    atrLength: Math.max(
-      1,
-      Number(getEl("indicatorAtrLength")?.value || 10)
-    ),
-
-    fastLength: Math.max(
-      1,
-      Number(getEl("indicatorFastLength")?.value || 12)
-    ),
-
-    slowLength: Math.max(
-      1,
-      Number(getEl("indicatorSlowLength")?.value || 26)
-    ),
-
-    signalLength: Math.max(
-      1,
-      Number(getEl("indicatorSignalLength")?.value || 9)
-    ),
-
-    color: getEl("indicatorColor")?.value || "#2563eb",
-
-    secondaryColor:
-      getEl("indicatorSecondaryColor")?.value || "#dc2626",
-
-    lineWidth: Math.max(
-      1,
-      Number(getEl("indicatorLineWidth")?.value || 2)
-    ),
-
-    visible: Boolean(getEl("indicatorVisible")?.checked)
-  };
-}
-
-function openIndicatorSettings(indicatorType, indicatorId = null) {
-  const modal = getEl("indicatorSettingsModal");
-
-  if (!modal) {
-    console.error(
-      "Indicator settings modal not found: #indicatorSettingsModal"
-    );
-    return;
-  }
-
-  currentIndicatorType = indicatorType;
-  currentIndicatorId = indicatorId;
-
-  let settings = getIndicatorDefaultSettings(indicatorType);
-
-  const chartState = advancedCharts[activeIndicatorChart];
-
-  if (
-    chartState &&
-    Array.isArray(chartState.indicators) &&
-    indicatorId
-  ) {
-    const existingIndicator = chartState.indicators.find(
-      indicator => indicator.id === indicatorId
-    );
-
-    if (existingIndicator) {
-      settings = {
-        ...settings,
-        ...existingIndicator.settings
-      };
-    }
-  }
-
-  const title = getEl("indicatorSettingsTitle");
-
-  if (title) {
-    title.textContent =
-      `Indicator settings — ${indicatorType.toUpperCase()}`;
-  }
-
-  setIndicatorFieldVisibility(indicatorType);
-  fillIndicatorSettingsForm(settings);
-
-  modal.classList.add("open");
-  modal.setAttribute("aria-hidden", "false");
-
-  showIndicatorSettingsTab("inputs");
-}
-
-function closeIndicatorSettings() {
-  const modal = getEl("indicatorSettingsModal");
-
-  if (!modal) return;
-
-  modal.classList.remove("open");
-  modal.setAttribute("aria-hidden", "true");
-
-  currentIndicatorType = null;
-  currentIndicatorId = null;
-}
-
-function showIndicatorSettingsTab(tabName) {
-  const inputsPanel = getEl("indicatorInputsPanel");
-  const stylePanel = getEl("indicatorStylePanel");
-
-  document
-    .querySelectorAll(".indicator-settings-tab")
-    .forEach(button => {
-      button.classList.toggle(
-        "active",
-        button.dataset.settingsTab === tabName
-      );
-    });
-
-  if (inputsPanel) {
-    inputsPanel.hidden = tabName !== "inputs";
-  }
-
-  if (stylePanel) {
-    stylePanel.hidden = tabName !== "style";
-  }
-}
-
-function saveIndicatorSettings() {
-  if (!activeIndicatorChart || !currentIndicatorType) {
-    console.error("No active chart or indicator selected");
-    return;
-  }
-
-  const chartState = advancedCharts[activeIndicatorChart];
-
-  if (!chartState) {
-    console.error(`Unknown chart: ${activeIndicatorChart}`);
-    return;
-  }
-
-  /*
-   * Convert old object state into an array.
-   */
-  if (!Array.isArray(chartState.indicators)) {
-    chartState.indicators = [];
-  }
-
-  const settings = readIndicatorSettingsForm();
-
-  if (currentIndicatorId) {
-    const existingIndex = chartState.indicators.findIndex(
-      indicator => indicator.id === currentIndicatorId
-    );
-
-    if (existingIndex >= 0) {
-      chartState.indicators[existingIndex] = {
-        ...chartState.indicators[existingIndex],
-        type: currentIndicatorType,
-        settings
-      };
-    }
-  } else {
-    chartState.indicators.push({
-      id: createIndicatorId(currentIndicatorType),
-      type: currentIndicatorType,
-      settings,
-      series: []
-    });
-  }
-
-  closeIndicatorSettings();
-  closeIndicatorModal();
-  refreshIndicatorModalState();
-
-  console.log(
-    `Saved ${currentIndicatorType} for ${activeIndicatorChart}`,
-    settings
-  );
-
-  /*
-   * The actual indicator drawing function will be called here.
-   */
-  redrawChartIndicators(activeIndicatorChart);
-}
-
-function removeCurrentIndicator() {
-  if (
-    !activeIndicatorChart ||
-    !currentIndicatorId
-  ) {
-    closeIndicatorSettings();
-    return;
-  }
-
-  const chartState = advancedCharts[activeIndicatorChart];
-
-  if (!chartState || !Array.isArray(chartState.indicators)) {
-    closeIndicatorSettings();
-    return;
-  }
-
-  chartState.indicators = chartState.indicators.filter(
-    indicator => indicator.id !== currentIndicatorId
-  );
-
-  closeIndicatorSettings();
-  refreshIndicatorModalState();
-  redrawChartIndicators(activeIndicatorChart);
-}
-
-function initialiseIndicatorSettingsModal() {
-  const modal = getEl("indicatorSettingsModal");
-  const closeButton = getEl("closeIndicatorSettings");
-  const cancelButton = getEl("cancelIndicatorSettings");
-  const saveButton = getEl("saveIndicatorSettings");
-  const removeButton = getEl("removeIndicatorSettings");
-
-  if (!modal) {
-    console.error(
-      "Cannot initialise indicator settings: modal not found"
-    );
-    return;
-  }
-
-  closeButton?.addEventListener(
-    "click",
-    closeIndicatorSettings
-  );
-
-  cancelButton?.addEventListener(
-    "click",
-    closeIndicatorSettings
-  );
-
-  saveButton?.addEventListener(
-    "click",
-    saveIndicatorSettings
-  );
-
-  removeButton?.addEventListener(
-    "click",
-    removeCurrentIndicator
-  );
-
-  document
-    .querySelectorAll(".indicator-settings-tab")
-    .forEach(button => {
-      button.addEventListener("click", () => {
-        showIndicatorSettingsTab(
-          button.dataset.settingsTab || "inputs"
-        );
-      });
-    });
-
-  modal.addEventListener("click", event => {
-    if (event.target === modal) {
-      closeIndicatorSettings();
-    }
-  });
-}
-
-function getIndicatorSourceValue(row, source = "close") {
-  const open = Number(row?.open);
-  const high = Number(row?.high);
-  const low = Number(row?.low);
-  const close = Number(row?.close);
-
-  if (![open, high, low, close].every(Number.isFinite)) return null;
-
-  switch (source) {
-    case "open": return open;
-    case "high": return high;
-    case "low": return low;
-    case "hl2": return (high + low) / 2;
-    case "hlc3": return (high + low + close) / 3;
-    case "ohlc4": return (open + high + low + close) / 4;
-    default: return close;
-  }
-}
-
-function calculateSMA(rows, period, source = "close") {
-  const result = [];
-  const window = [];
-  let sum = 0;
-
-  rows.forEach(row => {
-    const value = getIndicatorSourceValue(row, source);
-    if (!Number.isFinite(value)) return;
-
-    window.push(value);
-    sum += value;
-
-    if (window.length > period) sum -= window.shift();
-    if (window.length === period) result.push({ time: row.time, value: sum / period });
-  });
-
-  return result;
-}
-
-function calculateEMA(rows, period, source = "close") {
-  const values = rows
-    .map(row => ({ row, value: getIndicatorSourceValue(row, source) }))
-    .filter(item => Number.isFinite(item.value));
-
-  if (values.length < period) return [];
-
-  const result = [];
-  const multiplier = 2 / (period + 1);
-  let ema = values.slice(0, period).reduce((sum, item) => sum + item.value, 0) / period;
-  result.push({ time: values[period - 1].row.time, value: ema });
-
-  for (let i = period; i < values.length; i += 1) {
-    ema = ((values[i].value - ema) * multiplier) + ema;
-    result.push({ time: values[i].row.time, value: ema });
-  }
-
-  return result;
-}
-
-function calculateVWAP(rows, source = "hlc3") {
-  const result = [];
-  let cumulativePV = 0;
-  let cumulativeVolume = 0;
-
-  rows.forEach(row => {
-    const price = getIndicatorSourceValue(row, source);
-    const volume = Number(row?.volume ?? row?.qty ?? 0);
-    if (!Number.isFinite(price) || !Number.isFinite(volume) || volume <= 0) return;
-
-    cumulativePV += price * volume;
-    cumulativeVolume += volume;
-    result.push({ time: row.time, value: cumulativePV / cumulativeVolume });
-  });
-
-  return result;
-}
-
-function calculateBollingerBands(rows, period, multiplier, source = "close") {
-  const middle = [];
-  const upper = [];
-  const lower = [];
-  const window = [];
-
-  rows.forEach(row => {
-    const value = getIndicatorSourceValue(row, source);
-    if (!Number.isFinite(value)) return;
-
-    window.push(value);
-    if (window.length > period) window.shift();
-    if (window.length !== period) return;
-
-    const mean = window.reduce((sum, item) => sum + item, 0) / period;
-    const variance = window.reduce((sum, item) => sum + ((item - mean) ** 2), 0) / period;
-    const deviation = Math.sqrt(variance) * multiplier;
-
-    middle.push({ time: row.time, value: mean });
-    upper.push({ time: row.time, value: mean + deviation });
-    lower.push({ time: row.time, value: mean - deviation });
-  });
-
-  return { middle, upper, lower };
-}
-
-function calculateATR(rows, period) {
-  const trueRanges = [];
-  const result = [];
-  let previousClose = null;
-  let atr = null;
-
-  rows.forEach(row => {
-    const high = Number(row?.high);
-    const low = Number(row?.low);
-    const close = Number(row?.close);
-    if (![high, low, close].every(Number.isFinite)) return;
-
-    const tr = previousClose === null
-      ? high - low
-      : Math.max(high - low, Math.abs(high - previousClose), Math.abs(low - previousClose));
-    trueRanges.push({ time: row.time, value: tr });
-    previousClose = close;
-  });
-
-  if (trueRanges.length < period) return [];
-  atr = trueRanges.slice(0, period).reduce((sum, item) => sum + item.value, 0) / period;
-  result.push({ time: trueRanges[period - 1].time, value: atr });
-
-  for (let i = period; i < trueRanges.length; i += 1) {
-    atr = ((atr * (period - 1)) + trueRanges[i].value) / period;
-    result.push({ time: trueRanges[i].time, value: atr });
-  }
-
-  return result;
-}
-
-function calculateRSI(rows, period, source = "close") {
-  const values = rows
-    .map(row => ({ time: row.time, value: getIndicatorSourceValue(row, source) }))
-    .filter(item => Number.isFinite(item.value));
-  if (values.length <= period) return [];
-
-  let gains = 0;
-  let losses = 0;
-  for (let i = 1; i <= period; i += 1) {
-    const change = values[i].value - values[i - 1].value;
-    gains += Math.max(change, 0);
-    losses += Math.max(-change, 0);
-  }
-
-  let avgGain = gains / period;
-  let avgLoss = losses / period;
-  const result = [];
-  const toRsi = () => avgLoss === 0 ? 100 : 100 - (100 / (1 + (avgGain / avgLoss)));
-  result.push({ time: values[period].time, value: toRsi() });
-
-  for (let i = period + 1; i < values.length; i += 1) {
-    const change = values[i].value - values[i - 1].value;
-    avgGain = ((avgGain * (period - 1)) + Math.max(change, 0)) / period;
-    avgLoss = ((avgLoss * (period - 1)) + Math.max(-change, 0)) / period;
-    result.push({ time: values[i].time, value: toRsi() });
-  }
-
-  return result;
-}
-
-function calculateMACD(rows, fastLength, slowLength, signalLength, source = "close") {
-  const fast = calculateEMA(rows, fastLength, source);
-  const slow = calculateEMA(rows, slowLength, source);
-  const slowMap = new Map(slow.map(item => [item.time, item.value]));
-  const macd = fast
-    .filter(item => slowMap.has(item.time))
-    .map(item => ({ time: item.time, value: item.value - slowMap.get(item.time) }));
-
-  const signalRows = macd.map(item => ({
-    time: item.time,
-    open: item.value,
-    high: item.value,
-    low: item.value,
-    close: item.value
-  }));
-  const signal = calculateEMA(signalRows, signalLength, "close");
-  const signalMap = new Map(signal.map(item => [item.time, item.value]));
-  const histogram = macd
-    .filter(item => signalMap.has(item.time))
-    .map(item => ({
-      time: item.time,
-      value: item.value - signalMap.get(item.time),
-      color: item.value - signalMap.get(item.time) >= 0 ? "rgba(22,163,74,0.65)" : "rgba(220,38,38,0.65)"
-    }));
-
-  return { macd, signal, histogram };
-}
-
-function calculateSupertrend(rows, atrLength, multiplier) {
-  const atr = calculateATR(rows, atrLength);
-  const atrMap = new Map(atr.map(item => [item.time, item.value]));
-  const result = [];
-  let finalUpper = null;
-  let finalLower = null;
-  let supertrend = null;
-  let previousClose = null;
-
-  rows.forEach(row => {
-    const high = Number(row?.high);
-    const low = Number(row?.low);
-    const close = Number(row?.close);
-    const atrValue = atrMap.get(row.time);
-    if (![high, low, close, atrValue].every(Number.isFinite)) {
-      previousClose = Number.isFinite(close) ? close : previousClose;
-      return;
-    }
-
-    const hl2 = (high + low) / 2;
-    const basicUpper = hl2 + (multiplier * atrValue);
-    const basicLower = hl2 - (multiplier * atrValue);
-
-    finalUpper = finalUpper === null || basicUpper < finalUpper || previousClose > finalUpper
-      ? basicUpper
-      : finalUpper;
-    finalLower = finalLower === null || basicLower > finalLower || previousClose < finalLower
-      ? basicLower
-      : finalLower;
-
-    if (supertrend === null) supertrend = finalUpper;
-    else if (supertrend === finalUpper) supertrend = close <= finalUpper ? finalUpper : finalLower;
-    else supertrend = close >= finalLower ? finalLower : finalUpper;
-
-    result.push({
-      time: row.time,
-      value: supertrend,
-      color: close >= supertrend ? "#16a34a" : "#dc2626"
-    });
-    previousClose = close;
-  });
-
-  return result;
-}
-
-function safeRemoveSeries(chart, series) {
-  if (!chart || !series) return;
-  try { chart.removeSeries(series); } catch (error) { console.warn("Indicator series removal warning:", error); }
-}
-
-function clearIndicatorSeries(chartState, indicator) {
-  if (!Array.isArray(indicator.series)) indicator.series = [];
-  indicator.series.forEach(series => safeRemoveSeries(chartState.chart, series));
-  indicator.series = [];
-}
-
-function createLineIndicatorSeries(chartState, data, settings, options = {}) {
-  const series = chartState.chart.addLineSeries({
-    color: options.color || settings.color,
-    lineWidth: Number(settings.lineWidth || 2),
-    visible: settings.visible !== false,
-    priceScaleId: options.priceScaleId || "right",
-    lastValueVisible: options.lastValueVisible ?? true,
-    priceLineVisible: options.priceLineVisible ?? false
-  });
-  series.setData(data);
-  return series;
-}
-
-function redrawChartIndicators(chartName) {
-  const chartState = advancedCharts[chartName];
-  if (!chartState?.chart || !Array.isArray(chartState.rows)) return;
-  if (!Array.isArray(chartState.indicators)) chartState.indicators = [];
-
-  chartState.indicators.forEach(indicator => {
-    clearIndicatorSeries(chartState, indicator);
-    const settings = indicator.settings || {};
-    const rows = chartState.rows;
-
-    try {
-      if (indicator.type === "ema") {
-        indicator.series.push(createLineIndicatorSeries(chartState, calculateEMA(rows, settings.length, settings.source), settings));
-      } else if (indicator.type === "sma") {
-        indicator.series.push(createLineIndicatorSeries(chartState, calculateSMA(rows, settings.length, settings.source), settings));
-      } else if (indicator.type === "vwap") {
-        indicator.series.push(createLineIndicatorSeries(chartState, calculateVWAP(rows, settings.source), settings));
-      } else if (indicator.type === "bollinger") {
-        const bands = calculateBollingerBands(rows, settings.length, settings.multiplier, settings.source);
-        indicator.series.push(createLineIndicatorSeries(chartState, bands.middle, settings));
-        indicator.series.push(createLineIndicatorSeries(chartState, bands.upper, settings, { color: settings.secondaryColor }));
-        indicator.series.push(createLineIndicatorSeries(chartState, bands.lower, settings, { color: settings.secondaryColor }));
-      } else if (indicator.type === "supertrend") {
-        const data = calculateSupertrend(rows, settings.atrLength, settings.multiplier);
-        const series = chartState.chart.addLineSeries({
-          color: settings.color,
-          lineWidth: Number(settings.lineWidth || 2),
-          visible: settings.visible !== false,
-          priceLineVisible: false,
-          lastValueVisible: true
-        });
-        series.setData(data);
-        indicator.series.push(series);
-      } else if (indicator.type === "rsi") {
-        chartState.chart.priceScale("rsi").applyOptions({ scaleMargins: { top: 0.72, bottom: 0.02 } });
-        indicator.series.push(createLineIndicatorSeries(chartState, calculateRSI(rows, settings.length, settings.source), settings, { priceScaleId: "rsi" }));
-      } else if (indicator.type === "atr") {
-        chartState.chart.priceScale("atr").applyOptions({ scaleMargins: { top: 0.72, bottom: 0.02 } });
-        indicator.series.push(createLineIndicatorSeries(chartState, calculateATR(rows, settings.length), settings, { priceScaleId: "atr" }));
-      } else if (indicator.type === "macd") {
-        chartState.chart.priceScale("macd").applyOptions({ scaleMargins: { top: 0.72, bottom: 0.02 } });
-        const macd = calculateMACD(rows, settings.fastLength, settings.slowLength, settings.signalLength, settings.source);
-        indicator.series.push(createLineIndicatorSeries(chartState, macd.macd, settings, { priceScaleId: "macd" }));
-        indicator.series.push(createLineIndicatorSeries(chartState, macd.signal, settings, { priceScaleId: "macd", color: settings.secondaryColor }));
-        const histogram = chartState.chart.addHistogramSeries({
-          priceScaleId: "macd",
-          priceFormat: { type: "price" },
-          visible: settings.visible !== false,
-          priceLineVisible: false,
-          lastValueVisible: false
-        });
-        histogram.setData(macd.histogram);
-        indicator.series.push(histogram);
-      } else if (indicator.type === "volume") {
-        const volumeData = rows
-          .map(row => ({
-            time: row.time,
-            value: Number(row?.volume ?? row?.qty ?? 0),
-            color: Number(row?.close) >= Number(row?.open)
-              ? "rgba(22,163,74,0.55)"
-              : "rgba(220,38,38,0.55)"
-          }))
-          .filter(item => Number.isFinite(item.value) && item.value > 0);
-
-        const histogram = chartState.chart.addHistogramSeries({
-          priceScaleId: "volume",
-          priceFormat: { type: "volume" },
-          visible: settings.visible !== false,
-          priceLineVisible: false,
-          lastValueVisible: false
-        });
-        chartState.chart.priceScale("volume").applyOptions({ scaleMargins: { top: 0.78, bottom: 0 } });
-        histogram.setData(volumeData);
-        indicator.series.push(histogram);
-      }
-    } catch (error) {
-      console.error(`Failed to draw ${indicator.type} on ${chartName}:`, error);
-    }
-  });
-}
-
-/* =========================================================
-   CHART DRAWING TOOLS
-========================================================= */
-
-const chartDrawings = {
-  index: [],
-  future: [],
-  vix: []
-};
-
-const drawingState = {
-  chartName: null,
-  tool: null,
-  canvas: null,
-  context: null,
-  startPoint: null,
-  previewPoint: null,
-  drawing: false
-};
-
-function getDrawingCanvas(chartName) {
-  const ids = {
-    index: "indexDrawingCanvas",
-    future: "futureDrawingCanvas",
-    vix: "vixDrawingCanvas"
-  };
-
-  return getEl(ids[chartName]);
-}
-
-function resizeDrawingCanvas(chartName) {
-  const canvas = getDrawingCanvas(chartName);
-
-  if (!canvas) return;
-
-  const rect = canvas.parentElement.getBoundingClientRect();
-  const ratio = window.devicePixelRatio || 1;
-
-  canvas.width = Math.max(1, Math.round(rect.width * ratio));
-  canvas.height = Math.max(1, Math.round(rect.height * ratio));
-
-  canvas.style.width = `${rect.width}px`;
-  canvas.style.height = `${rect.height}px`;
-
-  const context = canvas.getContext("2d");
-
-  context.setTransform(ratio, 0, 0, ratio, 0, 0);
-
-  redrawSavedDrawings(chartName);
-}
-
-function getCanvasPoint(canvas, event) {
-  const rect = canvas.getBoundingClientRect();
-
-  return {
-    x: event.clientX - rect.left,
-    y: event.clientY - rect.top
-  };
-}
-
-function drawTrendLine(context, start, end) {
-  context.beginPath();
-  context.moveTo(start.x, start.y);
-  context.lineTo(end.x, end.y);
-  context.stroke();
-}
-
-function drawHorizontalLine(context, point, width) {
-  context.beginPath();
-  context.moveTo(0, point.y);
-  context.lineTo(width, point.y);
-  context.stroke();
-}
-
-function drawRectangle(context, start, end) {
-  const x = Math.min(start.x, end.x);
-  const y = Math.min(start.y, end.y);
-  const width = Math.abs(end.x - start.x);
-  const height = Math.abs(end.y - start.y);
-
-  context.strokeRect(x, y, width, height);
-}
-
-function drawTextAnnotation(context, point, text) {
-  context.save();
-  context.font = "bold 14px Arial";
-  context.fillStyle = "#111827";
-  context.fillText(text, point.x, point.y);
-  context.restore();
-}
-
-function applyDrawingStyle(context) {
-  context.strokeStyle = "#2563eb";
-  context.fillStyle = "#2563eb";
-  context.lineWidth = 2;
-  context.lineCap = "round";
-  context.lineJoin = "round";
-}
-
-function renderDrawing(context, canvas, drawing) {
-  applyDrawingStyle(context);
-
-  if (drawing.tool === "trend") {
-    drawTrendLine(context, drawing.start, drawing.end);
-  }
-
-  if (drawing.tool === "horizontal") {
-    drawHorizontalLine(
-      context,
-      drawing.start,
-      canvas.getBoundingClientRect().width
-    );
-  }
-
-  if (drawing.tool === "rectangle") {
-    drawRectangle(context, drawing.start, drawing.end);
-  }
-
-  if (drawing.tool === "text") {
-    drawTextAnnotation(
-      context,
-      drawing.start,
-      drawing.text || "Text"
-    );
-  }
-}
-
-function redrawSavedDrawings(chartName, previewDrawing = null) {
-  const canvas = getDrawingCanvas(chartName);
-
-  if (!canvas) return;
-
-  const context = canvas.getContext("2d");
-  const rect = canvas.getBoundingClientRect();
-
-  context.clearRect(0, 0, rect.width, rect.height);
-
-  const drawings = chartDrawings[chartName] || [];
-
-  drawings.forEach(drawing => {
-    renderDrawing(context, canvas, drawing);
-  });
-
-  if (previewDrawing) {
-    renderDrawing(context, canvas, previewDrawing);
-  }
-}
-
-function deactivateDrawingTool() {
-  if (drawingState.canvas) {
-    drawingState.canvas.classList.remove("active");
-  }
-
-  document
-    .querySelectorAll(
-      '.chart-toolbar button[data-tool="trend"], ' +
-      '.chart-toolbar button[data-tool="horizontal"], ' +
-      '.chart-toolbar button[data-tool="rectangle"], ' +
-      '.chart-toolbar button[data-tool="text"]'
+        for row in chain_df.itertuples(index=False)
+    ]
+    timings["response_build_ms"] = round((time.perf_counter() - stage) * 1000, 3)
+
+    valid_iv = pd.to_numeric(chain_df["iv"], errors="coerce").dropna()
+    atm_iv = valid_iv.mean() if not valid_iv.empty else None
+
+    available_expiries = get_available_expiries_for_date(
+        datetime.strptime(date_str, "%Y%m%d").date(),
+        dataset=dataset,
+        max_months=2,
     )
-    .forEach(button => {
-      button.classList.remove("active");
-    });
 
-  drawingState.chartName = null;
-  drawingState.tool = null;
-  drawingState.canvas = null;
-  drawingState.context = null;
-  drawingState.startPoint = null;
-  drawingState.previewPoint = null;
-  drawingState.drawing = false;
-}
+    timings["total_ms"] = round((time.perf_counter() - total_started) * 1000, 3)
 
-function activateDrawingTool(chartName, tool, button) {
-  deactivateDrawingTool();
-
-  const canvas = getDrawingCanvas(chartName);
-
-  if (!canvas) {
-    console.error(`Drawing canvas missing for ${chartName}`);
-    return;
-  }
-
-  resizeDrawingCanvas(chartName);
-
-  drawingState.chartName = chartName;
-  drawingState.tool = tool;
-  drawingState.canvas = canvas;
-  drawingState.context = canvas.getContext("2d");
-
-  canvas.classList.add("active");
-  button.classList.add("active");
-}
-
-function clearChartDrawings(chartName) {
-  if (!chartDrawings[chartName]) return;
-
-  chartDrawings[chartName] = [];
-  redrawSavedDrawings(chartName);
-}
-
-function handleDrawingMouseDown(event) {
-  if (!drawingState.canvas || !drawingState.tool) return;
-
-  const point = getCanvasPoint(drawingState.canvas, event);
-
-  if (drawingState.tool === "horizontal") {
-    chartDrawings[drawingState.chartName].push({
-      tool: "horizontal",
-      start: point
-    });
-
-    redrawSavedDrawings(drawingState.chartName);
-    return;
-  }
-
-  if (drawingState.tool === "text") {
-    const text = window.prompt("Enter annotation text:");
-
-    if (text && text.trim()) {
-      chartDrawings[drawingState.chartName].push({
-        tool: "text",
-        start: point,
-        text: text.trim()
-      });
-
-      redrawSavedDrawings(drawingState.chartName);
+    payload = {
+        "ok": True,
+        "dataset": dataset,
+        "underlying": dataset,
+        "query_date": query_date,
+        "date_str": date_str,
+        "query_time": target_ts.strftime("%H:%M"),
+        "resolved_week_number": resolved_week,
+        "expiry": expiry_str,
+        "expiry_label": _fmt_expiry_label(expiry_str),
+        "available_expiries": available_expiries,
+        "spot": round(float(spot), 2),
+        "india_vix": (
+            round(float(india_vix_value), 2)
+            if india_vix_value is not None
+            else None
+        ),
+        "day_open": round(float(day_open), 2),
+        "atm": int(atm),
+        "strike_step": strike_step,
+        "lot_size": int(LOT_SIZE_BY_INSTRUMENT.get(dataset, 65)),
+        "interval": candle_interval_minutes,
+        "max_allowed_query_date": MAX_ALLOWED_QUERY_DATE.strftime("%Y-%m-%d"),
+        "window_candles_before": WINDOW_CANDLES_BEFORE,
+        "window_candles_after": WINDOW_CANDLES_AFTER,
+        "option_window_cache_size": len(OPTION_WINDOW_CACHE),
+        "iv_enabled": ENABLE_IV_CALC,
+        "chain_source": chain_source,
+        "cache_hit": False,
+        "atm_iv": (
+            round(float(atm_iv), 4)
+            if atm_iv is not None and np.isfinite(atm_iv)
+            else None
+        ),
+        "performance": timings,
+        "rows": chain_rows,
     }
 
-    return;
-  }
+    _put_chain_snapshot_cache(cache_key, payload)
+    logger.info(
+        "Option-chain snapshot dataset=%s date=%s time=%s expiry=%s "
+        "source=%s rows=%d timings=%s",
+        dataset,
+        date_str,
+        query_time,
+        expiry_str,
+        chain_source,
+        len(chain_rows),
+        timings,
+    )
+    return payload
 
-  drawingState.startPoint = point;
-  drawingState.previewPoint = point;
-  drawingState.drawing = true;
-}
 
-function handleDrawingMouseMove(event) {
-  if (
-    !drawingState.drawing ||
-    !drawingState.canvas ||
-    !drawingState.startPoint
-  ) {
-    return;
-  }
+# =========================================================
+# BLACK-SCHOLES PAYOFF HELPERS
+# =========================================================
 
-  drawingState.previewPoint = getCanvasPoint(
-    drawingState.canvas,
-    event
-  );
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
-  redrawSavedDrawings(drawingState.chartName, {
-    tool: drawingState.tool,
-    start: drawingState.startPoint,
-    end: drawingState.previewPoint
-  });
-}
 
-function handleDrawingMouseUp(event) {
-  if (
-    !drawingState.drawing ||
-    !drawingState.canvas ||
-    !drawingState.startPoint
-  ) {
-    return;
-  }
+def _norm_pdf(x: float) -> float:
+    return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
 
-  const endPoint = getCanvasPoint(drawingState.canvas, event);
 
-  chartDrawings[drawingState.chartName].push({
-    tool: drawingState.tool,
-    start: drawingState.startPoint,
-    end: endPoint
-  });
+def black_scholes_price_and_greeks(
+    spot: float,
+    strike: float,
+    days_to_expiry: int,
+    iv_percent: float,
+    option_type: str,
+    risk_free_rate: float = 0.0,
+) -> Dict[str, float]:
+    T = max(float(days_to_expiry), 1.0) / 365.0
+    sigma = max(float(iv_percent), 0.01) / 100.0
+    strike = max(float(strike), 1.0)
+    spot = max(float(spot), 1.0)
 
-  drawingState.startPoint = null;
-  drawingState.previewPoint = null;
-  drawingState.drawing = false;
+    d1 = (
+        math.log(spot / strike)
+        + (risk_free_rate + 0.5 * sigma * sigma) * T
+    ) / (sigma * math.sqrt(T))
 
-  redrawSavedDrawings(drawingState.chartName);
-}
+    d2 = d1 - sigma * math.sqrt(T)
 
-function initialiseDrawingCanvas(chartName) {
-  const canvas = getDrawingCanvas(chartName);
+    if option_type.upper() == "CE":
+        price = spot * _norm_cdf(d1) - strike * math.exp(-risk_free_rate * T) * _norm_cdf(d2)
+        delta = _norm_cdf(d1)
+    else:
+        price = strike * math.exp(-risk_free_rate * T) * _norm_cdf(-d2) - spot * _norm_cdf(-d1)
+        delta = _norm_cdf(d1) - 1.0
 
-  if (!canvas || canvas.dataset.drawingInitialised === "true") {
-    return;
-  }
+    gamma = _norm_pdf(d1) / (spot * sigma * math.sqrt(T))
+    vega = spot * _norm_pdf(d1) * math.sqrt(T) / 100.0
+    theta = -(spot * _norm_pdf(d1) * sigma) / (2.0 * math.sqrt(T)) / 365.0
 
-  canvas.addEventListener("mousedown", handleDrawingMouseDown);
-  canvas.addEventListener("mousemove", handleDrawingMouseMove);
-  canvas.addEventListener("mouseup", handleDrawingMouseUp);
-  canvas.addEventListener("mouseleave", event => {
-    if (drawingState.drawing) {
-      handleDrawingMouseUp(event);
+    return {
+        "price": round(float(price), 2),
+        "delta": round(float(delta), 6),
+        "gamma": round(float(gamma), 8),
+        "vega": round(float(vega), 6),
+        "theta": round(float(theta), 6),
     }
-  });
 
-  canvas.dataset.drawingInitialised = "true";
 
-  resizeDrawingCanvas(chartName);
-}
+def _intrinsic_value(spot: float, strike: float, option_type: str) -> float:
+    if option_type.upper() == "CE":
+        return max(float(spot) - float(strike), 0.0)
+    return max(float(strike) - float(spot), 0.0)
 
-function initialiseChartDrawingTools() {
-  ["index", "future", "vix"].forEach(initialiseDrawingCanvas);
 
-  document
-    .querySelectorAll(".chart-toolbar button[data-tool]")
-    .forEach(button => {
-      if (button.dataset.drawingClickAttached === "true") {
-        return;
-      }
+def _leg_payoff_at_expiry(spot: float, leg: Dict[str, Any], lot_size: int) -> float:
+    strike = float(leg["strike"])
+    premium = float(leg["premium"])
+    qty = int(leg.get("qty", 1))
+    lots = int(leg.get("lots", 1))
+    side = str(leg["side"]).upper()
+    option_type = str(leg["type"]).upper()
 
-      const tool = button.dataset.tool;
+    intrinsic = _intrinsic_value(spot, strike, option_type)
 
-      if (tool === "indicators") {
-        return;
-      }
+    if side == "BUY":
+        per_unit = intrinsic - premium
+    else:
+        per_unit = premium - intrinsic
 
-      button.addEventListener("click", event => {
-        event.preventDefault();
+    return per_unit * qty * lots
 
-        const toolbar = button.closest(".chart-toolbar");
-        const chartName = toolbar?.dataset.chart;
-        const chartState = advancedCharts[chartName];
 
-        if (!chartName) return;
+def _current_leg_pnl(
+    spot: float,
+    leg: Dict[str, Any],
+    days_to_expiry: int,
+    iv_percent: float,
+    lot_size: int,
+) -> float:
+    """
+    Used for the pink Current MTM curve.
+    This should use Black-Scholes theoretical price.
+    Do not use this for actual P&L card.
+    """
+    strike = float(leg["strike"])
+    premium = float(leg["premium"])
+    qty = int(leg.get("qty", 1))
+    lots = int(leg.get("lots", 1))
+    side = str(leg["side"]).upper()
+    option_type = str(leg["type"]).upper()
 
-        if (tool === "fit") {
-          chartState?.chart?.timeScale().fitContent();
-          resizeDrawingCanvas(chartName);
-          return;
-        }
+    bs = black_scholes_price_and_greeks(
+        spot=spot,
+        strike=strike,
+        days_to_expiry=days_to_expiry,
+        iv_percent=iv_percent,
+        option_type=option_type,
+    )
 
-        if (tool === "clear") {
-          clearChartDrawings(chartName);
-          deactivateDrawingTool();
-          return;
-        }
+    current_price = float(bs["price"])
 
-        if (tool === "crosshair") {
-          deactivateDrawingTool();
-          return;
-        }
+    if side == "BUY":
+        return float((current_price - premium) * qty * lots)
 
-        if (
-          tool === "trend" ||
-          tool === "horizontal" ||
-          tool === "rectangle" ||
-          tool === "text"
-        ) {
-          activateDrawingTool(chartName, tool, button);
-        }
-      });
+    return float((premium - current_price) * qty * lots)
 
-      button.dataset.drawingClickAttached = "true";
-    });
 
-  window.addEventListener("resize", () => {
-    ["index", "future", "vix"].forEach(resizeDrawingCanvas);
-  });
-}
+def _actual_leg_pnl_now(leg: Dict[str, Any]) -> float:
+    """
+    Used only for actual P&L card.
 
-async function initSimulator() {
-  try {
-    ensureExpiryWarning();
-    ensureMetricsCards();
-    ensurePositionsHeaders();
+    premium = entry price
+    current_price = latest LTP sent from frontend
+    """
+    premium = float(leg["premium"])
+    current_price = float(leg.get("current_price", premium))
 
-    await loadDefaults();
-    resetStrategyPositions();
-    const initialData = await loadChain();
+    qty = int(leg.get("qty", 1))
+    lots = int(leg.get("lots", 1))
+    side = str(leg["side"]).upper()
 
-    // Start the simulator with a short straddle only once, after the initial
-    // option chain has loaded. Date/time navigation must never recreate it.
-    if (initialData && chain.length && legs.length === 0) {
-      loadTemplate("short_straddle");
+    if side == "BUY":
+        return float((current_price - premium) * qty * lots)
+
+    return float((premium - current_price) * qty * lots)
+
+
+def _signed_leg_units(leg: Dict[str, Any]) -> int:
+    """
+    BUY legs have positive payoff slope after the strike.
+    SELL legs have negative payoff slope after the strike.
+    """
+    side = str(leg["side"]).upper()
+    qty = int(leg.get("qty", 1))
+    lots = int(leg.get("lots", 1))
+    return qty * lots if side == "BUY" else -qty * lots
+
+
+def _payoff_unlimited_flags(legs: List[Dict[str, Any]]) -> Dict[str, bool]:
+    """
+    For vanilla options on an index, spot cannot go below zero, so downside is bounded.
+    Only uncovered net call exposure can create unlimited payoff/loss as spot -> infinity.
+
+    net_call_units > 0  => unlimited profit potential
+    net_call_units < 0  => unlimited loss risk
+    net_call_units == 0 => upside is hedged/bounded
+    """
+    net_call_units = 0
+
+    for leg in legs:
+        if str(leg.get("type", "")).upper() == "CE":
+            net_call_units += _signed_leg_units(leg)
+
+    return {
+        "max_profit_unlimited": net_call_units > 0,
+        "max_loss_unlimited": net_call_units < 0,
     }
-  } catch (err) {
-    console.error("initSimulator error:", err);
-    alert(err.message || "Simulator failed to initialize");
-  }
-}
-
-window.addEventListener("DOMContentLoaded", () => {
-  ensureExpiryWarning();
-  ensureMetricsCards();
-  ensurePositionsHeaders();
-
-  initialiseIndicatorModal();
-  initialiseIndicatorSettingsModal();
-  initialiseChartDrawingTools();
-
-  // =====================================================
-  // REFRESH BUTTON WITH LOADING SIGNAL
-  // =====================================================
-
-  const refreshBtn = getEl("refreshBtn");
-
-  if (refreshBtn) {
-    refreshBtn.onclick = async () => {
-      if (refreshBtn.disabled) return;
-
-      try {
-        setRefreshLoading(true);
-
-        /*
-         * Manual refresh:
-         * preserve the expiry currently selected by the user.
-         */
-        await loadChain(true, false);
-
-      } catch (error) {
-        console.error(
-          "Refresh error:",
-          error
-        );
-
-        alert(
-          error.message ||
-          "Failed to refresh option chain"
-        );
-
-      } finally {
-        setRefreshLoading(false);
-      }
-    };
-  }
-
-  // =====================================================
-  // DATE CHANGE
-  // AUTOMATICALLY SELECT NEAREST VALID EXPIRY
-  // =====================================================
-
-  const queryDateInput =
-    getEl("queryDate") ||
-    getEl("date") ||
-    getEl("query_date");
-
-  if (queryDateInput) {
-    queryDateInput.addEventListener(
-      "change",
-      async () => {
-        try {
-          setRefreshLoading(true);
-
-          /*
-           * Preserve the open strategy, its strikes, expiry, entry time and
-           * entry premiums. Only the live market values, P&L and Greeks are
-           * refreshed for the selected trading day.
-           */
-          await loadChain(true, false);
-
-        } catch (error) {
-          console.error(
-            "Date-change error:",
-            error
-          );
-
-          alert(
-            error.message ||
-            "Failed to load data for the selected date"
-          );
-
-        } finally {
-          setRefreshLoading(false);
-        }
-      }
-    );
-  }
-
-  // =====================================================
-  // PREVIOUS AND NEXT INTERVAL BUTTONS
-  // =====================================================
-
-  const prevBtn = getEl("prevIntervalBtn");
-
-  if (prevBtn) {
-    prevBtn.onclick = movePreviousInterval;
-  }
-
-  const nextBtn = getEl("nextIntervalBtn");
-
-  if (nextBtn) {
-    nextBtn.onclick = moveNextInterval;
-  }
-
-  // =====================================================
-  // GREEKS MODAL
-  // =====================================================
-
-  const openGreeksBtn = getEl("openGreeksBtn");
-
-  if (openGreeksBtn) {
-    openGreeksBtn.addEventListener(
-      "click",
-      openGreeksPopup
-    );
-  }
-
-  const closeGreeksBtn = getEl("closeGreeksBtn");
-
-  if (closeGreeksBtn) {
-    closeGreeksBtn.addEventListener(
-      "click",
-      closeGreeksPopup
-    );
-  }
-
-  // =====================================================
-  // INDEX CHART
-  // =====================================================
-
-  const chartOpenBtn = getEl("openChartPopup");
-
-  if (chartOpenBtn) {
-    chartOpenBtn.addEventListener(
-      "click",
-      openChartPopup
-    );
-  }
-
-  const chartCloseBtn = getEl("closeChartPopup");
-
-  if (chartCloseBtn) {
-    chartCloseBtn.addEventListener(
-      "click",
-      closeChartPopup
-    );
-  }
-
-  // =====================================================
-  // FUTURE CHART
-  // =====================================================
-
-  const futureOpenBtn =
-    getEl("openFutureChartPopup");
-
-  if (futureOpenBtn) {
-    futureOpenBtn.addEventListener(
-      "click",
-      openFutureChartPopup
-    );
-  }
-
-  const futureCloseBtn =
-    getEl("closeFutureChartPopup");
-
-  if (futureCloseBtn) {
-    futureCloseBtn.addEventListener(
-      "click",
-      closeFutureChartPopup
-    );
-  }
-
-  const futureMonthSelect =
-    getEl("futureMonthSelect");
-
-  if (futureMonthSelect) {
-    futureMonthSelect.addEventListener(
-      "change",
-      openFutureChartPopup
-    );
-  }
-
-  /*
-   * These variables may be used elsewhere in your existing
-   * chart code. Keep them if they are referenced later.
-   */
-  const futureChartStartDate =
-    getEl("futureChartStartDate");
-
-  const futureChartEndDate =
-    getEl("futureChartEndDate");
-
-  const futureChartEndTime =
-    getEl("futureChartEndTime");
-
-  const futureChartInterval =
-    getEl("futureChartInterval");
-
-  // =====================================================
-  // INDIA VIX CHART
-  // =====================================================
-
-  const vixOpenBtn =
-    getEl("openVixChartPopup");
-
-  if (vixOpenBtn) {
-    vixOpenBtn.addEventListener(
-      "click",
-      openIndiaVixChartPopup
-    );
-  }
-
-  const vixCloseBtn =
-    getEl("closeVixChartPopup");
-
-  if (vixCloseBtn) {
-    vixCloseBtn.addEventListener(
-      "click",
-      closeIndiaVixChartPopup
-    );
-  }
-
-  // =====================================================
-  // CHART APPLY BUTTONS
-  // =====================================================
-
-  document
-    .querySelectorAll(".chart-apply-btn")
-    .forEach(btn => {
-      if (
-        btn.dataset.clickAttached === "true"
-      ) {
-        return;
-      }
-
-      btn.addEventListener(
-        "click",
-        () => {
-          if (
-            btn.dataset.chart === "future"
-          ) {
-            openFutureChartPopup();
-          }
-
-          if (
-            btn.dataset.chart === "index"
-          ) {
-            openChartPopup();
-          }
-
-          if (
-            btn.dataset.chart === "vix"
-          ) {
-            openIndiaVixChartPopup();
-          }
-
-          if (
-            btn.dataset.chart === "option"
-          ) {
-            openOptionMetricChart(
-              {
-                preventDefault: () => {}
-              },
-              Number(btn.dataset.strike),
-              btn.dataset.metric
-            );
-          }
-        }
-      );
-
-      btn.dataset.clickAttached = "true";
-    });
-
-  // =====================================================
-  // DATASET CHANGE
-  // NIFTY / BANKNIFTY / SENSEX
-  // =====================================================
-
-  const datasetSelect =
-    getEl("dataset") ||
-    getEl("underlying") ||
-    getEl("symbol");
-
-  if (datasetSelect) {
-    datasetSelect.addEventListener(
-      "change",
-      async () => {
-        try {
-          setRefreshLoading(true);
-
-          resetStrategyPositions();
-
-          /*
-           * Dataset changed, so the previous expiry must not
-           * be preserved.
-           *
-           * BANKNIFTY will therefore receive its nearest
-           * monthly expiry from the backend.
-           */
-          await loadChain(true, true);
-
-        } catch (error) {
-          console.error(
-            "Dataset-change error:",
-            error
-          );
-
-          alert(
-            error.message ||
-            "Failed to change dataset"
-          );
-
-        } finally {
-          setRefreshLoading(false);
-        }
-      }
-    );
-  }
-
-  // =====================================================
-  // EXPIRY CHANGE
-  // =====================================================
-
-  const expirySelect =
-    getEl("expirySelect");
-
-  if (expirySelect) {
-    expirySelect.addEventListener(
-      "change",
-      async () => {
-        try {
-          setRefreshLoading(true);
-
-          resetStrategyPositions();
-
-          /*
-           * The user manually selected an expiry.
-           * Preserve and send that selected value.
-           */
-          await loadChain(true, false);
-
-        } catch (error) {
-          console.error(
-            "Expiry-change error:",
-            error
-          );
-
-          alert(
-            error.message ||
-            "Failed to load selected expiry"
-          );
-
-        } finally {
-          setRefreshLoading(false);
-        }
-      }
-    );
-  }
-
-  // =====================================================
-  // RESPONSIVE CHART RESIZING
-  // =====================================================
-
-  window.addEventListener(
-    "resize",
-    () => {
-      const indexContainer =
-        getEl("fullscreenIndexChart");
-
-      if (
-        fullscreenChart &&
-        indexContainer
-      ) {
-        fullscreenChart.applyOptions({
-          width: indexContainer.clientWidth,
-          height: indexContainer.clientHeight
-        });
-      }
-
-      const futureContainer =
-        getEl("fullscreenFutureChart");
-
-      if (
-        futureChart &&
-        futureContainer
-      ) {
-        futureChart.applyOptions({
-          width: futureContainer.clientWidth,
-          height: futureContainer.clientHeight
-        });
-      }
-
-      const vixContainer =
-        getEl("fullscreenVixChart");
-
-      if (
-        vixChart &&
-        vixContainer
-      ) {
-        vixChart.applyOptions({
-          width: vixContainer.clientWidth,
-          height: vixContainer.clientHeight
-        });
-      }
+
+
+def _summary_payoff_points(spot: float, legs: List[Dict[str, Any]], strike_step: int) -> List[float]:
+    """
+    Payoff at expiry is piecewise linear. Finite maxima/minima happen at kink points
+    (strikes) or at the zero boundary. Add the current spot for context.
+    """
+    points = {0.0, float(spot)}
+
+    for leg in legs:
+        try:
+            points.add(float(leg["strike"]))
+        except Exception:
+            pass
+
+    # Add one step around the traded strikes so fully hedged spreads are evaluated
+    # just outside their wings even when the chart range is narrow.
+    strikes = sorted(p for p in points if p > 0)
+    if strikes:
+        lo = max(0.0, min(strikes) - float(strike_step))
+        hi = max(strikes) + float(strike_step)
+        points.add(lo)
+        points.add(hi)
+
+    return sorted(points)
+
+
+def calculate_strategy(
+    spot: float,
+    iv: float,
+    days: int,
+    legs: List[Dict[str, Any]],
+    dataset: str = "NIFTY",
+) -> Dict[str, Any]:
+    dataset = _normalize_dataset(dataset)
+
+    cfg = get_dataset_config(dataset)
+    strike_step = int(cfg["strike_step"])
+    lot_size = int(LOT_SIZE_BY_INSTRUMENT.get(dataset, 65))
+
+    strikes_in_legs = [
+        float(leg["strike"])
+        for leg in legs
+        if leg.get("strike") is not None
+    ]
+
+    # Keep the chart readable but make it wide enough to show hedges/wings.
+    if strikes_in_legs:
+        lower_seed = min(float(spot) * 0.94, min(strikes_in_legs) - 3 * strike_step)
+        upper_seed = max(float(spot) * 1.06, max(strikes_in_legs) + 3 * strike_step)
+    else:
+        lower_seed = float(spot) * 0.94
+        upper_seed = float(spot) * 1.06
+
+    lower = max(0, int(lower_seed // strike_step * strike_step))
+    upper = int(math.ceil(upper_seed / strike_step) * strike_step)
+
+    spots = list(range(lower, upper + strike_step, strike_step))
+    expiry_payoff = []
+    current_payoff = []
+
+    for s in spots:
+        expiry_payoff.append(
+            round(
+                sum(_leg_payoff_at_expiry(s, leg, lot_size) for leg in legs),
+                2,
+            )
+        )
+
+        current_payoff.append(
+            round(
+                sum(_current_leg_pnl(s, leg, days, iv, lot_size) for leg in legs),
+                2,
+            )
+        )
+
+    total_credit = 0.0
+    total_debit = 0.0
+
+    greeks = {
+        "delta": 0.0,
+        "gamma": 0.0,
+        "vega": 0.0,
+        "theta": 0.0,
     }
-  );
 
-  // =====================================================
-  // EXISTING TAB CODE CONTINUES BELOW
-  // =====================================================
+    for leg in legs:
+        side = str(leg["side"]).upper()
+        option_type = str(leg["type"]).upper()
+        strike = float(leg["strike"])
+        premium = float(leg["premium"])
+        qty_units = int(leg.get("qty", 1)) * int(leg.get("lots", 1))
 
-  const payoffTab = getEl("payoffTab");
-  const volSmileTab = getEl("volSmileTab");
-  const ivSurfaceTab = getEl("ivSurfaceTab");
+        premium_value = premium * qty_units
 
-  const payoffPanel = getEl("payoffPanel");
-  const volSmilePanel = getEl("volSmilePanel");
-  const ivSurfacePanel = getEl("ivSurfacePanel");
+        if side == "SELL":
+            total_credit += premium_value
+            greek_sign = -1
+        else:
+            total_debit += premium_value
+            greek_sign = 1
 
-  /*
-   * Keep the remainder of your existing DOMContentLoaded
-   * code below this point.
-   */
+        bs = black_scholes_price_and_greeks(
+            spot=spot,
+            strike=strike,
+            days_to_expiry=days,
+            iv_percent=iv,
+            option_type=option_type,
+        )
 
-function setMainPanel(activeTab, activePanel) {
-  [payoffTab, volSmileTab, ivSurfaceTab].forEach(tab => {
-    if (tab) tab.classList.remove("active");
-  });
+        greeks["delta"] += greek_sign * bs["delta"] * qty_units
+        greeks["gamma"] += greek_sign * bs["gamma"] * qty_units
+        greeks["vega"] += greek_sign * bs["vega"] * qty_units
+        greeks["theta"] += greek_sign * bs["theta"] * qty_units
 
-  [payoffPanel, volSmilePanel, ivSurfacePanel].forEach(panel => {
-    if (panel) panel.style.display = "none";
-  });
+    unlimited = _payoff_unlimited_flags(legs)
 
-  if (activeTab) activeTab.classList.add("active");
-  if (activePanel) activePanel.style.display = "block";
-}
+    summary_points = _summary_payoff_points(
+        spot=spot,
+        legs=legs,
+        strike_step=strike_step,
+    )
 
-if (payoffTab && payoffPanel) {
-  payoffTab.addEventListener("click", () => {
-    setMainPanel(payoffTab, payoffPanel);
-  });
-}
+    summary_payoffs = [
+        round(
+            sum(_leg_payoff_at_expiry(s, leg, lot_size) for leg in legs),
+            2,
+        )
+        for s in summary_points
+    ]
 
-if (volSmileTab && volSmilePanel) {
-  volSmileTab.addEventListener("click", () => {
-    setMainPanel(volSmileTab, volSmilePanel);
-    renderVolSmile();
-  });
-}
+    finite_max_profit = max(summary_payoffs) if summary_payoffs else 0
+    finite_max_loss = min(summary_payoffs) if summary_payoffs else 0
 
-if (ivSurfaceTab && ivSurfacePanel) {
-  ivSurfaceTab.addEventListener("click", () => {
-    setMainPanel(ivSurfaceTab, ivSurfacePanel);
-    renderIvSurface();
-  });
-}
+    max_profit = (
+        "Unlimited"
+        if unlimited["max_profit_unlimited"]
+        else round(finite_max_profit, 2)
+    )
+
+    max_loss = (
+        "Unlimited"
+        if unlimited["max_loss_unlimited"]
+        else round(finite_max_loss, 2)
+    )
+
+    breakevens = []
+
+    for i in range(1, len(spots)):
+        if expiry_payoff[i - 1] == 0:
+            breakevens.append(spots[i - 1])
+        elif expiry_payoff[i - 1] * expiry_payoff[i] < 0:
+            x1, x2 = spots[i - 1], spots[i]
+            y1, y2 = expiry_payoff[i - 1], expiry_payoff[i]
+            breakeven = x1 + (0 - y1) * (x2 - x1) / (y2 - y1)
+            breakevens.append(round(breakeven, 2))
+
+    pnl_now = round(
+        sum(_actual_leg_pnl_now(leg) for leg in legs),
+        2,
+    )
+
+    return {
+        "spots": spots,
+        "payoff": expiry_payoff,
+        "current": current_payoff,
+        "summary": {
+            "net_credit": round(total_credit - total_debit, 2),
+            "max_profit": max_profit,
+            "max_loss": max_loss,
+            "breakevens": breakevens,
+            "pnl_now": pnl_now,
+            "delta": round(greeks["delta"], 2),
+            "gamma": round(greeks["gamma"], 4),
+            "vega": round(greeks["vega"], 2),
+            "theta": round(greeks["theta"], 2),
+            "lot_size": lot_size,
+        },
+    }
+
+# =========================================================
+# ROUTES
+# =========================================================
+
+@app.route("/")
+def index():
+    return render_template("simulator.html")
+
+
+@app.route("/api/chain")
+def api_chain():
+    try:
+        dataset = _normalize_dataset(
+            request.args.get("dataset")
+            or request.args.get("underlying")
+        )
+
+        query_date = (
+            request.args.get("date")
+            or request.args.get("query_date")
+        )
+
+        query_date = _normalize_date(query_date) if query_date else None
+
+        query_time = _normalize_time(
+            request.args.get("time")
+            or request.args.get("query_time")
+        )
+
+        expiry_rule = request.args.get("expiry_rule", "current expiry")
+
+        week_number = request.args.get("week_number")
+        week_number = int(week_number) if week_number not in (None, "", "null") else None
+
+        strike_count = int(request.args.get("strike_count", 14))
+        interval = int(request.args.get("interval", CANDLE_INTERVAL_MINUTES))
+        compute_greeks = _env_bool(
+            "DEFAULT_CHAIN_COMPUTE_GREEKS",
+            True,
+        )
+        if request.args.get("compute_greeks") is not None:
+            compute_greeks = str(request.args.get("compute_greeks")).strip().lower() in {
+                "1", "true", "yes", "on"
+            }
+
+        selected_expiry = request.args.get("expiry")
+
+        result = build_option_chain_snapshot(
+            query_date=query_date,
+            query_time=query_time,
+            dataset=dataset,
+            week_number=week_number,
+            expiry_rule=expiry_rule,
+            strike_count_each_side=strike_count,
+            candle_interval_minutes=interval,
+            selected_expiry=selected_expiry,
+            compute_greeks=compute_greeks,
+        )
+
+        response = jsonify(result)
+        performance = result.get("performance") or {}
+        if performance:
+            response.headers["Server-Timing"] = ", ".join(
+                f"{name.replace('_ms', '')};dur={value}"
+                for name, value in performance.items()
+                if name.endswith("_ms")
+            )
+        return response
+
+    except Exception as exc:
+        return _json_error(str(exc), 400)
+
+# =========================================================
+# ASYNC IV SURFACE ROUTES
+# Redis + ThreadPoolExecutor
+# =========================================================
+
+if redis_client is not None:
+    try:
+        from iv_surface_async import register_iv_surface_routes
+
+        register_iv_surface_routes(
+            app=app,
+            redis_client=redis_client,
+            build_option_chain_snapshot=build_option_chain_snapshot,
+            get_available_expiries_for_date=get_available_expiries_for_date,
+            normalize_dataset=_normalize_dataset,
+            normalize_date=_normalize_date,
+            normalize_time=_normalize_time,
+            resolve_default_week_date=_resolve_default_week_date,
+            safe_float=_safe_float,
+            json_error=_json_error,
+            default_interval=CANDLE_INTERVAL_MINUTES,
+        )
+
+        logger.info(
+            "IV-surface routes registered using Redis + ThreadPoolExecutor."
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "Unable to register async IV-surface routes: %s",
+            exc,
+        )
+        raise
+
+else:
+    @app.get("/api/iv-surface")
+    def api_iv_surface_unavailable():
+        return _json_error(
+            "IV-surface service is unavailable because Redis is not connected.",
+            503,
+        )
+
+    @app.get("/api/iv-surface/status/<job_id_value>")
+    def api_iv_surface_status_unavailable(job_id_value: str):
+        return _json_error(
+            "IV-surface service is unavailable because Redis is not connected.",
+            503,
+        )
+
+
+@app.route("/api/index-chart")
+def api_index_chart():
+    try:
+        dataset = _normalize_dataset(
+            request.args.get("dataset")
+            or request.args.get("underlying")
+        )
+
+        start_date = _normalize_date(
+            request.args.get("date")
+            or request.args.get("query_date")
+        )
+
+        end_date = _normalize_date(
+            request.args.get("end_date")
+            or start_date
+        )
+
+        end_time = _normalize_time(
+            request.args.get("time")
+            or request.args.get("end_time")
+            or "15:30"
+        )
+
+        interval = int(request.args.get("interval", CANDLE_INTERVAL_MINUTES))
+
+        if interval <= 0:
+            raise ValueError("interval must be greater than zero.")
+
+        start_day = datetime.strptime(start_date, "%Y-%m-%d").date()
+        end_day = datetime.strptime(end_date, "%Y-%m-%d").date()
+
+        if end_day < start_day:
+            raise ValueError("end_date cannot be before start date.")
+
+        all_candles = []
+        resolved_week = None
+        last_date_str = None
+
+        current_day = start_day
+
+        while current_day <= end_day:
+            current_query_date = current_day.strftime("%Y-%m-%d")
+
+            try:
+                resolved_week, folder, date_str = _resolve_week_folder_for_date(
+                    query_date=current_query_date,
+                    dataset=dataset,
+                    week_number=None,
+                )
+
+                day_candles = _get_spot_candles_for_day(
+                    folder=folder,
+                    date_str=date_str,
+                    dataset=dataset,
+                    candle_interval_minutes=interval,
+                )
+
+                if day_candles is not None and not day_candles.empty:
+                    all_candles.append(day_candles)
+                    last_date_str = date_str
+
+            except Exception:
+                pass
+
+            current_day += timedelta(days=1)
+
+        if not all_candles:
+            return jsonify({
+                "ok": True,
+                "dataset": dataset,
+                "query_date": start_date,
+                "end_date": end_date,
+                "date_str": None,
+                "resolved_week_number": resolved_week,
+                "interval": interval,
+                "rows": [],
+            })
+
+        candles = pd.concat(all_candles).sort_index()
+
+        start_dt = IST.localize(
+            datetime.strptime(f"{start_date} 09:15", "%Y-%m-%d %H:%M")
+        )
+
+        end_dt = IST.localize(
+            datetime.strptime(f"{end_date} {end_time}", "%Y-%m-%d %H:%M")
+        )
+
+        candles = candles[
+            (candles.index >= start_dt)
+            & (candles.index <= end_dt)
+        ]
+
+        rows = []
+
+        for ts, row in candles.iterrows():
+            ts = pd.Timestamp(ts)
+
+            if ts.tzinfo is not None:
+                ts = ts.tz_convert(IST).tz_localize(None)
+
+
+            rows.append({
+                "time": int(ts.timestamp()),
+                "open": round(float(row["open"]), 2),
+                "high": round(float(row["high"]), 2),
+                "low": round(float(row["low"]), 2),
+                "close": round(float(row["close"]), 2),
+            })
+
+        return jsonify({
+            "ok": True,
+            "dataset": dataset,
+            "query_date": start_date,
+            "end_date": end_date,
+            "date_str": last_date_str,
+            "resolved_week_number": resolved_week,
+            "interval": interval,
+            "rows": rows,
+        })
+
+    except Exception as exc:
+        return _json_error(str(exc), 400)
+
+@app.route("/api/option-metric-chart")
+def api_option_metric_chart():
+    request_started = time.perf_counter()
+    timings: Dict[str, float] = {}
+
+    try:
+        dataset = _normalize_dataset(
+            request.args.get("dataset") or request.args.get("underlying")
+        )
+        query_date_value = request.args.get("date") or request.args.get("query_date")
+        query_date = _normalize_date(query_date_value) if query_date_value else None
+
+        strike = int(request.args.get("strike"))
+        metric = str(request.args.get("metric") or "").strip().lower()
+        interval = int(request.args.get("interval", CANDLE_INTERVAL_MINUTES))
+        selected_expiry = request.args.get("expiry")
+
+        allowed = {
+            "ce_ltp", "pe_ltp",
+            "ce_iv", "pe_iv",
+            "ce_delta", "pe_delta",
+        }
+        if metric not in allowed:
+            raise ValueError(f"Unsupported metric: {metric}")
+        if interval <= 0 or interval > 1440:
+            raise ValueError("interval must be between 1 and 1440 minutes")
+
+        stage = time.perf_counter()
+        if query_date:
+            resolved_week, folder, date_str = _resolve_week_folder_for_date(
+                query_date=query_date,
+                dataset=dataset,
+                week_number=None,
+            )
+        else:
+            resolved_week, folder, date_str, query_date = _resolve_default_week_date(dataset)
+        timings["resolve_data_ms"] = round((time.perf_counter() - stage) * 1000, 3)
+
+        end_date = _normalize_date(request.args.get("end_date") or query_date)
+        end_time = _normalize_time(
+            request.args.get("time") or request.args.get("end_time") or "15:30"
+        )
+
+        expiry_str = selected_expiry or get_upcoming_expiry_np(
+            datetime.strptime(date_str, "%Y%m%d").date(),
+            instrument=dataset,
+        )
+        if not expiry_str:
+            raise ValueError("No upcoming expiry found")
+        expiry_str = str(expiry_str).strip()
+
+        metric_cache_key = (
+            dataset, query_date, end_date, end_time, expiry_str,
+            int(strike), metric, int(interval),
+        )
+        cached = _get_metric_chart_cache(metric_cache_key)
+        if cached is not None:
+            elapsed = round((time.perf_counter() - request_started) * 1000, 3)
+            cached["cache_hit"] = True
+            cached["performance"] = {"cache_lookup_ms": elapsed, "total_ms": elapsed}
+            return jsonify(cached)
+
+        start_ts = IST.localize(
+            datetime.strptime(f"{query_date} 09:15", "%Y-%m-%d %H:%M")
+        )
+        end_ts = IST.localize(
+            datetime.strptime(f"{end_date} {end_time}", "%Y-%m-%d %H:%M")
+        )
+        if end_ts < start_ts:
+            raise ValueError("end date/time cannot be before start date/time")
+
+        stage = time.perf_counter()
+        consolidated = load_consolidated_option_chain(
+            folder=folder,
+            date_str=date_str,
+            expiry_str=expiry_str,
+            instrument=dataset,
+        )
+        opt = _load_option_data_fast(
+            folder=folder,
+            date_str=date_str,
+            expiry_str=expiry_str,
+            strike=strike,
+            dataset=dataset,
+            chain=consolidated,
+        )
+        timings["option_load_ms"] = round((time.perf_counter() - stage) * 1000, 3)
+
+        stage = time.perf_counter()
+        ce_close = _resample_option_close_for_session(
+            opt.get("CE"), interval, start_ts, end_ts
+        )
+        pe_close = _resample_option_close_for_session(
+            opt.get("PE"), interval, start_ts, end_ts
+        )
+        timings["option_resample_ms"] = round((time.perf_counter() - stage) * 1000, 3)
+
+        stage = time.perf_counter()
+        spot_candles = _get_spot_candles_for_day(
+            folder=folder,
+            date_str=date_str,
+            dataset=dataset,
+            candle_interval_minutes=interval,
+        )
+        timings["spot_load_ms"] = round((time.perf_counter() - stage) * 1000, 3)
+
+        if spot_candles is None or spot_candles.empty:
+            return _json_error(
+                "No spot candles found for the selected date.",
+                404,
+                dataset=dataset, date_str=date_str, strike=strike, metric=metric, rows=[],
+            )
+
+        if getattr(spot_candles.index, "tz", None) is None:
+            spot_index = spot_candles.index.tz_localize(IST)
+        else:
+            spot_index = spot_candles.index.tz_convert(IST)
+
+        in_range = (spot_index >= start_ts) & (spot_index <= end_ts)
+        spot_frame = spot_candles.loc[in_range].copy()
+        spot_index = spot_index[in_range]
+        if spot_frame.empty:
+            return _json_error(
+                "No spot candles found inside the requested chart range.",
+                404, rows=[],
+            )
+
+        # Reindex option closes to the exact spot-candle grid. Forward-fill only
+        # after the first real option observation; leading missing values stay NaN.
+        ce_aligned = ce_close.reindex(spot_index).ffill() if not ce_close.empty else pd.Series(index=spot_index, dtype="float64")
+        pe_aligned = pe_close.reindex(spot_index).ffill() if not pe_close.empty else pd.Series(index=spot_index, dtype="float64")
+
+        rows_df = pd.DataFrame({
+            "timestamp": spot_index.tz_localize(None),
+            "trade_date": datetime.strptime(date_str, "%Y%m%d").date(),
+            "instrument": dataset,
+            "expiry": expiry_str,
+            "nearest_strike": int(strike),
+            "strike": int(strike),
+            "close": pd.to_numeric(spot_frame["close"], errors="coerce").to_numpy(),
+            "ce": ce_aligned.to_numpy(),
+            "pe": pe_aligned.to_numpy(),
+        })
+
+        diagnostics = {
+            "spot_rows": int(rows_df["close"].notna().sum()),
+            "ce_price_rows": int(rows_df["ce"].notna().sum()),
+            "pe_price_rows": int(rows_df["pe"].notna().sum()),
+        }
+
+        stage = time.perf_counter()
+        if metric in {"ce_iv", "pe_iv", "ce_delta", "pe_delta"}:
+            compute_greeks = metric in {"ce_delta", "pe_delta"}
+            try:
+                rows_df = append_black_scholes_iv(
+                    rows_df,
+                    compute_greeks=compute_greeks,
+                    inplace=True,
+                )
+            except TypeError:
+                rows_df = append_black_scholes_iv(
+                    rows_df, compute_greeks=compute_greeks
+                )
+        timings["iv_greeks_ms"] = round((time.perf_counter() - stage) * 1000, 3)
+
+        col_map = {
+            "ce_ltp": "ce", "pe_ltp": "pe",
+            "ce_iv": "ce_iv", "pe_iv": "pe_iv",
+            "ce_delta": "ce_delta", "pe_delta": "pe_delta",
+        }
+        col = col_map[metric]
+        if col not in rows_df.columns:
+            rows_df[col] = np.nan
+
+        for name in ("ce_iv", "pe_iv", "ce_delta", "pe_delta"):
+            diagnostics[f"{name}_rows"] = int(
+                rows_df[name].notna().sum() if name in rows_df.columns else 0
+            )
+
+        valid = rows_df.loc[rows_df[col].notna(), ["timestamp", col]]
+        if valid.empty:
+            timings["total_ms"] = round((time.perf_counter() - request_started) * 1000, 3)
+            logger.warning(
+                "No metric chart data dataset=%s date=%s expiry=%s strike=%s "
+                "metric=%s diagnostics=%s timings=%s",
+                dataset, date_str, expiry_str, strike, metric, diagnostics, timings,
+            )
+            return _json_error(
+                f"No valid {metric} values were calculated for strike {strike}.",
+                422,
+                dataset=dataset, query_date=query_date, end_date=end_date,
+                end_time=end_time, date_str=date_str, expiry=expiry_str,
+                strike=strike, metric=metric, diagnostics=diagnostics,
+                performance=timings, rows=[],
+            )
+
+        stage = time.perf_counter()
+        rows = []
+        for row in valid.itertuples(index=False, name=None):
+            ts, value = row
+            ts = pd.Timestamp(ts)
+            if ts.tzinfo is not None:
+                ts = ts.tz_convert(IST).tz_localize(None)
+            rows.append({
+                "time": int(ts.timestamp()),
+                "value": round(float(value), 4),
+            })
+        timings["response_build_ms"] = round((time.perf_counter() - stage) * 1000, 3)
+        timings["total_ms"] = round((time.perf_counter() - request_started) * 1000, 3)
+
+        payload = {
+            "ok": True,
+            "dataset": dataset,
+            "query_date": query_date,
+            "end_date": end_date,
+            "end_time": end_time,
+            "date_str": date_str,
+            "resolved_week_number": resolved_week,
+            "expiry": expiry_str,
+            "strike": strike,
+            "metric": metric,
+            "interval": interval,
+            "cache_hit": False,
+            "diagnostics": diagnostics,
+            "performance": timings,
+            "rows": rows,
+        }
+        _put_metric_chart_cache(metric_cache_key, payload)
+        logger.info(
+            "Metric chart dataset=%s date=%s expiry=%s strike=%s metric=%s "
+            "rows=%d timings=%s",
+            dataset, date_str, expiry_str, strike, metric, len(rows), timings,
+        )
+        return jsonify(payload)
+
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    except Exception as exc:
+        logger.exception("Option metric chart failed")
+        return _json_error("Unable to build option metric chart.", 500, detail=str(exc))
+
+
+@app.route("/api/option-ltp-candle-chart")
+def api_option_ltp_candle_chart():
+    try:
+        dataset = _normalize_dataset(
+            request.args.get("dataset")
+            or request.args.get("underlying")
+        )
+
+        query_date = (
+            request.args.get("date")
+            or request.args.get("query_date")
+        )
+
+        query_date = (
+            _normalize_date(query_date)
+            if query_date
+            else None
+        )
+
+        strike = int(request.args.get("strike"))
+
+        side = str(
+            request.args.get("side") or "CE"
+        ).upper()
+
+        interval = int(
+            request.args.get(
+                "interval",
+                CANDLE_INTERVAL_MINUTES,
+            )
+        )
+
+        selected_expiry = request.args.get("expiry")
+
+        if side not in {"CE", "PE"}:
+            raise ValueError("side must be CE or PE")
+
+        if interval <= 0:
+            raise ValueError(
+                "interval must be greater than zero"
+            )
+
+        # -------------------------------------------------
+        # Resolve selected date and week folder
+        # -------------------------------------------------
+
+        if query_date:
+            resolved_week, folder, date_str = (
+                _resolve_week_folder_for_date(
+                    query_date=query_date,
+                    dataset=dataset,
+                    week_number=None,
+                )
+            )
+        else:
+            (
+                resolved_week,
+                folder,
+                date_str,
+                query_date,
+            ) = _resolve_default_week_date(dataset)
+
+        # -------------------------------------------------
+        # Resolve expiry
+        # -------------------------------------------------
+
+        expiry_str = (
+            selected_expiry
+            or get_upcoming_expiry_np(
+                datetime.strptime(
+                    date_str,
+                    "%Y%m%d",
+                ).date(),
+                instrument=dataset,
+            )
+        )
+
+        if not expiry_str:
+            raise ValueError(
+                "No expiry found for selected date."
+            )
+
+        expiry_str = str(expiry_str).strip()
+
+        # -------------------------------------------------
+        # Load every raw tick for the selected contract
+        # -------------------------------------------------
+
+        raw_df = load_raw_option_contract_ticks(
+            folder=folder,
+            date_str=date_str,
+            expiry_str=expiry_str,
+            strike=strike,
+            option_type=side,
+            instrument=dataset,
+        )
+
+        if raw_df is None or raw_df.empty:
+            return jsonify(
+                {
+                    "ok": True,
+                    "dataset": dataset,
+                    "query_date": query_date,
+                    "date_str": date_str,
+                    "expiry": expiry_str,
+                    "strike": strike,
+                    "side": side,
+                    "interval": interval,
+                    "tick_count": 0,
+                    "candle_count": 0,
+                    "rows": [],
+                }
+            )
+
+        # -------------------------------------------------
+        # Prepare raw option ticks
+        # -------------------------------------------------
+
+        raw_df = raw_df.copy()
+
+        if "datetime" not in raw_df.columns:
+            raise ValueError(
+                "Option data does not contain datetime column."
+            )
+
+        if "price" not in raw_df.columns:
+            raise ValueError(
+                "Option data does not contain price column."
+            )
+
+        raw_df["datetime"] = pd.to_datetime(
+            raw_df["datetime"],
+            errors="coerce",
+        )
+
+        raw_df["price"] = pd.to_numeric(
+            raw_df["price"],
+            errors="coerce",
+        )
+
+        raw_df = (
+            raw_df
+            .dropna(subset=["datetime", "price"])
+            .sort_values("datetime")
+            .reset_index(drop=True)
+        )
+
+        if raw_df.empty:
+            raise ValueError(
+                "No valid raw option ticks found."
+            )
+
+        # -------------------------------------------------
+        # Ensure timestamps are in IST
+        # -------------------------------------------------
+
+        if getattr(
+            raw_df["datetime"].dt,
+            "tz",
+            None,
+        ) is None:
+            raw_df["datetime"] = (
+                raw_df["datetime"]
+                .dt.tz_localize(
+                    IST,
+                    ambiguous="NaT",
+                    nonexistent="NaT",
+                )
+            )
+        else:
+            raw_df["datetime"] = (
+                raw_df["datetime"]
+                .dt.tz_convert(IST)
+            )
+
+        raw_df = raw_df.dropna(
+            subset=["datetime"]
+        )
+
+        # -------------------------------------------------
+        # Requested chart range
+        # -------------------------------------------------
+
+        start_time = _normalize_time(
+            request.args.get("start_time")
+            or request.args.get("from_time")
+            or "09:15"
+        )
+
+        end_date = _normalize_date(
+            request.args.get("end_date")
+            or query_date
+        )
+
+        end_time = _normalize_time(
+            request.args.get("time")
+            or request.args.get("end_time")
+            or "15:30"
+        )
+
+        start_dt = IST.localize(
+            datetime.strptime(
+                f"{query_date} {start_time}",
+                "%Y-%m-%d %H:%M",
+            )
+        )
+
+        end_dt = IST.localize(
+            datetime.strptime(
+                f"{end_date} {end_time}",
+                "%Y-%m-%d %H:%M",
+            )
+        )
+
+        if end_dt < start_dt:
+            raise ValueError(
+                "End date/time cannot be before start date/time."
+            )
+
+        raw_df = raw_df[
+            (raw_df["datetime"] >= start_dt)
+            & (raw_df["datetime"] <= end_dt)
+        ].copy()
+
+        if raw_df.empty:
+            return jsonify(
+                {
+                    "ok": True,
+                    "dataset": dataset,
+                    "query_date": query_date,
+                    "end_date": end_date,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "date_str": date_str,
+                    "expiry": expiry_str,
+                    "strike": strike,
+                    "side": side,
+                    "interval": interval,
+                    "tick_count": 0,
+                    "candle_count": 0,
+                    "rows": [],
+                }
+            )
+
+        # -------------------------------------------------
+        # Optional diagnostics
+        # -------------------------------------------------
+
+        ticks_per_minute = (
+            raw_df
+            .set_index("datetime")
+            .resample("1min")["price"]
+            .count()
+        )
+
+        logger.info(
+            "Option raw-tick chart dataset=%s date=%s expiry=%s "
+            "strike=%s side=%s ticks=%s min_ticks_per_min=%s "
+            "max_ticks_per_min=%s avg_ticks_per_min=%.2f",
+            dataset,
+            date_str,
+            expiry_str,
+            strike,
+            side,
+            len(raw_df),
+            int(ticks_per_minute.min())
+            if not ticks_per_minute.empty
+            else 0,
+            int(ticks_per_minute.max())
+            if not ticks_per_minute.empty
+            else 0,
+            float(ticks_per_minute.mean())
+            if not ticks_per_minute.empty
+            else 0.0,
+        )
+
+        # -------------------------------------------------
+        # Build OHLC candles from all raw ticks
+        # -------------------------------------------------
+
+        candle_df = (
+            raw_df
+            .set_index("datetime")["price"]
+            .sort_index()
+            .resample(
+                f"{interval}min",
+                origin="start_day",
+                offset=pd.Timedelta(
+                    hours=9,
+                    minutes=15,
+                ),
+                label="left",
+                closed="left",
+            )
+            .ohlc()
+            .dropna(
+                subset=[
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                ]
+            )
+        )
+
+        if candle_df.empty:
+            return jsonify(
+                {
+                    "ok": True,
+                    "dataset": dataset,
+                    "query_date": query_date,
+                    "end_date": end_date,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "date_str": date_str,
+                    "expiry": expiry_str,
+                    "strike": strike,
+                    "side": side,
+                    "interval": interval,
+                    "tick_count": int(len(raw_df)),
+                    "candle_count": 0,
+                    "rows": [],
+                }
+            )
+
+        # -------------------------------------------------
+        # Convert candles for Lightweight Charts
+        # -------------------------------------------------
+
+        rows = []
+
+        for timestamp, candle in candle_df.iterrows():
+            timestamp = pd.Timestamp(timestamp)
+
+            if timestamp.tzinfo is not None:
+                timestamp = (
+                    timestamp
+                    .tz_convert(IST)
+                    .tz_localize(None)
+                )
+
+            rows.append(
+                {
+                    "time": int(timestamp.timestamp()),
+                    "open": round(
+                        float(candle["open"]),
+                        2,
+                    ),
+                    "high": round(
+                        float(candle["high"]),
+                        2,
+                    ),
+                    "low": round(
+                        float(candle["low"]),
+                        2,
+                    ),
+                    "close": round(
+                        float(candle["close"]),
+                        2,
+                    ),
+                }
+            )
+
+        return jsonify(
+            {
+                "ok": True,
+                "dataset": dataset,
+                "query_date": query_date,
+                "end_date": end_date,
+                "start_time": start_time,
+                "end_time": end_time,
+                "date_str": date_str,
+                "resolved_week_number": resolved_week,
+                "expiry": expiry_str,
+                "strike": strike,
+                "side": side,
+                "interval": interval,
+                "tick_count": int(len(raw_df)),
+                "candle_count": int(len(rows)),
+                "rows": rows,
+            }
+        )
+
+    except ValueError as exc:
+        return _json_error(
+            str(exc),
+            400,
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "Option LTP candle-chart error"
+        )
+
+        return _json_error(
+            "Unable to build option candle chart.",
+            500,
+            detail=str(exc),
+        )
+
+
+@app.route("/api/india-vix-chart")
+def api_india_vix_chart():
+    try:
+        dataset = _normalize_dataset(
+            request.args.get("dataset")
+            or request.args.get("underlying")
+        )
+
+        query_date = (
+            request.args.get("date")
+            or request.args.get("query_date")
+        )
+        query_date = _normalize_date(query_date) if query_date else None
+
+        end_date = _normalize_date(
+            request.args.get("end_date") or query_date
+        )
+
+        end_time = _normalize_time(
+            request.args.get("time")
+            or request.args.get("end_time")
+            or "15:30"
+        )
+
+        interval = int(request.args.get("interval", CANDLE_INTERVAL_MINUTES))
+
+        if interval <= 0:
+            raise ValueError("interval must be greater than zero.")
+
+        if query_date:
+            resolved_week, folder, date_str = _resolve_week_folder_for_date(
+                query_date=query_date,
+                dataset=dataset,
+                week_number=None,
+            )
+        else:
+            resolved_week, folder, date_str, query_date = _resolve_default_week_date(
+                dataset=dataset,
+            )
+
+        vix_df = load_index_data_by_symbol(
+            folder=folder,
+            date_str=date_str,
+            symbol_name="INDIAVIX",
+        )
+
+        if vix_df.empty:
+            return jsonify({
+                "ok": True,
+                "dataset": dataset,
+                "query_date": query_date,
+                "end_date": end_date,
+                "end_time": end_time,
+                "date_str": date_str,
+                "resolved_week_number": resolved_week,
+                "interval": interval,
+                "rows": [],
+            })
+
+        candles = create_candles(vix_df, interval)
+
+        start_dt = IST.localize(
+            datetime.strptime(f"{query_date} 09:15", "%Y-%m-%d %H:%M")
+        )
+
+        end_dt = IST.localize(
+            datetime.strptime(f"{end_date} {end_time}", "%Y-%m-%d %H:%M")
+        )
+
+        candles = candles[
+            (candles.index >= start_dt)
+            & (candles.index <= end_dt)
+        ]
+
+        rows = []
+
+        for ts, row in candles.iterrows():
+            ts = pd.Timestamp(ts)
+
+            # Important: convert IST candle time to naive IST
+            # so Lightweight Charts displays Indian market wall-clock time.
+            if ts.tzinfo is not None:
+                ts = ts.tz_convert(IST).tz_localize(None)
+
+            rows.append({
+                "time": int(ts.timestamp()),
+                "open": round(float(row["open"]), 2),
+                "high": round(float(row["high"]), 2),
+                "low": round(float(row["low"]), 2),
+                "close": round(float(row["close"]), 2),
+            })
+
+        return jsonify({
+            "ok": True,
+            "dataset": dataset,
+            "query_date": query_date,
+            "end_date": end_date,
+            "end_time": end_time,
+            "date_str": date_str,
+            "resolved_week_number": resolved_week,
+            "interval": interval,
+            "rows": rows,
+        })
+
+    except Exception as exc:
+        return _json_error(str(exc), 400)
+
+@app.route("/api/future-chart")
+def api_future_chart():
+    try:
+        dataset = _normalize_dataset(
+            request.args.get("dataset")
+            or request.args.get("underlying")
+        )
+
+        start_date = _normalize_date(
+            request.args.get("date")
+            or request.args.get("query_date")
+        )
+
+        end_date = _normalize_date(
+            request.args.get("end_date")
+            or start_date
+        )
+
+        end_time = _normalize_time(
+            request.args.get("time")
+            or request.args.get("end_time")
+            or "15:30"
+        )
+
+        interval = int(request.args.get("interval", CANDLE_INTERVAL_MINUTES))
+        month = str(request.args.get("month") or "current").lower()
+
+        if interval <= 0:
+            raise ValueError("interval must be greater than zero.")
+
+        start_day = datetime.strptime(start_date, "%Y-%m-%d").date()
+        end_day = datetime.strptime(end_date, "%Y-%m-%d").date()
+
+        if end_day < start_day:
+            raise ValueError("end_date cannot be before start date.")
+
+        all_futures = []
+        resolved_week = None
+        last_date_str = None
+
+        current_day = start_day
+
+        while current_day <= end_day:
+            current_query_date = current_day.strftime("%Y-%m-%d")
+
+            try:
+                resolved_week, folder, date_str = _resolve_week_folder_for_date(
+                    query_date=current_query_date,
+                    dataset=dataset,
+                    week_number=None,
+                )
+
+                fut_df = load_future_data_for_date(
+                    folder=folder,
+                    date_str=date_str,
+                    month=month,
+                    instrument=dataset,
+                )
+
+                if fut_df is not None and not fut_df.empty:
+                    all_futures.append(fut_df)
+                    last_date_str = date_str
+
+            except Exception:
+                pass
+
+            current_day += timedelta(days=1)
+
+        if not all_futures:
+            return jsonify({
+                "ok": True,
+                "dataset": dataset,
+                "query_date": start_date,
+                "end_date": end_date,
+                "date_str": None,
+                "resolved_week_number": resolved_week,
+                "interval": interval,
+                "month": month,
+                "rows": [],
+                "indicators": {},
+            })
+
+        fut_df = pd.concat(all_futures, ignore_index=True)
+
+        if "value" not in fut_df.columns and "price" in fut_df.columns:
+            fut_df["value"] = fut_df["price"]
+
+        candles = create_candles(
+            fut_df,
+            interval,
+        )
+
+        start_dt = IST.localize(
+            datetime.strptime(f"{start_date} 09:15", "%Y-%m-%d %H:%M")
+        )
+
+        end_dt = IST.localize(
+            datetime.strptime(f"{end_date} {end_time}", "%Y-%m-%d %H:%M")
+        )
+
+        payload = build_chart_payload(
+            candles,
+            interval=interval,
+            start=start_dt,
+            end=end_dt,
+            previous_candles=100,
+            sma=(20, 50),
+            ema=(9, 20),
+        )
+
+        return jsonify({
+            "ok": True,
+            "dataset": dataset,
+            "query_date": start_date,
+            "end_date": end_date,
+            "date_str": last_date_str,
+            "resolved_week_number": resolved_week,
+            "interval": interval,
+            "month": month,
+            "rows": payload["candles"],
+            "indicators": payload["indicators"],
+        })
+
+    except Exception as exc:
+        return _json_error(str(exc), 400)
+
+@app.route("/api/calculate", methods=["POST"])
+def api_calculate():
+    try:
+        data = request.get_json(force=True) or {}
+
+        dataset = _normalize_dataset(
+            data.get("dataset")
+            or data.get("underlying")
+        )
+
+        spot = float(data.get("spot"))
+        iv = float(data.get("iv") or 20.0)
+        days = int(data.get("days") or 1)
+        legs = data.get("legs") or []
+
+        if not legs:
+            return jsonify(
+                {
+                    "spots": [],
+                    "payoff": [],
+                    "current": [],
+                    "summary": {
+                        "net_credit": 0,
+                        "max_profit": 0,
+                        "max_loss": 0,
+                        "breakevens": [],
+                        "pnl_now": 0,
+                        "delta": 0,
+                        "gamma": 0,
+                        "vega": 0,
+                        "theta": 0,
+                        "lot_size": LOT_SIZE_BY_INSTRUMENT.get(dataset, 65),
+                    },
+                }
+            )
+
+        return jsonify(
+            calculate_strategy(
+                spot=spot,
+                iv=iv,
+                days=days,
+                legs=legs,
+                dataset=dataset,
+            )
+        )
+
+    except Exception as exc:
+        return _json_error(str(exc), 400)
+
+@app.route("/api/previous-trading-session")
+def api_previous_trading_session():
+    try:
+        dataset = _normalize_dataset(request.args.get("dataset"))
+        query_date = _normalize_date(request.args.get("date"))
+
+        current = datetime.strptime(query_date, "%Y-%m-%d").date()
+
+        all_dates = []
+
+        for num, folder in get_week_folders(instrument=dataset):
+            for date_str in get_dates_for_week_folder(num, folder, instrument=dataset):
+                d = datetime.strptime(date_str, "%Y%m%d").date()
+                if d < current:
+                    all_dates.append(d)
+
+        if not all_dates:
+            raise ValueError("No previous trading date found.")
+
+        prev_date = max(all_dates)
+
+        return jsonify({
+            "ok": True,
+            "date": prev_date.strftime("%Y-%m-%d"),
+            "time": "15:30"
+        })
+
+    except Exception as exc:
+        return _json_error(str(exc), 400)
+
+@app.route("/api/next-trading-session")
+def api_next_trading_session():
+    """Return the next date for which market data exists for the dataset.
+
+    Searching the actual data folders, rather than adding one calendar day,
+    safely skips weekends, exchange holidays and gaps in uploaded history.
+    """
+    try:
+        dataset = _normalize_dataset(request.args.get("dataset"))
+        query_date = _normalize_date(request.args.get("date"))
+        current = datetime.strptime(query_date, "%Y-%m-%d").date()
+
+        available_dates = set()
+        for week_number, folder in get_week_folders(instrument=dataset):
+            for date_str in get_dates_for_week_folder(
+                week_number,
+                folder,
+                instrument=dataset,
+            ):
+                trading_date = datetime.strptime(date_str, "%Y%m%d").date()
+                if trading_date > current:
+                    available_dates.add(trading_date)
+
+        if not available_dates:
+            raise ValueError("No next trading date found.")
+
+        next_date = min(available_dates)
+        return jsonify({
+            "ok": True,
+            "date": next_date.strftime("%Y-%m-%d"),
+            "time": "09:15",
+        })
+
+    except Exception as exc:
+        return _json_error(str(exc), 400)
+
+@app.route("/api/defaults")
+def api_defaults():
+    try:
+        dataset = _normalize_dataset(
+            request.args.get("dataset")
+            or request.args.get("underlying")
+        )
+
+        week_number, folder, date_str, query_date = _resolve_default_week_date(
+            dataset=dataset,
+        )
+
+        return jsonify(
+            {
+                "ok": True,
+                "dataset": dataset,
+                "query_date": query_date,
+                "date_str": date_str,
+                "query_time": DEFAULT_QUERY_TIME,
+                "max_allowed_query_date": MAX_ALLOWED_QUERY_DATE.strftime("%Y-%m-%d"),
+                "resolved_week_number": week_number,
+            }
+        )
+
+    except Exception as exc:
+        return _json_error(str(exc), 400)
+
+
+@app.route("/api/cache/status")
+def api_cache_status():
+    return jsonify(
+        {
+            "ok": True,
+            "option_window_cache_size": len(OPTION_WINDOW_CACHE),
+            "option_window_cache_limit": MAX_OPTION_WINDOW_CACHE_SIZE,
+            "spot_candle_cache_size": len(SPOT_CANDLE_CACHE),
+            "spot_candle_cache_limit": MAX_SPOT_CANDLE_CACHE_SIZE,
+            "window_candles_before": WINDOW_CANDLES_BEFORE,
+            "window_candles_after": WINDOW_CANDLES_AFTER,
+            "iv_enabled": ENABLE_IV_CALC,
+            "chain_snapshot_cache_size": len(CHAIN_SNAPSHOT_CACHE),
+            "chain_snapshot_cache_limit": MAX_CHAIN_SNAPSHOT_CACHE_SIZE,
+            "chain_snapshot_cache_ttl_seconds": CHAIN_SNAPSHOT_CACHE_TTL_SECONDS,
+            "metric_chart_cache_size": len(METRIC_CHART_CACHE),
+            "metric_chart_cache_limit": MAX_METRIC_CHART_CACHE_SIZE,
+            "metric_chart_cache_ttl_seconds": METRIC_CHART_CACHE_TTL_SECONDS,
+            "data_resolution_cache_size": len(DATA_RESOLUTION_CACHE),
+            "data_resolution_cache_limit": MAX_DATA_RESOLUTION_CACHE_SIZE,
+            "data_resolution_cache_ttl_seconds": DATA_RESOLUTION_CACHE_TTL_SECONDS,
+            "data_engine": runtime_cache_stats(),
+            "iv_cache": iv_cache_stats(),
+        }
+    )
+
+
+@app.route("/api/cache/clear", methods=["POST"])
+def api_cache_clear():
+    configured_token = os.getenv("CACHE_ADMIN_TOKEN")
+    if configured_token and request.headers.get("X-Admin-Token") != configured_token:
+        return _json_error("Unauthorized.", 401)
+    with OPTION_WINDOW_CACHE_LOCK:
+        OPTION_WINDOW_CACHE.clear()
+    with SPOT_CANDLE_CACHE_LOCK:
+        SPOT_CANDLE_CACHE.clear()
+    _clear_chain_snapshot_cache()
+    _clear_metric_chart_cache()
+    _clear_data_resolution_cache()
+    clear_iv_cache()
+    return jsonify({
+        "ok": True,
+        "message": "Application and IV RAM caches cleared.",
+    })
+
+
+@app.route("/api/health")
+def api_health():
+    redis_ok = False
+    if redis_client is not None:
+        try:
+            redis_ok = bool(redis_client.ping())
+        except Exception:
+            redis_ok = False
+    payload = {
+        "ok": True,
+        "service": "options-simulator",
+        "storage_mode": STORAGE_MODE,
+        "data_layout": DATA_LAYOUT,
+        "iv_enabled": ENABLE_IV_CALC,
+        "redis_connected": redis_ok,
+        "iv_surface_backend": "redis_threadpool" if redis_ok else "unavailable",
+        "option_window_cache_size": len(OPTION_WINDOW_CACHE),
+        "spot_candle_cache_size": len(SPOT_CANDLE_CACHE),
+        "chain_snapshot_cache_size": len(CHAIN_SNAPSHOT_CACHE),
+        "metric_chart_cache_size": len(METRIC_CHART_CACHE),
+        "data_resolution_cache_size": len(DATA_RESOLUTION_CACHE),
+    }
+    return jsonify(payload), 200
 
 
 
-  initSimulator();
-});
+if __name__ == "__main__":
+    # Development runner only. In production use Gunicorn, for example:
+    # gunicorn --workers 2 --threads 4 --timeout 120 --bind 0.0.0.0:8000 simulator:app
+    port = int(os.getenv("PORT", "8000"))
+    host = os.getenv("HOST", "0.0.0.0")
+    debug = os.getenv("DEBUG_MODE", "false").lower() in {"1", "true", "yes", "on"}
+
+    app.run(
+        host=host,
+        port=port,
+        debug=debug,
+    )
