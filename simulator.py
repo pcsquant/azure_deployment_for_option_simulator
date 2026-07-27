@@ -2967,6 +2967,43 @@ def api_previous_trading_session():
 
     except Exception as exc:
         return _json_error(str(exc), 400)
+
+@app.route("/api/next-trading-session")
+def api_next_trading_session():
+    """Return the next date for which market data exists for the dataset.
+
+    Searching the actual data folders, rather than adding one calendar day,
+    safely skips weekends, exchange holidays and gaps in uploaded history.
+    """
+    try:
+        dataset = _normalize_dataset(request.args.get("dataset"))
+        query_date = _normalize_date(request.args.get("date"))
+        current = datetime.strptime(query_date, "%Y-%m-%d").date()
+
+        available_dates = set()
+        for week_number, folder in get_week_folders(instrument=dataset):
+            for date_str in get_dates_for_week_folder(
+                week_number,
+                folder,
+                instrument=dataset,
+            ):
+                trading_date = datetime.strptime(date_str, "%Y%m%d").date()
+                if trading_date > current:
+                    available_dates.add(trading_date)
+
+        if not available_dates:
+            raise ValueError("No next trading date found.")
+
+        next_date = min(available_dates)
+        return jsonify({
+            "ok": True,
+            "date": next_date.strftime("%Y-%m-%d"),
+            "time": "09:15",
+        })
+
+    except Exception as exc:
+        return _json_error(str(exc), 400)
+
 @app.route("/api/defaults")
 def api_defaults():
     try:
