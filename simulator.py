@@ -197,45 +197,95 @@ def _internal_error(error):
 
 
 
-def _slice_consolidated_option_data(chain, strike):
-    """Return the standard CE/PE option-data shape for one strike.
+def _slice_consolidated_option_data(
+    chain: pd.DataFrame,
+    strike: int,
+) -> Dict[str, pd.DataFrame]:
+    """Return CE/PE price and OI data for one strike."""
 
-    The consolidated chain stores timestamp/strike/ce/pe columns.  Downstream
-    code expects datetime/price/volume frames, so normalize the fast-path
-    result to exactly the same interface as the per-contract fallback loader.
-    """
-    empty = pd.DataFrame(columns=["datetime", "price", "volume"])
+    empty = pd.DataFrame(
+        columns=["datetime", "price", "volume", "oi"]
+    )
 
     if chain is None or chain.empty:
-        return {"CE": empty.copy(), "PE": empty.copy()}
+        return {
+            "CE": empty.copy(),
+            "PE": empty.copy(),
+        }
 
     required = {"timestamp", "strike"}
+
     if not required.issubset(chain.columns):
-        return {"CE": empty.copy(), "PE": empty.copy()}
+        return {
+            "CE": empty.copy(),
+            "PE": empty.copy(),
+        }
 
     strike_value = int(strike)
+
     strike_rows = chain.loc[
-        pd.to_numeric(chain["strike"], errors="coerce") == strike_value
+        pd.to_numeric(
+            chain["strike"],
+            errors="coerce",
+        ) == strike_value
     ]
 
     result = {}
-    for side, price_column in (("CE", "ce"), ("PE", "pe")):
+
+    for side, price_column, oi_column in (
+        ("CE", "ce", "ce_oi"),
+        ("PE", "pe", "pe_oi"),
+    ):
         if price_column not in strike_rows.columns:
             result[side] = empty.copy()
             continue
 
-        frame = strike_rows[["timestamp", price_column]].rename(
-            columns={"timestamp": "datetime", price_column: "price"}
+        columns = [
+            "timestamp",
+            price_column,
+        ]
+
+        if oi_column in strike_rows.columns:
+            columns.append(oi_column)
+
+        frame = strike_rows[columns].rename(
+            columns={
+                "timestamp": "datetime",
+                price_column: "price",
+                oi_column: "oi",
+            }
         ).copy()
-        frame["datetime"] = pd.to_datetime(frame["datetime"], errors="coerce")
-        frame["price"] = pd.to_numeric(frame["price"], errors="coerce")
+
+        if "oi" not in frame.columns:
+            frame["oi"] = np.nan
+
+        frame["datetime"] = pd.to_datetime(
+            frame["datetime"],
+            errors="coerce",
+        )
+
+        frame["price"] = pd.to_numeric(
+            frame["price"],
+            errors="coerce",
+        )
+
+        frame["oi"] = pd.to_numeric(
+            frame["oi"],
+            errors="coerce",
+        )
+
         frame["volume"] = 0
+
         frame = (
-            frame.dropna(subset=["datetime", "price"])
+            frame
+            .dropna(subset=["datetime"])
             .sort_values("datetime")
             .reset_index(drop=True)
         )
-        result[side] = frame[["datetime", "price", "volume"]]
+
+        result[side] = frame[
+            ["datetime", "price", "volume", "oi"]
+        ]
 
     return result
 
