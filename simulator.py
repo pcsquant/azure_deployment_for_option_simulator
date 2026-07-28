@@ -197,41 +197,23 @@ def _internal_error(error):
 
 
 
-def _slice_consolidated_option_data(
-    chain: pd.DataFrame,
-    strike: int,
-) -> Dict[str, pd.DataFrame]:
-    """Return CE/PE price and OI data for one strike."""
-
-    empty = pd.DataFrame(
-        columns=["datetime", "price", "volume", "oi"]
-    )
+def _slice_consolidated_option_data(chain, strike):
+    """Return CE/PE price, volume, and OI data for one strike."""
+    empty = pd.DataFrame(columns=["datetime", "price", "volume", "oi"])
 
     if chain is None or chain.empty:
-        return {
-            "CE": empty.copy(),
-            "PE": empty.copy(),
-        }
+        return {"CE": empty.copy(), "PE": empty.copy()}
 
     required = {"timestamp", "strike"}
-
     if not required.issubset(chain.columns):
-        return {
-            "CE": empty.copy(),
-            "PE": empty.copy(),
-        }
+        return {"CE": empty.copy(), "PE": empty.copy()}
 
     strike_value = int(strike)
-
     strike_rows = chain.loc[
-        pd.to_numeric(
-            chain["strike"],
-            errors="coerce",
-        ) == strike_value
+        pd.to_numeric(chain["strike"], errors="coerce") == strike_value
     ]
 
     result = {}
-
     for side, price_column, oi_column in (
         ("CE", "ce", "ce_oi"),
         ("PE", "pe", "pe_oi"),
@@ -240,11 +222,7 @@ def _slice_consolidated_option_data(
             result[side] = empty.copy()
             continue
 
-        columns = [
-            "timestamp",
-            price_column,
-        ]
-
+        columns = ["timestamp", price_column]
         if oi_column in strike_rows.columns:
             columns.append(oi_column)
 
@@ -259,33 +237,16 @@ def _slice_consolidated_option_data(
         if "oi" not in frame.columns:
             frame["oi"] = np.nan
 
-        frame["datetime"] = pd.to_datetime(
-            frame["datetime"],
-            errors="coerce",
-        )
-
-        frame["price"] = pd.to_numeric(
-            frame["price"],
-            errors="coerce",
-        )
-
-        frame["oi"] = pd.to_numeric(
-            frame["oi"],
-            errors="coerce",
-        )
-
+        frame["datetime"] = pd.to_datetime(frame["datetime"], errors="coerce")
+        frame["price"] = pd.to_numeric(frame["price"], errors="coerce")
+        frame["oi"] = pd.to_numeric(frame["oi"], errors="coerce")
         frame["volume"] = 0
-
         frame = (
-            frame
-            .dropna(subset=["datetime"])
+            frame.dropna(subset=["datetime"])
             .sort_values("datetime")
             .reset_index(drop=True)
         )
-
-        result[side] = frame[
-            ["datetime", "price", "volume", "oi"]
-        ]
+        result[side] = frame[["datetime", "price", "volume", "oi"]]
 
     return result
 
@@ -435,6 +396,94 @@ def _put_metric_chart_cache(key: Tuple[Any, ...], payload: Dict[str, Any]) -> No
 def _clear_metric_chart_cache() -> None:
     with METRIC_CHART_CACHE_LOCK:
         METRIC_CHART_CACHE.clear()
+
+
+# Prepared full-day OI candles. One entry is keyed by
+# dataset/date/expiry/interval and is reused by every Next/Previous click.
+MAX_OI_DAY_CACHE_SIZE = max(
+    1,
+    int(os.getenv("OI_DAY_CACHE_SIZE", "16")),
+)
+OI_DAY_CACHE_TTL_SECONDS = max(
+    0.0,
+    float(os.getenv("OI_DAY_CACHE_TTL_SECONDS", "1800")),
+)
+OI_DAY_CACHE: "OrderedDict[Tuple[Any, ...], Tuple[float, pd.DataFrame]]" = OrderedDict()
+OI_DAY_CACHE_LOCK = threading.RLock()
+
+
+def _get_oi_day_cache(key: Tuple[Any, ...]) -> Optional[pd.DataFrame]:
+    now = time.monotonic()
+    with OI_DAY_CACHE_LOCK:
+        item = OI_DAY_CACHE.get(key)
+        if item is None:
+            return None
+        created_at, frame = item
+        if (
+            OI_DAY_CACHE_TTL_SECONDS > 0
+            and now - created_at >= OI_DAY_CACHE_TTL_SECONDS
+        ):
+            OI_DAY_CACHE.pop(key, None)
+            return None
+        OI_DAY_CACHE.move_to_end(key)
+        return frame
+
+
+def _put_oi_day_cache(key: Tuple[Any, ...], frame: pd.DataFrame) -> None:
+    with OI_DAY_CACHE_LOCK:
+        OI_DAY_CACHE[key] = (time.monotonic(), frame)
+        OI_DAY_CACHE.move_to_end(key)
+        while len(OI_DAY_CACHE) > MAX_OI_DAY_CACHE_SIZE:
+            OI_DAY_CACHE.popitem(last=False)
+
+
+def _clear_oi_day_cache() -> None:
+    with OI_DAY_CACHE_LOCK:
+        OI_DAY_CACHE.clear()
+
+
+# Final OI API payload cache. Revisiting an already requested timestamp returns
+# immediately without rebuilding levels and exposure values.
+MAX_OI_SNAPSHOT_CACHE_SIZE = max(
+    1,
+    int(os.getenv("OI_SNAPSHOT_CACHE_SIZE", "256")),
+)
+OI_SNAPSHOT_CACHE_TTL_SECONDS = max(
+    0.0,
+    float(os.getenv("OI_SNAPSHOT_CACHE_TTL_SECONDS", "900")),
+)
+OI_SNAPSHOT_CACHE: "OrderedDict[Tuple[Any, ...], Tuple[float, Dict[str, Any]]]" = OrderedDict()
+OI_SNAPSHOT_CACHE_LOCK = threading.RLock()
+
+
+def _get_oi_snapshot_cache(key: Tuple[Any, ...]) -> Optional[Dict[str, Any]]:
+    now = time.monotonic()
+    with OI_SNAPSHOT_CACHE_LOCK:
+        item = OI_SNAPSHOT_CACHE.get(key)
+        if item is None:
+            return None
+        created_at, payload = item
+        if (
+            OI_SNAPSHOT_CACHE_TTL_SECONDS > 0
+            and now - created_at >= OI_SNAPSHOT_CACHE_TTL_SECONDS
+        ):
+            OI_SNAPSHOT_CACHE.pop(key, None)
+            return None
+        OI_SNAPSHOT_CACHE.move_to_end(key)
+        return copy.deepcopy(payload)
+
+
+def _put_oi_snapshot_cache(key: Tuple[Any, ...], payload: Dict[str, Any]) -> None:
+    with OI_SNAPSHOT_CACHE_LOCK:
+        OI_SNAPSHOT_CACHE[key] = (time.monotonic(), copy.deepcopy(payload))
+        OI_SNAPSHOT_CACHE.move_to_end(key)
+        while len(OI_SNAPSHOT_CACHE) > MAX_OI_SNAPSHOT_CACHE_SIZE:
+            OI_SNAPSHOT_CACHE.popitem(last=False)
+
+
+def _clear_oi_snapshot_cache() -> None:
+    with OI_SNAPSHOT_CACHE_LOCK:
+        OI_SNAPSHOT_CACHE.clear()
 
 
 
@@ -915,6 +964,163 @@ def _option_ltp_at_time_cached(
         )
 
     return _option_ltp_from_window(cached_window, target_ts)
+
+
+
+
+def _calculate_exposure(
+    greek: Optional[float],
+    oi: Optional[float],
+    spot: float,
+    lot_size: int,
+    kind: str,
+) -> float:
+    """Calculate an analytical Greek exposure estimate."""
+    greek_value = _safe_float(greek)
+    oi_value = _safe_float(oi)
+    if greek_value is None or oi_value is None:
+        return 0.0
+
+    contracts = oi_value * float(lot_size)
+    if kind == "gamma":
+        return greek_value * contracts * float(spot) * float(spot) * 0.01
+    if kind == "delta":
+        return greek_value * contracts * float(spot)
+    if kind in {"vega", "theta"}:
+        return greek_value * contracts
+    return 0.0
+
+
+def build_daily_oi_candles(
+    chain_df: pd.DataFrame,
+    interval_minutes: int,
+) -> pd.DataFrame:
+    """Build all-strike OI candles for a full day in one vectorized pass."""
+    if chain_df is None or chain_df.empty:
+        return pd.DataFrame()
+
+    required = {"timestamp", "strike", "ce_oi", "pe_oi"}
+    if not required.issubset(chain_df.columns):
+        missing = sorted(required - set(chain_df.columns))
+        raise ValueError(
+            f"Consolidated option file is missing OI columns: {missing}"
+        )
+
+    work = chain_df[["timestamp", "strike", "ce_oi", "pe_oi"]].copy()
+    work["timestamp"] = pd.to_datetime(work["timestamp"], errors="coerce")
+    work["strike"] = pd.to_numeric(work["strike"], errors="coerce")
+    work["ce_oi"] = pd.to_numeric(work["ce_oi"], errors="coerce")
+    work["pe_oi"] = pd.to_numeric(work["pe_oi"], errors="coerce")
+    work = work.dropna(subset=["timestamp", "strike"]).sort_values("timestamp")
+    if work.empty:
+        return pd.DataFrame()
+
+    if getattr(work["timestamp"].dt, "tz", None) is None:
+        work["timestamp"] = work["timestamp"].dt.tz_localize(
+            IST, ambiguous="NaT", nonexistent="NaT"
+        )
+    else:
+        work["timestamp"] = work["timestamp"].dt.tz_convert(IST)
+
+    work = work.dropna(subset=["timestamp"])
+    work["strike"] = work["strike"].astype(int)
+    interval_minutes = max(int(interval_minutes), 1)
+    session_offset = pd.Timedelta(hours=9, minutes=15)
+
+    candles = (
+        work.set_index("timestamp")
+        .groupby("strike")[["ce_oi", "pe_oi"]]
+        .resample(
+            f"{interval_minutes}min",
+            origin="start_day",
+            offset=session_offset,
+            label="left",
+            closed="left",
+        )
+        .last()
+        .dropna(how="all", subset=["ce_oi", "pe_oi"])
+        .reset_index()
+        .sort_values(["strike", "timestamp"])
+        .reset_index(drop=True)
+    )
+
+    if candles.empty:
+        return candles
+
+    candles["ce_previous_oi"] = candles.groupby("strike")["ce_oi"].shift(1)
+    candles["pe_previous_oi"] = candles.groupby("strike")["pe_oi"].shift(1)
+    candles["ce_change_oi"] = candles["ce_oi"] - candles["ce_previous_oi"]
+    candles["pe_change_oi"] = candles["pe_oi"] - candles["pe_previous_oi"]
+    return candles
+
+
+def get_cached_daily_oi_candles(
+    folder: str,
+    date_str: str,
+    expiry_str: str,
+    dataset: str,
+    interval_minutes: int,
+) -> Tuple[pd.DataFrame, bool]:
+    """Return prepared daily OI candles and whether RAM cache was used."""
+    cache_key = (
+        str(dataset).upper(),
+        str(date_str),
+        str(expiry_str),
+        int(interval_minutes),
+        str(folder),
+    )
+    cached = _get_oi_day_cache(cache_key)
+    if cached is not None:
+        return cached, True
+
+    consolidated = load_consolidated_option_chain(
+        folder=folder,
+        date_str=date_str,
+        expiry_str=expiry_str,
+        instrument=dataset,
+    )
+    if consolidated is None or consolidated.empty:
+        raise ValueError("Consolidated option data is unavailable for the selected date.")
+
+    daily_oi = build_daily_oi_candles(consolidated, interval_minutes)
+    if daily_oi.empty:
+        raise ValueError("No valid OI candle data was created.")
+
+    _put_oi_day_cache(cache_key, daily_oi)
+    return daily_oi, False
+
+
+def _latest_completed_oi_by_strike(
+    daily_oi: pd.DataFrame,
+    target_ts: pd.Timestamp,
+) -> Dict[int, Dict[str, Any]]:
+    """Select the latest completed OI candle for each strike."""
+    if daily_oi is None or daily_oi.empty:
+        return {}
+
+    target_ts = _to_ist_timestamp(target_ts)
+    completed = daily_oi.loc[daily_oi["timestamp"] < target_ts]
+    if completed.empty:
+        return {}
+
+    latest_rows = (
+        completed.sort_values("timestamp")
+        .groupby("strike", as_index=False)
+        .tail(1)
+    )
+
+    result: Dict[int, Dict[str, Any]] = {}
+    for row in latest_rows.itertuples(index=False):
+        result[int(row.strike)] = {
+            "ce_oi": _safe_float(row.ce_oi),
+            "pe_oi": _safe_float(row.pe_oi),
+            "ce_previous_oi": _safe_float(row.ce_previous_oi),
+            "pe_previous_oi": _safe_float(row.pe_previous_oi),
+            "ce_change_oi": _safe_float(row.ce_change_oi),
+            "pe_change_oi": _safe_float(row.pe_change_oi),
+            "current_timestamp": row.timestamp,
+        }
+    return result
 
 
 # =========================================================
@@ -1887,6 +2093,199 @@ def api_chain():
 
     except Exception as exc:
         return _json_error(str(exc), 400)
+
+
+
+@app.route("/api/oi-simulator")
+def api_oi_simulator():
+    """Return OI, OI change, Greek exposures, and derived levels."""
+    request_started = time.perf_counter()
+    try:
+        dataset = _normalize_dataset(
+            request.args.get("dataset") or request.args.get("underlying")
+        )
+        query_date_value = request.args.get("date") or request.args.get("query_date")
+        query_date = _normalize_date(query_date_value) if query_date_value else None
+        query_time = _normalize_time(
+            request.args.get("time") or request.args.get("query_time")
+        )
+        interval = int(request.args.get("interval", CANDLE_INTERVAL_MINUTES))
+        if interval <= 0:
+            raise ValueError("interval must be greater than zero.")
+        strike_count = min(max(int(request.args.get("strike_count", 10)), 1), 30)
+        selected_expiry = request.args.get("expiry")
+
+        base = build_option_chain_snapshot(
+            query_date=query_date,
+            query_time=query_time,
+            dataset=dataset,
+            strike_count_each_side=strike_count,
+            candle_interval_minutes=interval,
+            selected_expiry=selected_expiry,
+            compute_greeks=True,
+        )
+
+        oi_cache_key = (
+            dataset,
+            base["query_date"],
+            base["query_time"],
+            base["expiry"],
+            interval,
+            strike_count,
+        )
+        cached_payload = _get_oi_snapshot_cache(oi_cache_key)
+        if cached_payload is not None:
+            elapsed = round((time.perf_counter() - request_started) * 1000, 3)
+            cached_payload["cache_hit"] = True
+            cached_payload["performance"] = {
+                "oi_response_cache_hit": True,
+                "cache_lookup_ms": elapsed,
+                "total_ms": elapsed,
+            }
+            return jsonify(cached_payload)
+
+        resolved_week, folder, date_str = _resolve_week_folder_for_date(
+            query_date=base["query_date"],
+            dataset=dataset,
+            week_number=base.get("resolved_week_number"),
+        )
+        target_ts = IST.localize(
+            datetime.strptime(
+                f"{base['query_date']} {base['query_time']}",
+                "%Y-%m-%d %H:%M",
+            )
+        )
+        lot_size = int(
+            base.get("lot_size") or LOT_SIZE_BY_INSTRUMENT.get(dataset, 65)
+        )
+        spot = float(base["spot"])
+
+        oi_load_started = time.perf_counter()
+        daily_oi, oi_day_cache_hit = get_cached_daily_oi_candles(
+            folder=folder,
+            date_str=date_str,
+            expiry_str=base["expiry"],
+            dataset=dataset,
+            interval_minutes=interval,
+        )
+        oi_load_ms = round((time.perf_counter() - oi_load_started) * 1000, 3)
+
+        lookup_started = time.perf_counter()
+        oi_by_strike = _latest_completed_oi_by_strike(daily_oi, target_ts)
+        oi_lookup_ms = round((time.perf_counter() - lookup_started) * 1000, 3)
+
+        rows = []
+        for item in base.get("rows", []):
+            strike = int(item["strike"])
+            oi_result = oi_by_strike.get(strike, {})
+            ce_oi = _safe_float(oi_result.get("ce_oi"))
+            pe_oi = _safe_float(oi_result.get("pe_oi"))
+
+            ce_gex = _calculate_exposure(item.get("ce_gamma"), ce_oi, spot, lot_size, "gamma")
+            pe_gex = -_calculate_exposure(item.get("pe_gamma"), pe_oi, spot, lot_size, "gamma")
+            ce_dex = _calculate_exposure(item.get("ce_delta"), ce_oi, spot, lot_size, "delta")
+            pe_dex = _calculate_exposure(item.get("pe_delta"), pe_oi, spot, lot_size, "delta")
+            ce_vex = _calculate_exposure(item.get("ce_vega"), ce_oi, spot, lot_size, "vega")
+            pe_vex = _calculate_exposure(item.get("pe_vega"), pe_oi, spot, lot_size, "vega")
+            ce_tex = _calculate_exposure(item.get("ce_theta"), ce_oi, spot, lot_size, "theta")
+            pe_tex = _calculate_exposure(item.get("pe_theta"), pe_oi, spot, lot_size, "theta")
+
+            current_timestamp = oi_result.get("current_timestamp")
+            rows.append({
+                **item,
+                "ce_oi": _round_or_none(ce_oi, 2),
+                "pe_oi": _round_or_none(pe_oi, 2),
+                "ce_previous_oi": _round_or_none(oi_result.get("ce_previous_oi"), 2),
+                "pe_previous_oi": _round_or_none(oi_result.get("pe_previous_oi"), 2),
+                "ce_change_oi": _round_or_none(oi_result.get("ce_change_oi"), 2),
+                "pe_change_oi": _round_or_none(oi_result.get("pe_change_oi"), 2),
+                "oi_current_timestamp": (
+                    current_timestamp.isoformat() if current_timestamp is not None else None
+                ),
+                "gex": round(ce_gex + pe_gex, 2),
+                "dex": round(ce_dex + pe_dex, 2),
+                "vex": round(ce_vex + pe_vex, 2),
+                "tex": round(ce_tex + pe_tex, 2),
+            })
+
+        valid_ce = [row for row in rows if row.get("ce_oi") is not None]
+        valid_pe = [row for row in rows if row.get("pe_oi") is not None]
+        call_wall = max(valid_ce, key=lambda row: row["ce_oi"])["strike"] if valid_ce else None
+        put_wall = max(valid_pe, key=lambda row: row["pe_oi"])["strike"] if valid_pe else None
+        total_gex = sum(_safe_float(row.get("gex"), 0.0) for row in rows)
+        max_positive_gex = max(rows, key=lambda row: row["gex"])["strike"] if rows else None
+        max_negative_gex = min(rows, key=lambda row: row["gex"])["strike"] if rows else None
+        resistance = sorted(
+            [row for row in valid_ce if row["strike"] > spot],
+            key=lambda row: row["ce_oi"],
+            reverse=True,
+        )[:2]
+        support = sorted(
+            [row for row in valid_pe if row["strike"] < spot],
+            key=lambda row: row["pe_oi"],
+            reverse=True,
+        )[:2]
+        bias = (
+            "Bullish / stabilising" if total_gex > 0
+            else "Bearish / destabilising" if total_gex < 0
+            else "Neutral"
+        )
+
+        total_ms = round((time.perf_counter() - request_started) * 1000, 3)
+        payload = {
+            "ok": True,
+            "dataset": dataset,
+            "query_date": base["query_date"],
+            "query_time": base["query_time"],
+            "expiry": base["expiry"],
+            "expiry_label": base["expiry_label"],
+            "available_expiries": base["available_expiries"],
+            "resolved_week_number": resolved_week,
+            "spot": base["spot"],
+            "india_vix": base.get("india_vix"),
+            "atm": base["atm"],
+            "strike_step": base["strike_step"],
+            "lot_size": lot_size,
+            "interval": interval,
+            "cache_hit": False,
+            "rows": rows,
+            "levels": {
+                "call_wall": call_wall,
+                "put_wall": put_wall,
+                "total_gex": round(total_gex, 2),
+                "max_positive_gex": max_positive_gex,
+                "max_negative_gex": max_negative_gex,
+                "resistance_1": resistance[0]["strike"] if len(resistance) > 0 else None,
+                "resistance_2": resistance[1]["strike"] if len(resistance) > 1 else None,
+                "support_1": support[0]["strike"] if len(support) > 0 else None,
+                "support_2": support[1]["strike"] if len(support) > 1 else None,
+                "bias": bias,
+            },
+            "performance": {
+                "oi_response_cache_hit": False,
+                "oi_day_cache_hit": oi_day_cache_hit,
+                "oi_day_load_ms": oi_load_ms,
+                "oi_timestamp_lookup_ms": oi_lookup_ms,
+                "total_ms": total_ms,
+            },
+            "note": (
+                "OI change is the latest completed candle OI minus the previous "
+                "completed candle OI for the selected interval."
+            ),
+        }
+        _put_oi_snapshot_cache(oi_cache_key, payload)
+        return jsonify(payload)
+
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    except Exception as exc:
+        logger.exception("OI simulator request failed")
+        return _json_error(
+            "Unable to build OI simulator.",
+            500,
+            detail=str(exc),
+        )
+
 
 # =========================================================
 # ASYNC IV SURFACE ROUTES
@@ -3100,6 +3499,12 @@ def api_cache_status():
             "metric_chart_cache_size": len(METRIC_CHART_CACHE),
             "metric_chart_cache_limit": MAX_METRIC_CHART_CACHE_SIZE,
             "metric_chart_cache_ttl_seconds": METRIC_CHART_CACHE_TTL_SECONDS,
+            "oi_day_cache_size": len(OI_DAY_CACHE),
+            "oi_day_cache_limit": MAX_OI_DAY_CACHE_SIZE,
+            "oi_day_cache_ttl_seconds": OI_DAY_CACHE_TTL_SECONDS,
+            "oi_snapshot_cache_size": len(OI_SNAPSHOT_CACHE),
+            "oi_snapshot_cache_limit": MAX_OI_SNAPSHOT_CACHE_SIZE,
+            "oi_snapshot_cache_ttl_seconds": OI_SNAPSHOT_CACHE_TTL_SECONDS,
             "data_resolution_cache_size": len(DATA_RESOLUTION_CACHE),
             "data_resolution_cache_limit": MAX_DATA_RESOLUTION_CACHE_SIZE,
             "data_resolution_cache_ttl_seconds": DATA_RESOLUTION_CACHE_TTL_SECONDS,
@@ -3120,11 +3525,13 @@ def api_cache_clear():
         SPOT_CANDLE_CACHE.clear()
     _clear_chain_snapshot_cache()
     _clear_metric_chart_cache()
+    _clear_oi_day_cache()
+    _clear_oi_snapshot_cache()
     _clear_data_resolution_cache()
     clear_iv_cache()
     return jsonify({
         "ok": True,
-        "message": "Application and IV RAM caches cleared.",
+        "message": "Application, OI, and IV RAM caches cleared.",
     })
 
 
@@ -3148,6 +3555,8 @@ def api_health():
         "spot_candle_cache_size": len(SPOT_CANDLE_CACHE),
         "chain_snapshot_cache_size": len(CHAIN_SNAPSHOT_CACHE),
         "metric_chart_cache_size": len(METRIC_CHART_CACHE),
+        "oi_day_cache_size": len(OI_DAY_CACHE),
+        "oi_snapshot_cache_size": len(OI_SNAPSHOT_CACHE),
         "data_resolution_cache_size": len(DATA_RESOLUTION_CACHE),
     }
     return jsonify(payload), 200
